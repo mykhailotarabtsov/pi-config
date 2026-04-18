@@ -1,0 +1,26 @@
+{
+  "providers": {
+    "llama-cpp": {
+      "baseUrl": "${PI_LLAMA_CPP_URL}",
+      "api": "openai-completions",
+      "apiKey": "not-needed",
+      "timeout": 120000,
+      "models": [
+        {
+          "id": "unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_XS",
+          "name": "Gemma 4 26b (RTX 5070 Ti)",
+          "contextWindow": 65536,
+          "reasoning": true,
+          "tools": true
+        },
+        {
+          "id": "Qwen3.6-35B-A3B-UD-IQ3_S",
+          "name": "Qwen3.6 35B A3B (RTX 5070 Ti)",
+          "contextWindow": 131072,
+          "reasoning": true,
+          "tools": true
+        }
+      ]
+    }
+  }
+}

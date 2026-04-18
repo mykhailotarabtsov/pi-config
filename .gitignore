@@ -1,0 +1,19 @@
+# Sensitive
+auth.json
+
+# Auto-generated / machine-specific
+sessions/
+mcp-cache.json
+mcp-npx-cache.json
+
+# macOS
+.DS_Store
+
+# Cloned repos (just reference in settings.json)
+git/
+
+# Machine-specific binaries (won't work on other platforms)
+bin/
+
+# Generated from template (contains local IPs)
+models.json
