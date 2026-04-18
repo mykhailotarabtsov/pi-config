@@ -4,16 +4,16 @@ Pi agent configuration for easy setup across machines.
 
 ## What's in here
 
-| File | Purpose |
-|---|---|
-| `settings.json` | Default provider, model, theme, packages, extensions |
+| File                   | Purpose                                                                |
+| ---------------------- | ---------------------------------------------------------------------- |
+| `settings.json`        | Default provider, model, theme, packages, extensions                   |
 | `models.json.template` | Model providers with env var placeholders (never commit `models.json`) |
-| `mcp.json` | MCP server configurations |
-| `AGENTS.md` | Main agent system prompt and behaviors |
-| `agents/*.md` | Subagent definitions (builder, unit-tester, browser-tester) |
-| `skills/*.md` | Custom skill definitions (commit, change-review, learn-codebase, etc.) |
-| `bin/` | Helper binaries |
-| `setup.sh` | One-command restore script |
+| `mcp.json`             | MCP server configurations                                              |
+| `AGENTS.md`            | Main agent system prompt and behaviors                                 |
+| `agents/*.md`          | Subagent definitions (builder, unit-tester, browser-tester)            |
+| `skills/*.md`          | Custom skill definitions (commit, change-review, learn-codebase, etc.) |
+| `bin/`                 | Helper binaries                                                        |
+| `setup.sh`             | One-command restore script                                             |
 
 ## Environment variables
 
@@ -65,6 +65,13 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 .git/          # Cloned repo data
 .DS_Store      # macOS junk
 ```
+
+## Custom extensions
+
+| Extension                           | Description                                                                                                                                                                                                                                     |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `extensions/context-workflow.ts`    | Structured 5-stage dev workflow (write → test → review → fix → verify). Starts with `/workflow [spec]`, auto-progresses with deterministic test gates and context-compacted code review. (source - https://github.com/owainlewis/pi-extensions) |
+| `extensions/fun-working-message.ts` | Replaces the default "Working..." status with a random message from a curated list each turn.                                                                                                                                                   |
 
 ## Updating configs
 
