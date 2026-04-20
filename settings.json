@@ -1,7 +1,7 @@
 {
   "lastChangelogVersion": "0.67.68",
-  "defaultProvider": "llama-cpp",
-  "defaultModel": "Qwen3.6-35B-A3B-UD-IQ3_S",
+  "defaultProvider": "cursor",
+  "defaultModel": "composer-2",
   "agents": {
     "defaults": {
       "timeoutSeconds": 120
@@ -10,7 +10,8 @@
   "defaultThinkingLevel": "medium",
   "theme": "dark",
   "packages": [
-    "git:github.com/nicobailon/pi-mcp-adapter"
+    "git:github.com/nicobailon/pi-mcp-adapter",
+    "npm:@netandreus/pi-cursor-provider"
   ],
   "hideThinkingBlock": false,
   "extensions": []
