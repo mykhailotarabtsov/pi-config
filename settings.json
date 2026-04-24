@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.67.68",
+  "lastChangelogVersion": "0.70.0",
   "defaultProvider": "cursor",
   "defaultModel": "composer-2",
   "agents": {
@@ -11,7 +11,8 @@
   "theme": "dark",
   "packages": [
     "git:github.com/nicobailon/pi-mcp-adapter",
-    "npm:@netandreus/pi-cursor-provider"
+    "npm:@netandreus/pi-cursor-provider",
+    "git:github.com/HazAT/pi-interactive-subagents"
   ],
   "hideThinkingBlock": false,
   "extensions": []
