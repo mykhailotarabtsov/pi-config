@@ -1,7 +1,7 @@
 {
-  "lastChangelogVersion": "0.70.0",
-  "defaultProvider": "cursor",
-  "defaultModel": "composer-2",
+  "lastChangelogVersion": "0.70.2",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.4",
   "agents": {
     "defaults": {
       "timeoutSeconds": 120

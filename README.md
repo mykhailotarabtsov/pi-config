@@ -31,7 +31,7 @@ export PI_OLLAMA_URL="http://192.168.0.XXX:11434/v1"
 
 ```bash
 # 1. Clone this repo
-git clone git@github.com:<your-username>/pi-config.git ~/pi-config
+git clone git@github.com:mykhailotarabtsov/pi-config.git ~/pi-config
 cd ~/pi-config
 
 # 2. Set environment variables (see above)
