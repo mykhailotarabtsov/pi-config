@@ -9,10 +9,7 @@
   },
   "defaultThinkingLevel": "medium",
   "theme": "dark",
-  "packages": [
-    "git:github.com/nicobailon/pi-mcp-adapter",
-    "npm:@netandreus/pi-cursor-provider"
-  ],
+  "packages": [],
   "hideThinkingBlock": false,
   "extensions": []
 }
