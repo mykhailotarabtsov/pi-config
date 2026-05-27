@@ -48,38 +48,26 @@ Before saying "done":
 
 ---
 
-## Sequential Agent Flow
+## Subagent Workflow
 
-This setup uses three subagents in a **strict sequential pipeline**. Never run two subagents at once.
+This setup provides subagents through the local `extensions/subagent` Pi extension, following Pi's documented extension model. The core `subagent` tool spawns isolated `pi --mode json -p --no-session` child processes and returns the child agent's final assistant output.
 
-### The Pipeline
+### Available Agents
 
-```
-Plan → Builder → Unit-Tester → Browser-Tester
-```
+- **`scout`** — Fast codebase reconnaissance and compressed handoff context.
+- **`planner`** — Creates implementation plans without modifying files.
+- **`worker`** — General-purpose implementation agent in an isolated context.
+- **`reviewer`** — Code review specialist.
+- **`builder`** — Focused implementation with minimal validation.
+- **`unit-tester`** — Runs unit/integration tests and reports concrete results.
+- **`browser-tester`** — Manual QA specialist; may be blocked if browser/MCP tools are unavailable in the child process.
 
-1. **Plan** — Main agent analyzes the request, reads relevant files, and produces a detailed implementation plan.
-2. **Builder** — Main agent delegates the plan to `builder` to implement the feature/fix.
-3. **Unit-Tester** — After builder reports done, main agent delegates to `unit-tester` to run the project's unit/integration tests.
-4. **Browser-Tester** — After unit tests pass, main agent delegates to `browser-tester` for manual browser QA.
+### Usage Rules
 
-### Rules
-
-- **Always sequential** — wait for one subagent to finish before spawning the next.
-- **Only the main agent orchestrates** — subagents must not spawn or delegate to other subagents.
-- **Subagents execute one task, return a summary, and stop.**
-
-### Who runs which tests
-
-- **`builder`** — Minimal checks only: compile/build/lint or a **single** targeted command. **Do not** run the full test suite; that belongs to `unit-tester`.
-- **`unit-tester`** — The **authoritative** run of the project's unit/integration tests.
-- **`browser-tester`** — Manual browser QA via MCP browser tools.
-
-### When NOT to Delegate
-
-- Tiny one-file edits
-- Quick factual questions
-- Small tasks that complete faster directly
+- Use subagents when isolation or specialization is useful; do not delegate tiny one-file edits or quick factual questions.
+- Prefer documented modes: single `{ agent, task }`, parallel `{ tasks: [...] }`, or chain `{ chain: [...] }` with `{previous}` handoff.
+- User-level agents in `~/.pi/agent/agents/*.md` are loaded by default. Project-local `.pi/agents/*.md` require `agentScope: "project"` or `"both"` and should only be used for trusted repositories.
+- Subagents finish by returning normal final text from the child Pi process.
 
 ---
 
@@ -97,12 +85,3 @@ Load only these starter skills by default:
 
 The `commit` skill remains mandatory whenever creating commits.
 
----
-
-## Subagent Completion
-
-Subagents **must** invoke the `subagent_done` **tool** (not plain text) as their final action. If a subagent only writes prose, the parent session stays stuck on "running".
-
-This is especially critical for **local models** (llama-cpp, Ollama) — they often skip tool calls and finish in natural language. Always require the tool invocation.
-
-If a subagent session is stuck, invoke `subagent_done` in a follow-up turn.

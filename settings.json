@@ -1,7 +1,7 @@
 {
-  "lastChangelogVersion": "0.70.2",
+  "lastChangelogVersion": "0.75.5",
   "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.4",
+  "defaultModel": "gpt-5.5",
   "agents": {
     "defaults": {
       "timeoutSeconds": 120
@@ -11,8 +11,7 @@
   "theme": "dark",
   "packages": [
     "git:github.com/nicobailon/pi-mcp-adapter",
-    "npm:@netandreus/pi-cursor-provider",
-    "git:github.com/HazAT/pi-interactive-subagents"
+    "npm:@netandreus/pi-cursor-provider"
   ],
   "hideThinkingBlock": false,
   "extensions": []

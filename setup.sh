@@ -71,7 +71,7 @@ if [[ -f "models.json.template" ]]; then
 fi
 
 # Copy directories
-for dir in agents skills; do
+for dir in agents skills extensions prompts bin; do
   if [[ -d "$dir" ]]; then
     if [[ $DRY_RUN -eq 0 ]]; then
       cp -r "$dir" "$AGENT_DIR/"
