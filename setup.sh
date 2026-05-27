@@ -3,7 +3,7 @@
 # Usage: ./setup.sh [--dry-run]
 # Installs pi-agent configuration into ~/.pi/agent/
 #
-# Required environment variables (set in ~/.zshrc or ~/.bashrc):
+# Optional environment variables (set in ~/.zshrc or ~/.bashrc):
 #   PI_LLAMA_CPP_URL   - URL of your llama-cpp server (e.g. http://192.168.0.XXX:8080/v1)
 #   PI_OLLAMA_URL      - URL of your ollama server (e.g. http://192.168.0.XXX:11434/v1)
 
@@ -39,30 +39,18 @@ done
 # Generate models.json from template with env var substitution
 if [[ -f "models.json.template" ]]; then
   if [[ $DRY_RUN -eq 0 ]]; then
-    # Check required env vars
-    MISSING=()
-    if [[ -z "${PI_LLAMA_CPP_URL:-}" ]]; then
-      MISSING+=("PI_LLAMA_CPP_URL")
-    fi
-    if [[ -z "${PI_OLLAMA_URL:-}" ]]; then
-      MISSING+=("PI_OLLAMA_URL")
-    fi
-
-    if [[ ${#MISSING[@]} -gt 0 ]]; then
+    # Environment variables are optional; unset values become empty strings.
+    if [[ -z "${PI_LLAMA_CPP_URL:-}" || -z "${PI_OLLAMA_URL:-}" ]]; then
       echo ""
-      echo "⚠️  Missing environment variables: ${MISSING[*]}"
-      echo "   Add these to ~/.zshrc or ~/.bashrc:"
-      for var in "${MISSING[@]}"; do
-        echo "   export $var='your-value-here'"
-      done
-      echo "   Then run: source ~/.zshrc"
-      exit 1
+      echo "⚠️  PI_LLAMA_CPP_URL and/or PI_OLLAMA_URL are not set."
+      echo "   Generating models.json with empty URL placeholders."
+      echo "   Set them in ~/.zshrc or ~/.bashrc and rerun setup.sh if you need local providers."
     fi
 
     # Substitute env vars in the template using sed
     # Single quotes protect the ${VAR} placeholders from shell expansion
-    sed -e 's|${PI_LLAMA_CPP_URL}|'"$PI_LLAMA_CPP_URL"'|g' \
-        -e 's|${PI_OLLAMA_URL}|'"$PI_OLLAMA_URL"'|g' \
+    sed -e 's|${PI_LLAMA_CPP_URL}|'"${PI_LLAMA_CPP_URL:-}"'|g' \
+        -e 's|${PI_OLLAMA_URL}|'"${PI_OLLAMA_URL:-}"'|g' \
         "models.json.template" > "$AGENT_DIR/models.json"
     echo "  ✅ models.json (generated from template)"
   else

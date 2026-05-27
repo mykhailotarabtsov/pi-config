@@ -18,7 +18,7 @@ Pi agent configuration for easy setup across machines.
 
 ## Environment variables
 
-These must be set on each machine (add to `~/.zshrc` or `~/.bashrc`):
+These are optional. Set them on machines where you want local providers configured (add to `~/.zshrc` or `~/.bashrc`):
 
 ```bash
 # URL of your llama-cpp server (e.g., local machine or GPU server)
@@ -35,7 +35,7 @@ export PI_OLLAMA_URL="http://192.168.0.XXX:11434/v1"
 git clone git@github.com:mykhailotarabtsov/pi-config.git ~/pi-config
 cd ~/pi-config
 
-# 2. Set environment variables (see above)
+# 2. Optional: set local provider environment variables (see above)
 echo 'export PI_LLAMA_CPP_URL="http://192.168.0.XXX:8080/v1"' >> ~/.zshrc
 echo 'export PI_OLLAMA_URL="http://192.168.0.XXX:11434/v1"' >> ~/.zshrc
 source ~/.zshrc
@@ -44,7 +44,7 @@ source ~/.zshrc
 ./setup.sh
 ```
 
-This copies all config files into `~/.pi/agent/` and generates `models.json` from the template with your actual server URLs.
+This copies all config files into `~/.pi/agent/` and generates `models.json` from the template. If local provider environment variables are unset, their URL placeholders are left empty.
 
 ### Dry run
 
