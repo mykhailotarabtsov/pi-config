@@ -111,9 +111,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    // Subagents run in headless `pi --mode json -p --no-session` child processes.
+    // They cannot answer UI permission prompts, so allow normal file edits but
+    // keep blocking dangerous shell commands, MCP calls, and sensitive paths.
+    const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
+
     if (event.toolName === "bash") {
       const command = String(event.input.command ?? "");
       if (!command || !isDangerousBash(command) || trustedExactCommands.has(command)) return undefined;
+
+      if (isSubagentChild) {
+        return { block: true, reason: "Unsafe bash command blocked for headless subagent" };
+      }
 
       if (!ctx.hasUI) {
         return { block: true, reason: "Permission required for unsafe bash command, but no UI is available" };
@@ -138,11 +147,19 @@ export default function (pi: ExtensionAPI) {
       const key = `${event.toolName}:${filePath}`;
       if (trustedAllMutatingTools.has(event.toolName) || trustedToolPaths.has(key)) return undefined;
 
+      const sensitive = isSensitivePath(filePath);
+
+      if (isSubagentChild) {
+        if (sensitive) {
+          return { block: true, reason: `Sensitive path blocked for headless subagent: ${displayPath(filePath)}` };
+        }
+        return undefined;
+      }
+
       if (!ctx.hasUI) {
         return { block: true, reason: `Permission required for ${event.toolName} to ${displayPath(filePath)}, but no UI is available` };
       }
 
-      const sensitive = isSensitivePath(filePath);
       const choice = await ctx.ui.select(
         `${sensitive ? "🚨 Sensitive path" : "✏️ File modification"}\n\nTool: ${event.toolName}\nPath: ${displayPath(filePath)}\n\nAllow?`,
         [
@@ -170,6 +187,10 @@ export default function (pi: ExtensionAPI) {
       const tool = String(event.input.tool ?? "");
       const key = server ? `${server}/${tool}` : tool;
       if (trustedMcpTools.has(key)) return undefined;
+
+      if (isSubagentChild) {
+        return { block: true, reason: `MCP tool blocked for headless subagent: ${key}` };
+      }
 
       if (!ctx.hasUI) {
         return { block: true, reason: `Permission required for MCP tool ${key}, but no UI is available` };
