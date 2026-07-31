@@ -17,3 +17,4 @@ bin/
 
 # Generated from template (contains local IPs)
 models.json
+models-store.json
