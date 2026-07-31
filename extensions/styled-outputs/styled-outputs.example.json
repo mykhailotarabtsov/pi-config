@@ -1,0 +1,85 @@
+{
+  "_comment": "Place this file at ~/.pi/agent/configs/styled-outputs.json",
+  "assistantMessage": {
+    "prefix": "●",
+    "color": "text"
+  },
+  "userMessage": {
+    "prefix": "❯",
+    "color": "accent",
+    "bodyColor": "text",
+    "isThemeBackgroundVisible": true
+  },
+  "thinkingMessage": {
+    "prefix": "✽",
+    "prefixColor": "accent",
+    "label": "Thinking:",
+    "labelColor": "muted",
+    "isLabelVisible": false,
+    "messageColor": "dim"
+  },
+  "skills": {
+    "prefix": "✓",
+    "prefixColor": "accent",
+    "titleColor": "toolTitle",
+    "nameColor": "dim",
+    "labelColor": "success",
+    "expandHintColor": "dim",
+    "outputColor": "dim"
+  },
+  "customMessages": {
+    "prefix": "✓",
+    "prefixColor": "accent",
+    "titleColor": "toolTitle",
+    "nameColor": "dim",
+    "labelColor": "success",
+    "expandHintColor": "dim",
+    "outputColor": "dim"
+  },
+  "bashExecution": {
+    "titleColor": "toolTitle"
+  },
+  "tools": {
+    "toolSpinnerPrefix": {
+      "prefixChars": ["·", "✢", "✳", "✶", "✻", "✽"],
+      "color": "muted"
+    },
+    "toolSuccess": {
+      "prefix": "✓",
+      "prefixColor": "success",
+      "labelColor": "success"
+    },
+    "toolError": {
+      "prefix": "✗",
+      "prefixColor": "error",
+      "labelColor": "error"
+    },
+    "toolBranch": {
+      "prefix": "└─",
+      "color": "separator"
+    },
+    "general": {
+      "titleColor": "toolTitle",
+      "summaryColor": "dim",
+      "countColor": "muted",
+      "expandHintColor": "dim",
+      "outputColor": "dim",
+      "maxExpandedLines": 40,
+      "moreColor": "muted",
+      "moreBgColor": "separator",
+      "isThemeBackgroundVisible": false,
+      "verticalPadding": 0,
+      "horizontalPadding": 3,
+      "diffAddedColor": "toolDiffAdded",
+      "diffRemovedColor": "toolDiffRemoved",
+      "diffContextColor": "toolDiffContext",
+      "maxDiffFileSize": "1MB"
+    },
+    "groups": {
+      "base": {},
+      "mcp": {},
+      "web": {},
+      "custom": {}
+    }
+  }
+}

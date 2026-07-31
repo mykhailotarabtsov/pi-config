@@ -8,8 +8,13 @@
     }
   },
   "defaultThinkingLevel": "high",
-  "theme": "tokyo-night-storm-improved",
+  "theme": "slop",
+  "quietStartup": true,
   "packages": [],
-  "hideThinkingBlock": false,
+  "hideThinkingBlock": true,
+  "doubleEscapeAction": "tree",
+  "terminal": {
+    "showTerminalProgress": false
+  },
   "extensions": []
 }

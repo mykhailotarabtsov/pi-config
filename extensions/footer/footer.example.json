@@ -1,0 +1,50 @@
+{
+  "_comment": "Place this file at ~/.pi/agent/configs/footer.json",
+  "row1LeftSegments": ["pi", "separator", "model", "separator", "path", "git"],
+  "row1RightSegments": ["context_pct"],
+  "row2LeftSegments": [
+    "thinking",
+    "separator",
+    "caveman",
+    "separator",
+    "plan_mode",
+    "separator",
+    "chat_mode"
+  ],
+  "row2RightSegments": ["token_total", "separator", "cost"],
+  "icons": {
+    "pi": "\ue22c",
+    "folder": "\uf115",
+    "branch": "\uf126",
+    "git": "\uf1d3",
+    "separator": "|"
+  },
+  "colors": {
+    "model": "#c07898",
+    "thinkingHigh": "#afb9fe",
+    "thinkingXhigh": "#9575cd",
+    "thinkingMax": "#ce93d8",
+    "separator": "#87827a"
+  },
+  "segmentOptions": {
+    "path": {
+      "mode": "full"
+    },
+    "git": {
+      "showBranch": true,
+      "showStaged": true,
+      "showUnstaged": true,
+      "showUntracked": true
+    },
+    "contextBar": {
+      "barWidth": 18,
+      "filledChar": "▋",
+      "unfilledChar": "▋",
+      "unfilledColor": "#4e4c49",
+      "gradientStart": "#f29373",
+      "gradientMid": "#d67858",
+      "gradientEnd": "#ae4f2f",
+      "gradientMidPoint": 0.55
+    }
+  }
+}

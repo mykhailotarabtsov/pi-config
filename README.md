@@ -72,9 +72,9 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 | Extension                           | Description                                                                                                                                                                                                                                     |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `extensions/subagent/`              | Local subagent support based on Pi's official extension example. Registers the `subagent` tool and supports single, parallel, and chain delegation to `agents/*.md`.                                                                              |
-| `extensions/permission-gate.ts`     | Codex-style session permission prompts for file edits/writes, unsafe bash commands, and MCP tool calls. Use `/permissions clear` to reset session trust.                                                                                         |
+| `extensions/permission-gate.ts`     | Allows normal project reads/edits automatically, while guarding sensitive/out-of-project paths, unsafe bash commands, and MCP tool calls. Use `/permissions clear` to reset session trust.                                                      |
 | `extensions/context-workflow.ts`    | Structured 5-stage dev workflow (write → test → review → fix → verify). Starts with `/workflow [spec]`, auto-progresses with deterministic test gates and context-compacted code review. (source - https://github.com/owainlewis/pi-extensions) |
-| `extensions/fun-working-message.ts` | Replaces the default "Working..." status with a random message from a curated list each turn.                                                                                                                                                   |
+| `extensions/fun-working-message.ts.disabled` | Replaced by the Pikit spinners UI (`extensions/spinners/`) to avoid competing working-message timers.                                                                                                                                             |
 
 ## Updating configs
 
