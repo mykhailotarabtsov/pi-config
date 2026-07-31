@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const PATH_TOOLS = new Set(["read", "write", "edit"]);
 const MUTATING_TOOLS = new Set(["write", "edit"]);
@@ -232,6 +232,47 @@ export default function (pi: ExtensionAPI) {
   const trustedToolPaths = new Set<string>();
   const trustedMcpTools = new Set<string>();
   const trustedAllMutatingTools = new Set<string>();
+  const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
+
+  const checkBashPermission = async (command: string, cwd: string, ctx: ExtensionContext) => {
+    const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
+    const sensitive = containsSensitivePath(command);
+    const dangerous = isDangerousBash(command);
+    const outsideProject = containsOutOfProjectPath(command, cwd, boundaryRoot);
+    const subagentOutsideRoot = isSubagentChild && !isWithinProject(cwd, boundaryRoot);
+    if (!command || (!dangerous && !sensitive && !outsideProject && !subagentOutsideRoot) || trustedExactCommands.has(command)) {
+      return { allowed: true as const };
+    }
+
+    if (isSubagentChild) {
+      return {
+        allowed: false as const,
+        reason: sensitive
+          ? "Sensitive-path Bash command blocked for headless subagent"
+          : "Unsafe Bash command blocked for headless subagent",
+      };
+    }
+
+    if (!ctx.hasUI) {
+      return {
+        allowed: false as const,
+        reason: `Permission required for ${sensitive ? "sensitive" : "unsafe"} Bash command, but no UI is available`,
+      };
+    }
+
+    const choice = await ctx.ui.select(`${sensitive ? "🚨 Sensitive-path Bash command" : "⚠️ Allow unsafe Bash command"}?\n\n${command}`, [
+      "Allow once",
+      "Trust exact command for this session",
+      "Block",
+    ]);
+
+    if (choice === "Trust exact command for this session") {
+      trustedExactCommands.add(command);
+      return { allowed: true as const };
+    }
+    if (choice === "Allow once") return { allowed: true as const };
+    return { allowed: false as const, reason: "Blocked by permission gate" };
+  };
 
   pi.registerCommand("permissions", {
     description: "Show or clear session permission-gate trust rules",
@@ -261,46 +302,26 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.on("user_bash", async (event, ctx) => {
+    const permission = await checkBashPermission(event.command, event.cwd, ctx);
+    if (permission.allowed) return undefined;
+    return {
+      result: {
+        output: permission.reason,
+        exitCode: 1,
+        cancelled: false,
+        truncated: false,
+      },
+    };
+  });
+
   pi.on("tool_call", async (event, ctx) => {
     // Subagents run in headless `pi --mode json -p --no-session` child processes.
     // They cannot answer UI permission prompts, so allow normal work only inside
     // the parent project and block sensitive or out-of-boundary operations.
-    const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
-
     if (event.toolName === "bash") {
-      const command = String(event.input.command ?? "");
-      const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
-      const sensitive = containsSensitivePath(command);
-      const dangerous = isDangerousBash(command);
-      const outsideProject = containsOutOfProjectPath(command, ctx.cwd, boundaryRoot);
-      const subagentOutsideRoot = isSubagentChild && !isWithinProject(ctx.cwd, boundaryRoot);
-      if (!command || (!dangerous && !sensitive && !outsideProject && !subagentOutsideRoot) || trustedExactCommands.has(command)) return undefined;
-
-      if (isSubagentChild) {
-        return {
-          block: true,
-          reason: sensitive
-            ? "Sensitive-path Bash command blocked for headless subagent"
-            : "Unsafe Bash command blocked for headless subagent",
-        };
-      }
-
-      if (!ctx.hasUI) {
-        return { block: true, reason: `Permission required for ${sensitive ? "sensitive" : "unsafe"} Bash command, but no UI is available` };
-      }
-
-      const choice = await ctx.ui.select(`${sensitive ? "🚨 Sensitive-path Bash command" : "⚠️ Allow unsafe Bash command"}?\n\n${command}`, [
-        "Allow once",
-        "Trust exact command for this session",
-        "Block",
-      ]);
-
-      if (choice === "Trust exact command for this session") {
-        trustedExactCommands.add(command);
-        return undefined;
-      }
-      if (choice === "Allow once") return undefined;
-      return { block: true, reason: "Blocked by permission gate" };
+      const permission = await checkBashPermission(String(event.input.command ?? ""), ctx.cwd, ctx);
+      if (!permission.allowed) return { block: true, reason: permission.reason };
     }
 
     if (PATH_TOOLS.has(event.toolName)) {

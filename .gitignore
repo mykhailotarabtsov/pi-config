@@ -15,6 +15,9 @@ git/
 # Machine-specific binaries (won't work on other platforms)
 bin/
 
+# Local session handoffs
+.pi/handoffs/
+
 # Generated from template (contains local IPs)
 models.json
 models-store.json

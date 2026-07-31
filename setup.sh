@@ -25,7 +25,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
 fi
 
 # Copy config files
-for file in settings.json mcp.json AGENTS.md setup.sh; do
+for file in settings.json APPEND_SYSTEM.md mcp.json AGENTS.md setup.sh; do
   if [[ -f "$file" ]]; then
     if [[ $DRY_RUN -eq 0 ]]; then
       cp "$file" "$AGENT_DIR/"

@@ -4,15 +4,17 @@ Pi agent configuration for easy setup across machines.
 
 ## What's in here
 
-| File                   | Purpose                                                                |
+| File or directory      | Purpose                                                                |
 | ---------------------- | ---------------------------------------------------------------------- |
-| `settings.json`        | Default provider, model, theme, packages, extensions                   |
+| `settings.json`        | Default provider, model, theme, packages, and Pi settings              |
 | `models.json.template` | Model providers with env var placeholders (never commit `models.json`) |
-| `mcp.json`             | MCP server configurations                                              |
-| `AGENTS.md`            | Main agent system prompt and behaviors                                 |
-| `agents/*.md`          | Subagent definitions (official Pi extension format)                    |
-| `prompts/*.md`         | Prompt templates for subagent workflows                                |
-| `skills/*.md`          | Custom skill definitions (commit, change-review, learn-codebase, etc.) |
+| `AGENTS.md`            | Pi-specific subagent and skill configuration                           |
+| `APPEND_SYSTEM.md`     | Global coding principles appended to Pi's system prompt                |
+| `agents/*.md`          | Subagent definitions used by the local subagent extension              |
+| `prompts/*.md`         | Prompt templates, including implementation and handoff workflows       |
+| `skills/*/SKILL.md`    | Custom skill definitions (commit, review, GitHub, and setup workflows) |
+| `extensions/`          | Auto-discovered UI, workflow, permission, and subagent extensions      |
+| `themes/`              | Pi themes, with `slop.json` currently selected                         |
 | `bin/`                 | Helper binaries                                                        |
 | `setup.sh`             | One-command restore script                                             |
 
@@ -54,6 +56,28 @@ This copies all config files into `~/.pi/agent/` and generates `models.json` fro
 
 Shows what would be copied without making changes.
 
+## Current UI and behavior
+
+The configuration uses Pi's local auto-discovery for extensions, prompts, and
+skills; `settings.json` does not need to list each local extension explicitly.
+The active UI configuration includes:
+
+- `themes/slop.json` as the active theme.
+- A startup dashboard, styled transcript/tool output, boxed chat input, animated
+  working status, and a two-row footer.
+- Hidden thinking blocks, quiet startup, tree view on double Escape, and disabled
+  terminal progress.
+- A permission gate for sensitive paths, out-of-project access, unsafe Bash
+  commands, interactive `!`/`!!` commands, MCP calls, and headless subagents.
+- Local subagent delegation through `extensions/subagent/` and the structured
+  workflow extension in `extensions/context-workflow.ts`.
+
+The Pikit UI was ported without its artifacts, web access, MCP setup, plan/chat
+modes, or other non-UI modules. The original project is available at
+https://github.com/adrianapan/pikit. The old working-message extension remains
+renamed to `fun-working-message.ts.disabled` so it does not conflict with the
+new spinners extension.
+
 ## What's excluded from git
 
 These files are machine-specific and should never be committed:
@@ -69,12 +93,17 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 
 ## Custom extensions
 
-| Extension                           | Description                                                                                                                                                                                                                                     |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `extensions/subagent/`              | Local subagent support based on Pi's official extension example. Registers the `subagent` tool and supports single, parallel, and chain delegation to `agents/*.md`.                                                                              |
-| `extensions/permission-gate.ts`     | Allows normal project reads/edits automatically, while guarding sensitive/out-of-project paths, unsafe bash commands, and MCP tool calls. Use `/permissions clear` to reset session trust.                                                      |
-| `extensions/context-workflow.ts`    | Structured 5-stage dev workflow (write → test → review → fix → verify). Starts with `/workflow [spec]`, auto-progresses with deterministic test gates and context-compacted code review. (source - https://github.com/owainlewis/pi-extensions) |
-| `extensions/fun-working-message.ts.disabled` | Replaced by the Pikit spinners UI (`extensions/spinners/`) to avoid competing working-message timers.                                                                                                                                             |
+| Extension | Description |
+| --- | --- |
+| `extensions/styled-outputs/` | Styled assistant/user/thinking/tool transcript output, diffs, tool spinners, and `!`/`!!` command rendering. |
+| `extensions/footer/` | Two-row status footer with model, path, Git, context, token, and cost information. |
+| `extensions/chat-input/` | Boxed, theme-aware chat editor with native history, autocomplete, and paste support. |
+| `extensions/spinners/` | Animated working verbs with elapsed-time and token status. |
+| `extensions/startup/` | Startup dashboard showing loaded resources and keyboard shortcuts. |
+| `extensions/permission-gate.ts` | Allows ordinary in-project work while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Use `/permissions clear` to reset session trust. |
+| `extensions/subagent/` | Registers the `subagent` tool for single, parallel, and chained delegation to `agents/*.md`. |
+| `extensions/context-workflow.ts` | Structured write → test → review → fix → verify workflow, started with `/workflow [spec]`. |
+| `extensions/fun-working-message.ts.disabled` | Disabled because the Pikit spinners extension provides the working status without competing timers. |
 
 ## Updating configs
 
