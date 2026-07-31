@@ -1,14 +1,14 @@
 {
-  "lastChangelogVersion": "0.75.5",
+  "lastChangelogVersion": "0.83.0",
   "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.5",
+  "defaultModel": "gpt-5.6-luna",
   "agents": {
     "defaults": {
       "timeoutSeconds": 120
     }
   },
-  "defaultThinkingLevel": "medium",
-  "theme": "dark",
+  "defaultThinkingLevel": "high",
+  "theme": "tokyo-night-storm-improved",
   "packages": [],
   "hideThinkingBlock": false,
   "extensions": []
