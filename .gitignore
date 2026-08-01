@@ -8,6 +8,7 @@ auth.json
 sessions/
 mcp-cache.json
 mcp-npx-cache.json
+pi-debug.log
 
 # macOS
 .DS_Store

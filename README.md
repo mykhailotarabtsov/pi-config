@@ -58,6 +58,27 @@ This copies all config files into `~/.pi/agent/` and generates `models.json` fro
 
 Shows what would be copied without making changes.
 
+## Optional sandboxing with nono
+
+[nono](https://nono.sh/) can run Pi with OS-enforced filesystem and network restrictions. Review the profile before using it:
+
+```bash
+brew install nono
+nono pull nolabs-ai/pi
+nono profile show nolabs-ai/pi
+
+cd /path/to/project
+nono run --profile nolabs-ai/pi -- pi
+```
+
+For convenience, add this alias to `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+alias pi='nono run --profile nolabs-ai/pi -- pi'
+```
+
+Then reload the shell with `source ~/.zshrc`.
+
 ## Current UI and behavior
 
 The configuration uses Pi's local auto-discovery for extensions, prompts, and
