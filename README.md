@@ -7,6 +7,8 @@ Pi agent configuration for easy setup across machines.
 | File or directory      | Purpose                                                                |
 | ---------------------- | ---------------------------------------------------------------------- |
 | `settings.json`        | Default provider, model, theme, packages, and Pi settings              |
+| `package.json`         | Pinned runtime dependencies for the artifacts extension                |
+| `package-lock.json`    | Reproducible dependency lockfile                                      |
 | `models.json.template` | Model providers with env var placeholders (never commit `models.json`) |
 | `AGENTS.md`            | Pi-specific subagent and skill configuration                           |
 | `APPEND_SYSTEM.md`     | Global coding principles appended to Pi's system prompt                |
@@ -64,7 +66,7 @@ The active UI configuration includes:
 
 - `themes/slop.json` as the active theme.
 - A startup dashboard, styled transcript/tool output, boxed chat input, animated
-  working status, and a two-row footer.
+  working status, a two-row footer, and safe browser artifacts.
 - Hidden thinking blocks, quiet startup, tree view on double Escape, and disabled
   terminal progress.
 - A permission gate for sensitive paths, out-of-project access, unsafe Bash
@@ -72,8 +74,10 @@ The active UI configuration includes:
 - Local subagent delegation through `extensions/subagent/` and the structured
   workflow extension in `extensions/context-workflow.ts`.
 
-The Pikit UI was ported without its artifacts, web access, MCP setup, plan/chat
-modes, or other non-UI modules. The original project is available at
+The Pikit UI and a hardened artifacts extension are included; web access, MCP
+setup, plan/chat modes, and other non-UI modules are not. Artifacts default to
+sanitized Markdown/static HTML, project-contained file inputs, and a
+token-protected localhost server. The original project is available at
 https://github.com/adrianapan/pikit. The old working-message extension remains
 renamed to `fun-working-message.ts.disabled` so it does not conflict with the
 new spinners extension.
@@ -85,7 +89,9 @@ These files are machine-specific and should never be committed:
 ```
 auth.json      # Contains auth tokens
 models.json    # Generated from template (contains local IPs)
+node_modules/  # Installed runtime dependencies
 sessions/      # Conversation history
+.pi/artifacts/ # Generated browser artifacts
 mcp-cache.json / mcp-npx-cache.json  # Caches
 .git/          # Cloned repo data
 .DS_Store      # macOS junk
@@ -96,6 +102,7 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 | Extension | Description |
 | --- | --- |
 | `extensions/styled-outputs/` | Styled assistant/user/thinking/tool transcript output, diffs, tool spinners, and `!`/`!!` command rendering. |
+| `extensions/artifacts/` | Safe Markdown/static-HTML browser artifacts with diffs, code highlighting, optional pinned Mermaid, path restrictions, CSP, and a token-protected localhost server. |
 | `extensions/footer/` | Two-row status footer with model, path, Git, context, token, and cost information. |
 | `extensions/chat-input/` | Boxed, theme-aware chat editor with native history, autocomplete, and paste support. |
 | `extensions/spinners/` | Animated working verbs with elapsed-time and token status. |
@@ -113,4 +120,4 @@ After pulling new config from this repo, always run:
 ./setup.sh
 ```
 
-This regenerates `models.json` with your current environment variables, so if your server IP changes, it picks up the new value.
+This regenerates `models.json` with your current environment variables and installs the pinned runtime dependencies from `package-lock.json`, so if your server IP changes, it picks up the new value.

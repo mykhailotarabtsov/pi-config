@@ -1,0 +1,15 @@
+{
+  "name": "pi-config",
+  "private": true,
+  "description": "Local Pi agent configuration and extensions",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mermaid-js/tiny": "11.16.0",
+    "diff2html": "3.4.52",
+    "highlight.js": "11.11.1",
+    "marked": "18.0.5",
+    "sanitize-html": "2.17.0"
+  }
+}

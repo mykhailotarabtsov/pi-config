@@ -1,0 +1,8 @@
+{
+  "_comment": "Optional styling. Copy to ~/.pi/agent/configs/artifacts.json. Mermaid is enabled by default and uses the pinned local package asset."
+  "theme": "auto",
+  "accent": "#d67858",
+  "accentLight": "#b95730",
+  "maxWidth": 860,
+  "mermaid": true
+}

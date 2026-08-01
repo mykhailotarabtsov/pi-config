@@ -1,5 +1,8 @@
 # Sensitive
 auth.json
+.env
+.env.*
+!.env.example
 
 # Auto-generated / machine-specific
 sessions/
@@ -15,8 +18,10 @@ git/
 # Machine-specific binaries (won't work on other platforms)
 bin/
 
-# Local session handoffs
+# Local session handoffs and generated artifacts
 .pi/handoffs/
+.pi/artifacts/
+node_modules/
 
 # Generated from template (contains local IPs)
 models.json

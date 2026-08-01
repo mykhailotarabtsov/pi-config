@@ -52,6 +52,16 @@ For multi-step tasks, state a brief plan:
 3. [Step] → verify: [check]
 ```
 
-## 5. Visual Output
+## 5. Visual Output → Artifacts
 
-Keep visual or long output clear and concise. Use only tools and extensions that are actually installed in this Pi configuration. Do not assume that a browser artifact tool is available.
+Keep visual or long output clear and concise. When output is inherently visual or
+longer than a screen — reports, diagrams, rendered diffs, comparison tables —
+prefer the `artifact` tool over printing a wall of text in the terminal.
+
+- Use `kind: "markdown"` by default for prose, tables, diffs, and code.
+- Mermaid fences are supported when enabled, using a pinned browser dependency.
+- `kind: "html"` accepts only a static sanitized fragment; do not expect scripts,
+  widgets, iframes, styles, or full HTML documents to work.
+- File inputs must be relative, regular, non-sensitive files inside the project.
+- Do not assume artifacts are a security sandbox; untrusted repositories still
+  require normal review or a container/VM.
