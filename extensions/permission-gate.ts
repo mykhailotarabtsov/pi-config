@@ -233,8 +233,19 @@ export default function (pi: ExtensionAPI) {
   const trustedMcpTools = new Set<string>();
   const trustedAllMutatingTools = new Set<string>();
   const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
+  const isFirstmateWorker = process.env.PI_FIRSTMATE_WORKER === "1" && !isSubagentChild;
+  const withPermissionDialog = async <T>(label: string, dialog: () => Promise<T>): Promise<T> => {
+    pi.events.emit("herdr:blocked", { active: true, label });
+    try {
+      return await dialog();
+    } finally {
+      pi.events.emit("herdr:blocked", { active: false });
+    }
+  };
 
   const checkBashPermission = async (command: string, cwd: string, ctx: ExtensionContext) => {
+    if (isFirstmateWorker) return { allowed: true as const };
+
     const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
     const sensitive = containsSensitivePath(command);
     const dangerous = isDangerousBash(command);
@@ -260,11 +271,14 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    const choice = await ctx.ui.select(`${sensitive ? "🚨 Sensitive-path Bash command" : "⚠️ Allow unsafe Bash command"}?\n\n${command}`, [
-      "Allow once",
-      "Trust exact command for this session",
-      "Block",
-    ]);
+    const choice = await withPermissionDialog(
+      "Unsafe Bash",
+      () => ctx.ui.select(`${sensitive ? "🚨 Sensitive-path Bash command" : "⚠️ Allow unsafe Bash command"}?\n\n${command}`, [
+        "Allow once",
+        "Trust exact command for this session",
+        "Block",
+      ]),
+    );
 
     if (choice === "Trust exact command for this session") {
       trustedExactCommands.add(command);
@@ -324,7 +338,7 @@ export default function (pi: ExtensionAPI) {
       if (!permission.allowed) return { block: true, reason: permission.reason };
     }
 
-    if (PATH_TOOLS.has(event.toolName)) {
+    if (PATH_TOOLS.has(event.toolName) && !isFirstmateWorker) {
       const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
       const filePath = normalizePath(event.input.path, ctx.cwd);
       const key = `${event.toolName}:${filePath}`;
@@ -353,14 +367,17 @@ export default function (pi: ExtensionAPI) {
         return { block: true, reason: `Permission required for ${event.toolName} to ${displayPath(filePath)}, but no UI is available` };
       }
 
-      const choice = await ctx.ui.select(
-        `${sensitive || protectedMutation ? "🚨 Protected path" : "📁 Outside project"}\n\nTool: ${event.toolName}\nPath: ${displayPath(filePath)}\n\nAllow?`,
-        [
-          "Allow once",
-          "Trust this file for this session",
-          ...(MUTATING_TOOLS.has(event.toolName) ? [`Trust all ${event.toolName} calls for this session`] : []),
-          "Block",
-        ],
+      const choice = await withPermissionDialog(
+        "Protected path",
+        () => ctx.ui.select(
+          `${sensitive || protectedMutation ? "🚨 Protected path" : "📁 Outside project"}\n\nTool: ${event.toolName}\nPath: ${displayPath(filePath)}\n\nAllow?`,
+          [
+            "Allow once",
+            "Trust this file for this session",
+            ...(MUTATING_TOOLS.has(event.toolName) ? [`Trust all ${event.toolName} calls for this session`] : []),
+            "Block",
+          ],
+        ),
       );
 
       if (choice === "Trust this file for this session") {
@@ -375,7 +392,7 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: "Blocked by permission gate" };
     }
 
-    if (event.toolName === "mcp" && event.input.tool) {
+    if (!isFirstmateWorker && event.toolName === "mcp" && event.input.tool) {
       const server = String(event.input.server ?? "");
       const tool = String(event.input.tool ?? "");
       const key = server ? `${server}/${tool}` : tool;
@@ -389,11 +406,14 @@ export default function (pi: ExtensionAPI) {
         return { block: true, reason: `Permission required for MCP tool ${key}, but no UI is available` };
       }
 
-      const choice = await ctx.ui.select(`🔌 Allow MCP tool call?\n\n${key}\n\nArgs:\n${String(event.input.args ?? "")}`, [
-        "Allow once",
-        "Trust this MCP tool for this session",
-        "Block",
-      ]);
+      const choice = await withPermissionDialog(
+        "MCP tool",
+        () => ctx.ui.select(`🔌 Allow MCP tool call?\n\n${key}\n\nArgs:\n${String(event.input.args ?? "")}`, [
+          "Allow once",
+          "Trust this MCP tool for this session",
+          "Block",
+        ]),
+      );
 
       if (choice === "Trust this MCP tool for this session") {
         trustedMcpTools.add(key);

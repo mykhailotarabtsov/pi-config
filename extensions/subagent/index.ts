@@ -256,7 +256,23 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
+const DEFAULT_SUBAGENT_MODEL = "openai-codex/gpt-5.6-luna:high";
+
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
+
+function canRetryWithFallback(result: SingleResult): boolean {
+	const usedTools = result.messages.some(
+		(message) =>
+			message.role === "toolResult" ||
+			(message.role === "assistant" && message.content.some((part) => part.type === "toolCall")),
+	);
+	if (usedTools) return false;
+
+	return (
+		result.exitCode !== 0 ||
+		(result.stopReason === "error" && result.usage.input === 0 && result.usage.output === 0)
+	);
+}
 
 async function runSingleAgent(
 	defaultCwd: string,
@@ -268,6 +284,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	fallbackModel?: string,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -285,8 +302,8 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
+	const selectedModel = agent.model ?? DEFAULT_SUBAGENT_MODEL;
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", selectedModel];
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -300,7 +317,7 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: selectedModel,
 		step,
 	};
 
@@ -410,6 +427,24 @@ async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) throw new Error("Subagent was aborted");
+
+		if (fallbackModel && fallbackModel !== selectedModel && canRetryWithFallback(currentResult)) {
+			const fallbackAgents = agents.map((candidate) =>
+				candidate.name === agentName ? { ...candidate, model: fallbackModel } : candidate,
+			);
+			return runSingleAgent(
+				defaultCwd,
+				fallbackAgents,
+				agentName,
+				task,
+				cwd,
+				step,
+				signal,
+				onUpdate,
+				makeDetails,
+			);
+		}
+
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -473,6 +508,9 @@ export default function (pi: ExtensionAPI) {
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			const fallbackModel = ctx.model
+				? `${ctx.model.provider}/${ctx.model.id}:${ctx.thinkingLevel ?? "high"}`
+				: undefined;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -559,6 +597,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						fallbackModel,
 					);
 					results.push(result);
 
@@ -637,6 +676,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
+						fallbackModel,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -673,6 +713,7 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
+					fallbackModel,
 				);
 				const isError = isFailedResult(result);
 				if (isError) {

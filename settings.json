@@ -10,7 +10,11 @@
   "defaultThinkingLevel": "high",
   "theme": "slop",
   "quietStartup": true,
-  "packages": [],
+  "packages": [
+    {
+      "source": "/Users/mykhailotarabtsov/.config/nono/packages/nolabs-ai/pi"
+    }
+  ],
   "hideThinkingBlock": true,
   "doubleEscapeAction": "tree",
   "terminal": {
