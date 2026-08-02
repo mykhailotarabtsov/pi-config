@@ -16,6 +16,8 @@ Pi agent configuration for easy setup across machines.
 | `prompts/*.md`         | Prompt templates, including implementation and handoff workflows       |
 | `skills/*/SKILL.md`    | Custom skill definitions (commit, review, GitHub, and setup workflows) |
 | `extensions/`          | Auto-discovered UI, workflow, permission, and subagent extensions      |
+| `extensions/firstmate/` | Herdr-gated Firstmate coordination and Treehouse task lifecycle       |
+| `tests/firstmate-delivery.test.mjs` | Focused delivery and teardown guard tests                  |
 | `themes/`              | Pi themes, with `slop.json` currently selected                         |
 | `bin/`                 | Helper binaries                                                        |
 | `setup.sh`             | One-command restore script                                             |
@@ -102,6 +104,43 @@ token-protected localhost server. The original project is available at
 https://github.com/adrianapan/pikit. The old working-message extension remains
 renamed to `fun-working-message.ts.disabled` so it does not conflict with the
 new spinners extension.
+
+## Herdr Firstmate workflow
+
+The `extensions/firstmate/` extension is auto-discovered by Pi. It is active only
+inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane coordinates work,
+while each worker runs as a visible Pi tab. Project tasks require [Treehouse](https://github.com/kunchenguid/treehouse),
+which leases isolated worktrees instead of running workers in the primary checkout.
+
+Use this safe lifecycle:
+
+```text
+task_create -> worker structured report -> task_reconcile -> explicit task_deliver
+(fast-forward landing) -> idempotent delivery retry if needed -> task_teardown
+```
+
+`task_reconcile` validates the worker's structured report. `task_deliver` must
+explicitly land the worker branch with a local fast-forward before cleanup; retry
+it idempotently if a delivery attempt needs to be repeated. `task_teardown` then
+verifies the exact task identity, closes the exact worker tab, and returns the
+exact Treehouse lease. Delivery must happen before teardown. Do not manually
+close worker tabs before cleanup.
+
+Firstmate is inspired by [firstmate](https://github.com/kunchenguid/firstmate),
+but this configuration ports only local-only delivery and teardown behavior,
+not the full PR workflow.
+
+For Firstmate changes, run the focused tests in
+`tests/firstmate-delivery.test.mjs`, applicable Node syntax checks, and finish
+with `git diff --check` plus link/path grep validation.
+
+## Project-local session files
+
+`/handoff` and `/pickup` use project-relative `.pi/handoffs/`; handoffs are
+project-local documents. Artifact output uses project-relative `.pi/artifacts/`.
+Generated `.pi/artifacts/` is excluded from git. These commands resolve paths
+relative to the session cwd, so start Pi in the project or use an absolute
+handoff path.
 
 ## What's excluded from git
 
