@@ -1,5 +1,6 @@
 # Sensitive
 auth.json
+trust.json
 .env
 .env.*
 !.env.example

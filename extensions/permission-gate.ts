@@ -9,6 +9,11 @@ const MUTATING_TOOLS = new Set(["write", "edit"]);
 // classify safely. Treat the whole command as requiring approval rather than
 // trying to prove that every chained segment is read-only.
 const SHELL_CONTROL = /[\n\r;&|`$()<>\\]/;
+const GIT_PUSH_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+push(?:\s|$)/i;
+
+function containsGitPush(command: string): boolean {
+  return GIT_PUSH_COMMAND.test(command.replaceAll(/["']/g, ""));
+}
 
 const DANGEROUS_BASH = [
   /\bsudo\b/,
@@ -233,7 +238,8 @@ export default function (pi: ExtensionAPI) {
   const trustedMcpTools = new Set<string>();
   const trustedAllMutatingTools = new Set<string>();
   const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
-  const isFirstmateWorker = process.env.PI_FIRSTMATE_WORKER === "1" && !isSubagentChild;
+  const isFirstmateExecution = process.env.PI_FIRSTMATE_WORKER === "1";
+  const isFirstmateWorker = isFirstmateExecution && !isSubagentChild;
   const withPermissionDialog = async <T>(label: string, dialog: () => Promise<T>): Promise<T> => {
     pi.events.emit("herdr:blocked", { active: true, label });
     try {
@@ -244,6 +250,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   const checkBashPermission = async (command: string, cwd: string, ctx: ExtensionContext) => {
+    if (isFirstmateExecution && containsGitPush(command)) {
+      return { allowed: false as const, reason: "git push is blocked for Firstmate workers and their subagents" };
+    }
     if (isFirstmateWorker) return { allowed: true as const };
 
     const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
@@ -390,6 +399,10 @@ export default function (pi: ExtensionAPI) {
       }
       if (choice === "Allow once") return undefined;
       return { block: true, reason: "Blocked by permission gate" };
+    }
+
+    if (isFirstmateExecution && event.toolName === "mcp") {
+      return { block: true, reason: "MCP calls are blocked for Firstmate workers and their subagents" };
     }
 
     if (!isFirstmateWorker && event.toolName === "mcp" && event.input.tool) {

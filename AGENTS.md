@@ -37,6 +37,7 @@ It is intentionally gated:
 - A per-workspace marker prevents later visible Herdr worker Pi panes from becoming firstmate sessions.
 - Firstmate sessions are coordination-only: active tools are limited to `read`, `grep`, `find`, `ls`, and `herdr_control`; `subagent`, `edit`, `write`, and `bash` are removed.
 - Firstmate starts/coordinates one visible Herdr tab per worker, never a split pane. When the firstmate is Pi, worker agent starts must use Herdr kind `pi` (the tool derives the current kind; do not hardcode another kind such as `codex`). Worker tabs inherit the firstmate session's active Node runtime.
+- Firstmate sessions default to shared-checkout workers. Use `/firstmate-isolation worktree` to make later `task_create` calls lease isolated Treehouse worktrees, or `/firstmate-isolation shared` to switch back. Do not run concurrent shared-checkout workers for the same project.
 - Firstmate names the Pi session `firstmate` and attempts to rename the Herdr agent to `firstmate`.
 
 ### Firstmate operating contract
@@ -45,11 +46,11 @@ The captain is the firstmate's only user-facing contact. Firstmate coordinates p
 
 Before delegation, firstmate must inspect enough context to identify the project, scope, authority, and success condition. It asks the captain a focused clarification when any of those are ambiguous; it does not delegate speculative or invented work.
 
-Each worker receives a precise brief with the objective, relevant context, file or scope boundaries, constraints, preservation of unrelated changes, commit authority, explicit success criteria, required tests or validation, and the expected outcome report. Every worker gets its own visible Herdr tab without taking the captain's focus. The worker uses the same Herdr agent kind as firstmate (a Pi firstmate starts Pi workers), and its tab inherits firstmate's active Node runtime.
+Each worker receives a precise brief with the objective, relevant context, file or scope boundaries, constraints, preservation of unrelated changes, commit authority, explicit success criteria, required tests or validation, and the expected outcome report. Every worker gets its own visible Herdr tab without taking the captain's focus. The worker uses the same Herdr agent kind as firstmate (a Pi firstmate starts Pi workers), and its tab inherits firstmate's active Node runtime. Shared-checkout tasks are already local and need no delivery; worktree tasks require explicit delivery before teardown.
 
 Firstmate waits for and reads worker results, then reconciles them against the request, brief, changed files, and test or validation evidence before reporting. A blocked worker is handled by identifying the exact missing input or dependency, providing it, asking the captain, or reporting the blocker; firstmate does not silently substitute work. A failed worker is reported plainly with evidence and is retried only for a concrete, in-scope diagnosis. Blocked or failed work is never presented as complete.
 
-Workers must make surgical changes and preserve unrelated working-tree changes. They must not commit unless the captain explicitly asks. Firstmate's final response addresses the captain as `captain` and reports the outcome, changed files (or none), tests and validation with results, reconciliation evidence, and blockers, failures, or unresolved decisions. It does not claim work, tests, validation, or files that were not reported or verified.
+Workers must make surgical changes and preserve unrelated working-tree changes. Workers and their subagents must never push, publish, or use MCP calls; the Firstmate permission gate hard-blocks those paths. They must not commit unless the captain explicitly asks. Firstmate's final response addresses the captain as `captain` and reports the outcome, changed files (or none), tests and validation with results, reconciliation evidence, and blockers, failures, or unresolved decisions. It does not claim work, tests, validation, or files that were not reported or verified.
 
 ## Skill Triggers
 

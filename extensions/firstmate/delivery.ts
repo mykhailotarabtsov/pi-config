@@ -1,21 +1,21 @@
 export type LocalDeliveryProbe = {
-  defaultBranch: string
-  currentBranch: string
-  clean: boolean
+  targetBranch: string
+  dirtyPathCheckSucceeded: boolean
+  dirtyPathsOverlap: boolean
   branchExists: boolean
   fastForward: boolean
 }
 
 export type LocalDeliveryDecision =
   | { allowed: true }
-  | { allowed: false; reason: 'wrong-branch' | 'dirty' | 'missing-branch' | 'diverged' | 'no-default-branch' }
+  | { allowed: false; reason: 'detached' | 'dirty-path-check-failed' | 'dirty-overlap' | 'missing-branch' | 'diverged' }
 
 export function assessLocalDelivery(probe: LocalDeliveryProbe): LocalDeliveryDecision {
-  if (!probe.defaultBranch) return { allowed: false, reason: 'no-default-branch' }
-  if (probe.currentBranch !== probe.defaultBranch) return { allowed: false, reason: 'wrong-branch' }
-  if (!probe.clean) return { allowed: false, reason: 'dirty' }
+  if (!probe.targetBranch) return { allowed: false, reason: 'detached' }
   if (!probe.branchExists) return { allowed: false, reason: 'missing-branch' }
   if (!probe.fastForward) return { allowed: false, reason: 'diverged' }
+  if (!probe.dirtyPathCheckSucceeded) return { allowed: false, reason: 'dirty-path-check-failed' }
+  if (probe.dirtyPathsOverlap) return { allowed: false, reason: 'dirty-overlap' }
   return { allowed: true }
 }
 

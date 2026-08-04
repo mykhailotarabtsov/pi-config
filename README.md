@@ -16,7 +16,7 @@ Pi agent configuration for easy setup across machines.
 | `prompts/*.md`         | Prompt templates, including implementation and handoff workflows       |
 | `skills/*/SKILL.md`    | Custom skill definitions (commit, review, GitHub, and setup workflows) |
 | `extensions/`          | Auto-discovered UI, workflow, permission, and subagent extensions      |
-| `extensions/firstmate/` | Herdr-gated Firstmate coordination and Treehouse task lifecycle       |
+| `extensions/firstmate/` | Herdr-gated Firstmate coordination, session isolation, and task lifecycle |
 | `tests/firstmate-delivery.test.mjs` | Focused delivery and teardown guard tests                  |
 | `themes/`              | Pi themes, with `slop.json` currently selected                         |
 | `bin/`                 | Helper binaries                                                        |
@@ -109,22 +109,36 @@ new spinners extension.
 
 The `extensions/firstmate/` extension is auto-discovered by Pi. It is active only
 inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane coordinates work,
-while each worker runs as a visible Pi tab. Project tasks require [Treehouse](https://github.com/kunchenguid/treehouse),
-which leases isolated worktrees instead of running workers in the primary checkout.
+while each worker runs as a visible Pi tab.
 
-Use this safe lifecycle:
+Firstmate uses a session-scoped worker isolation mode. The default is `shared`,
+which starts the worker in the requested project checkout. Switch modes with:
+
+```text
+/firstmate-isolation shared
+/firstmate-isolation worktree
+```
+
+The selection is persisted in the Pi session and applies to later `task_create`
+calls. Shared-checkout tasks are already local, so they require only a structured
+report and reconciliation before teardown. Worktree tasks use [Treehouse](https://github.com/kunchenguid/treehouse)
+for isolated leases and follow this lifecycle:
 
 ```text
 task_create -> worker structured report -> task_reconcile -> explicit task_deliver
 (fast-forward landing) -> idempotent delivery retry if needed -> task_teardown
 ```
 
-`task_reconcile` validates the worker's structured report. `task_deliver` must
-explicitly land the worker branch with a local fast-forward before cleanup; retry
-it idempotently if a delivery attempt needs to be repeated. `task_teardown` then
-verifies the exact task identity, closes the exact worker tab, and returns the
-exact Treehouse lease. Delivery must happen before teardown. Do not manually
-close worker tabs before cleanup.
+`task_reconcile` validates the worker's structured report. `task_deliver` is only
+for worktree tasks and must explicitly land the worker branch with a local
+fast-forward before cleanup; retry it idempotently if a delivery attempt needs to
+be repeated. `task_teardown` verifies the exact task identity, closes the exact
+worker tab, and returns the Treehouse lease when applicable. Do not manually close
+worker tabs before cleanup.
+
+Firstmate workers and their subagents cannot push or publish remote changes. The
+permission gate hard-blocks `git push`, blocks MCP calls that could bypass this
+rule, and Firstmate rejects push commands sent through `pane_run`.
 
 Firstmate is inspired by [firstmate](https://github.com/kunchenguid/firstmate),
 but this configuration ports only local-only delivery and teardown behavior,
@@ -148,6 +162,7 @@ These files are machine-specific and should never be committed:
 
 ```
 auth.json      # Contains auth tokens
+trust.json     # Machine-specific project trust decisions
 models.json    # Generated from template (contains local IPs)
 node_modules/  # Installed runtime dependencies
 sessions/      # Conversation history

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+for argument in "$@"; do
+  if [ "$argument" = "push" ]; then
+    echo "git push is blocked for Firstmate workers and their subagents." >&2
+    exit 126
+  fi
+done
+
+exec "${PI_FIRSTMATE_REAL_GIT:-/usr/bin/git}" "$@"

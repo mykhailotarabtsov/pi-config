@@ -3,17 +3,32 @@ import test from 'node:test'
 import { assessLocalDelivery, canCleanupAfterDelivery } from '../extensions/firstmate/delivery.ts'
 import { readFile } from 'node:fs/promises'
 
-const clean = { defaultBranch: 'main', currentBranch: 'main', clean: true, branchExists: true, fastForward: true }
+const fastForward = { targetBranch: 'feature/current', dirtyPathCheckSucceeded: true, dirtyPathsOverlap: false, branchExists: true, fastForward: true }
 
-test('delivery refuses wrong branch, dirty, missing branch, and diverged primary state', () => {
-  assert.deepEqual(assessLocalDelivery({ ...clean, currentBranch: 'feature' }), { allowed: false, reason: 'wrong-branch' })
-  assert.deepEqual(assessLocalDelivery({ ...clean, clean: false }), { allowed: false, reason: 'dirty' })
-  assert.deepEqual(assessLocalDelivery({ ...clean, branchExists: false }), { allowed: false, reason: 'missing-branch' })
-  assert.deepEqual(assessLocalDelivery({ ...clean, fastForward: false }), { allowed: false, reason: 'diverged' })
+test('delivery allows unrelated dirty paths on the current feature branch', () => {
+  assert.deepEqual(assessLocalDelivery(fastForward), { allowed: true })
 })
 
-test('delivery permits a clean fast-forward and cleanup only after landing', () => {
-  assert.deepEqual(assessLocalDelivery(clean), { allowed: true })
+test('delivery rejects an overlapping tracked modification', () => {
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathsOverlap: true }), { allowed: false, reason: 'dirty-overlap' })
+})
+
+test('delivery rejects an incomplete dirty-path check', () => {
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathCheckSucceeded: false }), { allowed: false, reason: 'dirty-path-check-failed' })
+})
+
+test('delivery rejects an overlapping untracked path', () => {
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathsOverlap: true }), { allowed: false, reason: 'dirty-overlap' })
+})
+
+test('delivery refuses detached, missing branch, and diverged primary state', () => {
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, targetBranch: '' }), { allowed: false, reason: 'detached' })
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, branchExists: false }), { allowed: false, reason: 'missing-branch' })
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, fastForward: false }), { allowed: false, reason: 'diverged' })
+})
+
+test('delivery permits a feature-branch fast-forward and cleanup only after landing', () => {
+  assert.deepEqual(assessLocalDelivery(fastForward), { allowed: true })
   assert.equal(canCleanupAfterDelivery({ reportCompleted: true, deliveryStatus: 'failed', leaseStatus: 'leased' }), false)
   assert.equal(canCleanupAfterDelivery({ reportCompleted: false, deliveryStatus: 'landed', leaseStatus: 'leased' }), false)
   assert.equal(canCleanupAfterDelivery({ reportCompleted: true, deliveryStatus: 'landed', leaseStatus: 'leased' }), true)
@@ -30,6 +45,7 @@ test('extension source keeps delivery and cleanup identity/return guards', async
   assert.match(source, /runHerdr\(\['tab', 'close', helper\.tabId\]/)
   assert.match(source, /deliveryHelperTabId/)
   assert.match(source, /leaseReturnHelperTabId/)
+  assert.match(source, /deliveryTargetBranch/)
   assert.match(source, /task delivery requires a reconciled completed worker report/)
   assert.match(source, /idempotent: true/)
   assert.match(source, /task\.branch !== `firstmate\/\$\{taskId\}`/)
@@ -43,6 +59,53 @@ test('extension source keeps delivery and cleanup identity/return guards', async
   assert.match(source, /task teardown requires successful explicit local delivery before cleanup/)
   assert.match(source, /agent_status/)
   assert.match(source, /status !== 'idle' && status !== 'done'/)
+})
+
+test('Treehouse provisioning resolves the base ref and creates the worker branch in the leased worktree before start', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const taskCreateStart = source.indexOf("case 'task_create'")
+  const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
+  const provisioning = source.slice(taskCreateStart, taskCreateEnd)
+  assert.match(provisioning, /treehouse get --lease/)
+  assert.match(source, /origin_head=\$\(git symbolic-ref --quiet --short refs\/remotes\/origin\/HEAD/)
+  assert.match(source, /for candidate in main master/)
+  assert.match(source, /git switch --create "\$branch" -- "\$base"/)
+  assert.match(provisioning, /const branchSetupCommand = treehouseWorkerBranchCommand\(branch, task\.reviewTarget\)/)
+  assert.match(provisioning, /runHerdr\(branchSetupArgs, signal, timeout\)/)
+  assert.ok(provisioning.indexOf('branchSetupArgs') < provisioning.indexOf("const startArgs = ['agent', 'start'"), 'branch setup must precede agent start')
+  assert.doesNotMatch(provisioning, /treehouse get --lease.*--branch/)
+})
+
+test('reviewTarget is an additive inspection input and keeps review cleanup separate from delivery', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  assert.match(source, /reviewTarget: Type\.Optional\(Type\.String/)
+  assert.match(source, /reviewTarget\?: string/)
+  assert.match(source, /review_target=\$\{shellQuote\(reviewTarget \|\| ''\)\}/)
+  assert.match(source, /This is a review task\. Inspect the existing target ref/)
+  assert.match(source, /review tasks are inspection-only and cannot be locally delivered/)
+  assert.match(source, /const reviewTask = typeof task\.reviewTarget === 'string'/)
+  assert.match(source, /if \(task\.worktreeProvider === 'treehouse' && !reviewTask && \(!canCleanupAfterDelivery\(/)
+})
+
+test('delivery targets the current branch, checks NUL-delimited dirty-path overlap, and retains backwards-safe state handling', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const deliveryStart = source.indexOf("case 'task_deliver'")
+  const deliveryEnd = source.indexOf("case 'task_teardown'", deliveryStart)
+  const delivery = source.slice(deliveryStart, deliveryEnd)
+  assert.match(delivery, /target_ref=\$\(git -C "\$project" symbolic-ref --quiet HEAD/)
+  assert.match(delivery, /case "\$target_ref" in refs\/heads\/\*\) target=/)
+  assert.match(delivery, /merge-base --is-ancestor "\$target" "\$branch"/)
+  assert.ok(delivery.includes('target=%s\\\\ndirty_paths_check=%s\\\\ndirty_paths_overlap=%s'))
+  assert.match(delivery, /diff --name-only -z/)
+  assert.match(delivery, /diff --cached --name-only -z/)
+  assert.match(delivery, /ls-files --others --exclude-standard -z/)
+  assert.match(delivery, /diff --name-only --no-renames -z "\$target" "\$branch" > "\$worker_paths"/)
+  assert.match(delivery, /entries\.push\(bytes\.subarray\(start,index\)\)/)
+  assert.match(delivery, /dirtyAncestors/)
+  assert.match(delivery, /shellQuote\(process\.execPath\)/)
+  assert.doesNotMatch(delivery, /refs\/remotes\/origin\/HEAD/)
+  assert.match(delivery, /deliveryTargetBranch: values\.target, deliveryDefaultBranch: undefined/)
+  assert.match(delivery, /task\.deliveryTargetBranch \|\| task\.deliveryDefaultBranch/)
 })
 
 test('delivery refusal records a failure without exiting before wrapper status write', async () => {
@@ -101,4 +164,65 @@ test('teardown recovers an absent recorded worker tab after durable return succe
   assert.ok(source.includes('let taskTeardownReport: WorkerReport | undefined'))
   assert.ok(teardownSource.includes('taskTeardownReport = validation.report'))
   assert.ok(teardownSource.includes('report: taskTeardownReport'))
+})
+
+test('Firstmate defaults to session-scoped shared isolation and can switch to worktrees', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const taskCreateStart = source.indexOf("case 'task_create'")
+  const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
+  const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
+  const teardownStart = source.indexOf("case 'task_teardown'")
+  const teardownEnd = source.indexOf("case 'tab_create'", teardownStart)
+  const teardown = source.slice(teardownStart, teardownEnd)
+
+  assert.match(source, /const ISOLATION_STATE_ENTRY = 'firstmate-isolation'/)
+  assert.match(source, /let isolationMode: IsolationMode = 'shared'/)
+  assert.match(source, /pi\.registerCommand\('firstmate-isolation'/)
+  assert.match(source, /pi\.appendEntry\(ISOLATION_STATE_ENTRY, \{ mode: requested \}\)/)
+  assert.match(source, /restoreIsolationMode\(ctx\)/)
+  assert.match(taskCreate, /const taskIsolation = isolationMode/)
+  assert.match(taskCreate, /worktreeProvider: taskIsolation === 'shared' \? 'herdr' : 'treehouse'/)
+  assert.match(taskCreate, /if \(taskIsolation === 'worktree'\) \{\n              const leaseArgs/)
+  assert.match(taskCreate, /fs\.promises\.realpath\(project\)/)
+  assert.match(taskCreate, /a shared-checkout task is already active for this project/)
+  assert.match(taskCreate, /reviewTarget tasks require worktree isolation/)
+  assert.match(source, /shared-checkout tasks are already local and must not use task_deliver/)
+  assert.match(teardown, /task\.worktreeProvider === 'treehouse' && !reviewTask/)
+  assert.match(teardown, /leaseNotRequired: task\.worktreeProvider === 'herdr'/)
+})
+
+test('Firstmate workers and subagents have a hard no-push guard', async () => {
+  const firstmate = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const permissionGate = await readFile(new URL('../extensions/permission-gate.ts', import.meta.url), 'utf8')
+  const gitWrapper = await readFile(new URL('../extensions/firstmate/worker-git/git', import.meta.url), 'utf8')
+
+  assert.ok(firstmate.includes('const GIT_PUSH_COMMAND = /\\bgit'))
+  assert.match(firstmate, /if \(containsGitPush\(params\.command\)\) return errorResult\('git push is blocked/)
+  assert.match(firstmate, /export \$\{WORKER_ENV\}=1/)
+  assert.match(permissionGate, /const isFirstmateExecution = process\.env\.PI_FIRSTMATE_WORKER === "1"/)
+  assert.match(permissionGate, /if \(isFirstmateExecution && containsGitPush\(command\)\)/)
+  assert.match(permissionGate, /MCP calls are blocked for Firstmate workers and their subagents/)
+  assert.match(firstmate, /FIRSTMATE_WORKER_BIN_DIR/)
+  assert.match(firstmate, /PI_FIRSTMATE_REAL_GIT/)
+  assert.match(gitWrapper, /\[ "\$argument" = "push" \]/)
+  assert.match(gitWrapper, /exit 126/)
+})
+
+test('Pi worker starts append enforced Luna/high arguments after caller native arguments', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const helperStart = source.indexOf('function appendWorkerNativeArgs')
+  const helperEnd = source.indexOf('\n\nexport default function firstmate', helperStart)
+  const helper = source.slice(helperStart, helperEnd)
+  const taskCreateStart = source.indexOf("case 'task_create'")
+  const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
+  const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
+  const manualStart = source.indexOf("case 'agent_start'")
+  const manualEnd = source.indexOf("case 'agent_prompt'", manualStart)
+  const manual = source.slice(manualStart, manualEnd)
+
+  assert.ok(source.includes("const PI_WORKER_NATIVE_ARGS = ['--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'high']"))
+  assert.ok(helper.indexOf("args.push('--', ...nativeArgs)") < helper.indexOf('args.push(...PI_WORKER_NATIVE_ARGS)'))
+  assert.match(helper, /if \(kind === 'pi'\) args\.push\(\.\.\.PI_WORKER_NATIVE_ARGS\)/)
+  assert.ok(taskCreate.includes('appendWorkerNativeArgs(startArgs, kind)'))
+  assert.ok(manual.includes('appendWorkerNativeArgs(args, kind!, params.args)'))
 })
