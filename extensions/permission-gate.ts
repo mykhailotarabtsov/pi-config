@@ -198,6 +198,23 @@ function isWithinProject(filePath: string, cwd: string): boolean {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+function isWithinGlobalPi(filePath: string): boolean {
+  const home = process.env.HOME;
+  if (!home || filePath === "(unknown path)") return false;
+
+  let resolvedGlobalPi: string;
+  try {
+    resolvedGlobalPi = realpathSync(path.join(home, ".pi"));
+  } catch {
+    return false;
+  }
+
+  const resolvedFile = resolveForBoundary(filePath);
+  if (!resolvedFile) return false;
+  const relative = path.relative(resolvedGlobalPi, resolvedFile);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 function containsSensitivePath(command: string): boolean {
   const normalized = command.replaceAll("\\", "/").replaceAll(/["']/g, "").toLowerCase();
   const directoryPath = /(?:^|[\s/])(?:\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.terraform\.d|\.git)(?:[\s/]|$)/;
@@ -355,10 +372,15 @@ export default function (pi: ExtensionAPI) {
       const protectedMutation = MUTATING_TOOLS.has(event.toolName)
         && hasPathSegment(filePath, MUTATION_PROTECTED_DIRECTORY_NAMES);
       const inProject = isWithinProject(filePath, boundaryRoot);
-      const needsApproval = sensitive || protectedMutation || !inProject;
+      const globalPiRead = event.toolName === "read"
+        && !isSubagentChild
+        && !sensitive
+        && isWithinGlobalPi(filePath);
+      const needsApproval = sensitive || protectedMutation || (!inProject && !globalPiRead);
 
       // Ordinary project reads and edits are allowed without interruption.
-      // Sensitive paths and writes outside the project remain guarded.
+      // Non-sensitive global ~/.pi reads are also allowed for interactive users;
+      // sensitive paths, mutations, symlink escapes, and headless access remain guarded.
       if (!needsApproval) return undefined;
       if (!sensitive && MUTATING_TOOLS.has(event.toolName) && trustedAllMutatingTools.has(event.toolName)) return undefined;
       if (trustedToolPaths.has(key)) return undefined;

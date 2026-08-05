@@ -23,6 +23,8 @@ const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID_RE = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
 const WORKSPACE_ID_RE = /^w[0-9A-Za-z]+$/
 const AGENT_KIND_RE = /^[a-z][a-z0-9_-]{0,31}$/
+const ALLOWED_WORKER_KINDS = ['pi', 'claude'] as const
+const DEFAULT_WORKER_KIND = 'pi' as const
 const TARGET_RE = /^(?:w[0-9A-Za-z]+:p[0-9A-Za-z]+|[a-z][a-z0-9_-]{0,31})$/
 const TASK_ID_RE = /^task-[a-z0-9]+-[0-9a-f]{8}-[0-9a-f]{3}$/
 const WATCHER_INTERVAL_MS = 5_000
@@ -30,6 +32,9 @@ const WATCHER_RECENCY_WINDOW_MS = 2 * WATCHER_INTERVAL_MS
 const TREEHOUSE_RETURN_SUCCESS_MARKER = 'Worktree returned to pool.'
 const PI_WORKER_NATIVE_ARGS = ['--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'high']
 const ISOLATION_STATE_ENTRY = 'firstmate-isolation'
+const WORKER_STATE_ENTRY = 'firstmate-worker'
+
+type WorkerKind = (typeof ALLOWED_WORKER_KINDS)[number]
 
 const FIRSTMATE_SYSTEM_PROMPT = `
 # Herdr Firstmate Role
@@ -57,7 +62,7 @@ For each worker, write a precise brief containing:
 - explicit success criteria and the tests or validation to run; and
 - the expected report: outcome, changed files, tests, validation, and blockers.
 
-Every worker gets its own visible Herdr tab. Create a new tab per worker (not a split pane), without taking the captain's focus. Start the worker with the same Herdr agent kind as this firstmate; omit kind so herdr_control derives it. A Pi firstmate starts Pi workers only, using openai-codex/gpt-5.6-luna with high thinking effort. Worker tabs inherit this firstmate session's active Node runtime.
+Every worker gets its own visible Herdr tab. Create a new tab per worker (not a split pane), without taking the captain's focus. Start workers with the selected allowlisted worker kind (pi by default, or claude when explicitly selected). Worker tabs inherit this firstmate session's active Node runtime.
 
 ## Supervision and outcomes
 
@@ -84,7 +89,7 @@ const HerdrControlParams = Type.Object({
   label: Type.Optional(Type.String({ description: 'Optional label for a new worker tab.' })),
   target: Type.Optional(Type.String({ description: 'Agent target: unique agent name or pane id hosting an agent.' })),
   name: Type.Optional(Type.String({ description: 'Agent name for agent_start. Must match [a-z][a-z0-9_-]{0,31}.' })),
-  kind: Type.Optional(Type.String({ description: 'Agent kind for agent_start. Omit to derive the current firstmate agent kind (pi when firstmate is Pi).' })),
+  kind: Type.Optional(StringEnum(ALLOWED_WORKER_KINDS, { description: 'Allowlisted worker kind for task_create or agent_start: pi (default) or claude.' })),
   cwd: Type.Optional(Type.String({ description: 'Working directory for tab_create. Defaults to current Pi cwd.' })),
   command: Type.Optional(Type.String({ description: 'Command text for pane_run. Passed to herdr CLI as one argv, never interpolated by a shell in this extension.' })),
   prompt: Type.Optional(Type.String({ description: 'Prompt text for agent_prompt.' })),
@@ -109,7 +114,7 @@ type ControlParams = {
   label?: string
   target?: string
   name?: string
-  kind?: string
+  kind?: WorkerKind
   cwd?: string
   command?: string
   prompt?: string
@@ -188,7 +193,7 @@ type TaskRecord = {
   branch: string
   reviewTarget?: string
   workerName?: string
-  workerKind?: string
+  workerKind?: WorkerKind
   status: TaskStatus
   reportPath: string
   reportStatus: ReportStatus
@@ -249,6 +254,7 @@ function isWatcherTaskRecord(value: unknown, taskId: string): value is TaskRecor
   if (value.deliveryHelperTabId !== undefined && typeof value.deliveryHelperTabId !== 'string') return false
   if (value.deliveryHelperPaneId !== undefined && typeof value.deliveryHelperPaneId !== 'string') return false
   if (value.reviewTarget !== undefined && typeof value.reviewTarget !== 'string') return false
+  if (value.workerKind !== undefined && !isWorkerKind(value.workerKind)) return false
   if (value.leaseReturnHelperTabId !== undefined && typeof value.leaseReturnHelperTabId !== 'string') return false
   if (value.leaseReturnHelperPaneId !== undefined && typeof value.leaseReturnHelperPaneId !== 'string') return false
   return true
@@ -508,9 +514,13 @@ function validateAgentName(value: string | undefined): string | undefined {
   return undefined
 }
 
-function validateKind(value: string | undefined): string | undefined {
-  if (!value) return 'agent kind could not be derived; pass `kind` explicitly.'
-  if (!AGENT_KIND_RE.test(value)) return '`kind` must match [a-z][a-z0-9_-]{0,31}.'
+function isWorkerKind(value: unknown): value is WorkerKind {
+  return ALLOWED_WORKER_KINDS.includes(value as WorkerKind)
+}
+
+function validateWorkerKind(value: string | undefined): string | undefined {
+  if (!value) return 'worker kind is required; use `pi` or `claude`.'
+  if (!isWorkerKind(value)) return '`kind` must be one of: pi, claude.'
   return undefined
 }
 
@@ -572,7 +582,9 @@ export default function firstmate(pi: ExtensionAPI) {
   let active = false
   let registered = false
   let isolationCommandRegistered = false
+  let workerCommandRegistered = false
   let isolationMode: IsolationMode = 'shared'
+  let selectedWorkerKind: WorkerKind = DEFAULT_WORKER_KIND
   let currentAgentKind: string | undefined
   let watcherInterval: ReturnType<typeof setInterval> | undefined
   let watcherRunning = false
@@ -896,6 +908,44 @@ export default function firstmate(pi: ExtensionAPI) {
     })
   }
 
+  function restoreWorkerKind(ctx: { sessionManager: { getBranch: () => Array<{ type: string; customType?: string; data?: unknown }> } }): void {
+    selectedWorkerKind = DEFAULT_WORKER_KIND
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== 'custom' || entry.customType !== WORKER_STATE_ENTRY || !isRecord(entry.data) || !isWorkerKind(entry.data.kind)) continue
+      selectedWorkerKind = entry.data.kind
+    }
+  }
+
+  function registerWorkerCommand(): void {
+    if (workerCommandRegistered) return
+    workerCommandRegistered = true
+    pi.registerCommand('firstmate-worker', {
+      description: 'Show or set the worker kind for this session: pi (default) or claude.',
+      handler: async (args, ctx) => {
+        if (!active) {
+          ctx.ui.notify('Firstmate worker selection is only available in the active Herdr firstmate pane.', 'warning')
+          return
+        }
+        const requested = args.trim()
+        if (!requested) {
+          ctx.ui.notify(`Firstmate worker: ${selectedWorkerKind}. Use /firstmate-worker pi or /firstmate-worker claude.`, 'info')
+          return
+        }
+        if (!isWorkerKind(requested)) {
+          ctx.ui.notify('Use /firstmate-worker pi or /firstmate-worker claude.', 'warning')
+          return
+        }
+        try {
+          pi.appendEntry(WORKER_STATE_ENTRY, { kind: requested })
+          selectedWorkerKind = requested
+          ctx.ui.notify(`Firstmate worker set to ${selectedWorkerKind} for this session.`, 'info')
+        } catch (error) {
+          ctx.ui.notify(`Could not persist Firstmate worker selection: ${(error as Error).message}`, 'error')
+        }
+      },
+    })
+  }
+
   function registerFirstmateTool(): void {
     if (registered) return
     registered = true
@@ -914,7 +964,7 @@ export default function firstmate(pi: ExtensionAPI) {
         "Use task_teardown after task_reconcile for shared-checkout and review tasks, or only after task_deliver has landed ordinary worktree tasks; it verifies the exact recorded worker endpoint, closes only that worker tab, and returns the Treehouse lease only for worktree tasks.",
         'Create one new tab per worker; do not use split panes for workers.',
         "tab_create pins each worker tab to the firstmate session's active Node runtime; verify node and pi versions if startup fails.",
-        'Use herdr_control agent_start without kind; it derives and enforces the current firstmate kind, so Pi firstmates start Pi workers with kind pi on openai-codex/gpt-5.6-luna with high thinking effort.',
+        'Use the session-selected worker kind for task_create and agent_start by omitting kind; it defaults to pi. Use kind: claude for an explicit Claude override, or /firstmate-worker claude to select Claude for later workers. Pi workers receive the enforced openai-codex/gpt-5.6-luna and high-thinking arguments; those arguments are never added to Claude workers.',
         'Never auto-close completed worker tabs; use task_deliver before task_teardown for worktree tasks, task_teardown after reconciliation for shared-checkout tasks, or tab_close for existing explicit tab cleanup after the outcome is reconciled and authority to close the tab is established.',
       ],
       parameters: HerdrControlParams,
@@ -1077,6 +1127,7 @@ export default function firstmate(pi: ExtensionAPI) {
               workspaceId,
               paneId: process.env.HERDR_PANE_ID,
               currentAgentKind,
+              selectedWorkerKind,
               watcher: watcherDetails(),
               workspaceList: parseJsonMaybe(workspaceList.stdout) ?? workspaceList,
               currentPane: parseJsonMaybe(currentPane.stdout) ?? currentPane,
@@ -1094,6 +1145,9 @@ export default function firstmate(pi: ExtensionAPI) {
             const projectError = validateOptionalCwd(params.project)
             if (projectError) return errorResult(projectError, { action: params.action })
             if (!params.prompt) return errorResult('`prompt` is required for task_create.', { action: params.action })
+            const taskWorkerKind = params.kind === undefined ? selectedWorkerKind : params.kind
+            const taskWorkerKindError = validateWorkerKind(taskWorkerKind)
+            if (taskWorkerKindError) return errorResult(taskWorkerKindError, { action: params.action, kind: params.kind })
             const reviewTargetError = validateOptionalCwd(params.reviewTarget)
             if (reviewTargetError) return errorResult(reviewTargetError, { action: params.action })
             if (params.reviewTarget !== undefined && !params.reviewTarget.trim()) return errorResult('`reviewTarget` must be a non-empty ref when provided.', { action: params.action })
@@ -1139,6 +1193,7 @@ export default function firstmate(pi: ExtensionAPI) {
               paneId: null,
               branch,
               ...(params.reviewTarget !== undefined ? { reviewTarget: params.reviewTarget } : {}),
+              workerKind: taskWorkerKind,
               status: 'provisioning',
               reportPath,
               reportStatus: 'pending',
@@ -1159,9 +1214,7 @@ export default function firstmate(pi: ExtensionAPI) {
               return errorResult(message, { action: params.action, taskId, taskPath, task, ...details })
             }
 
-            const kind = await deriveCurrentAgentKind(signal)
-            const kindError = validateKind(kind)
-            if (kindError) return failTask(kindError)
+            const kind = taskWorkerKind
             if (!AGENT_NAME_RE.test(workerName)) return failTask('generated worker name is invalid.')
 
             const workspaceId = process.env.HERDR_WORKSPACE_ID
@@ -2228,13 +2281,9 @@ export default function firstmate(pi: ExtensionAPI) {
             if (nameError) return errorResult(nameError, { action: params.action })
             const paneError = validatePaneId(params.paneId)
             if (paneError) return errorResult(paneError, { action: params.action })
-            const derivedKind = await deriveCurrentAgentKind(signal)
-            if (params.kind && derivedKind && params.kind !== derivedKind) {
-              return errorResult(`worker kind must match the firstmate kind (${derivedKind}); received ${params.kind}.`, { action: params.action, derivedKind })
-            }
-            const kind = params.kind || derivedKind
-            const kindError = validateKind(kind)
-            if (kindError) return errorResult(kindError, { action: params.action })
+            const kind = params.kind === undefined ? selectedWorkerKind : params.kind
+            const kindError = validateWorkerKind(kind)
+            if (kindError) return errorResult(kindError, { action: params.action, kind: params.kind })
             const workerEnvResult = await runHerdr(['pane', 'run', params.paneId!, `export ${WORKER_ENV}=1 PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`], signal, 10_000)
             if (workerEnvResult.code !== 0) return errorResult(commandResultText('herdr pane run (worker environment)', workerEnvResult), { action: params.action, paneId: params.paneId })
             args = ['agent', 'start', params.name!, '--kind', kind!, '--pane', params.paneId!]
@@ -2416,7 +2465,9 @@ export default function firstmate(pi: ExtensionAPI) {
     if (!active) return
 
     restoreIsolationMode(ctx)
+    restoreWorkerKind(ctx)
     registerIsolationCommand()
+    registerWorkerCommand()
     registerFirstmateTool()
     registerTurnEndGuard()
     applyFirstmateTools()
@@ -2443,9 +2494,7 @@ export default function firstmate(pi: ExtensionAPI) {
   pi.on('before_agent_start', (event) => {
     if (!active) return
     applyFirstmateTools()
-    const kindLine = currentAgentKind
-      ? `\n\nCurrent Herdr agent kind derived for this firstmate: ${currentAgentKind}. Use that as the default worker kind; Pi workers use openai-codex/gpt-5.6-luna with high thinking effort.`
-      : '\n\nCurrent Herdr agent kind will be derived by herdr_control at agent_start time; do not guess another kind. Pi workers use openai-codex/gpt-5.6-luna with high thinking effort.'
+    const kindLine = `\n\nCurrent firstmate agent kind: ${currentAgentKind || 'unknown'}. Current selected worker kind: ${selectedWorkerKind}; task_create and agent_start use this by default. Select the allowlisted worker kind with /firstmate-worker pi or /firstmate-worker claude.`
     const isolationLine = `\n\nCurrent session isolation mode: ${isolationMode}. task_create must use ${isolationMode === 'shared' ? 'the requested shared checkout; do not start concurrent shared tasks for that project' : 'an isolated Treehouse worktree and require task_deliver before teardown'}. The captain can switch it with /firstmate-isolation shared or /firstmate-isolation worktree.`
     return { systemPrompt: `${FIRSTMATE_SYSTEM_PROMPT}${kindLine}${isolationLine}\n\n${event.systemPrompt}` }
   })

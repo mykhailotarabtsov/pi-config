@@ -109,7 +109,7 @@ new spinners extension.
 
 The `extensions/firstmate/` extension is auto-discovered by Pi. It is active only
 inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane coordinates work,
-while each worker runs as a visible Pi tab.
+while each worker runs as a visible worker tab.
 
 Firstmate uses a session-scoped worker isolation mode. The default is `shared`,
 which starts the worker in the requested project checkout. Switch modes with:
@@ -120,7 +120,11 @@ which starts the worker in the requested project checkout. Switch modes with:
 ```
 
 The selection is persisted in the Pi session and applies to later `task_create`
-calls. Shared-checkout tasks are already local, so they require only a structured
+calls. Worker selection is explicitly allowlisted: Pi is the default, and Claude
+can be selected for later workers with `/firstmate-worker claude` (or overridden
+per task with `kind: "claude"`). Use `/firstmate-worker pi` to restore the default.
+The same `kind` override is supported by manual `agent_start`; invalid kinds are
+rejected. Shared-checkout tasks are already local, so they require only a structured
 report and reconciliation before teardown. Worktree tasks use [Treehouse](https://github.com/kunchenguid/treehouse)
 for isolated leases and follow this lifecycle:
 
@@ -182,7 +186,7 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 | `extensions/chat-input/` | Boxed, theme-aware chat editor with native history, autocomplete, and paste support. |
 | `extensions/spinners/` | Animated working verbs with elapsed-time and token status. |
 | `extensions/startup/` | Startup dashboard showing loaded resources and keyboard shortcuts. |
-| `extensions/permission-gate.ts` | Allows ordinary in-project work while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Use `/permissions clear` to reset session trust. |
+| `extensions/permission-gate.ts` | Allows ordinary in-project work and non-sensitive reads under the current user’s global `~/.pi` while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Use `/permissions clear` to reset session trust. |
 | `extensions/subagent/` | Registers the `subagent` tool for single, parallel, and chained delegation to `agents/*.md`. |
 | `extensions/context-workflow.ts` | Structured write → test → review → fix → verify workflow, started with `/workflow [spec]`. |
 | `extensions/fun-working-message.ts.disabled` | Disabled because the Pikit spinners extension provides the working status without competing timers. |
