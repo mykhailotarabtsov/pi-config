@@ -94,8 +94,7 @@ The active UI configuration includes:
   terminal progress.
 - A permission gate for sensitive paths, out-of-project access, unsafe Bash
   commands, interactive `!`/`!!` commands, MCP calls, and headless subagents.
-- Local subagent delegation through `extensions/subagent/` and the structured
-  workflow extension in `extensions/context-workflow.ts`.
+- Local subagent delegation through `extensions/subagent/`.
 
 The Pikit UI and a hardened artifacts extension are included; web access, MCP
 setup, plan/chat modes, and other non-UI modules are not. Artifacts default to
@@ -188,7 +187,6 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 | `extensions/startup/` | Startup dashboard showing loaded resources and keyboard shortcuts. |
 | `extensions/permission-gate.ts` | Allows ordinary in-project work and non-sensitive reads under the current user’s global `~/.pi` while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Use `/permissions clear` to reset session trust. |
 | `extensions/subagent/` | Registers the `subagent` tool for single, parallel, and chained delegation to `agents/*.md`. |
-| `extensions/context-workflow.ts` | Structured write → test → review → fix → verify workflow, started with `/workflow [spec]`. |
 | `extensions/fun-working-message.ts.disabled` | Disabled because the Pikit spinners extension provides the working status without competing timers. |
 
 ## Updating configs

@@ -28,6 +28,9 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+// Chain handoffs are prompt input to the next child; keep them bounded without losing context at either edge.
+export const CHAIN_HANDOFF_MAX_CHARS = 12_000;
+const CHAIN_HANDOFF_TRUNCATION_MARKER = "\n\n[Previous output truncated: beginning and end preserved.]\n\n";
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -195,6 +198,24 @@ function truncateParallelOutput(output: string): string {
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
+export function truncateChainHandoff(output: string): string {
+	if (output.length <= CHAIN_HANDOFF_MAX_CHARS) return output;
+	const available = CHAIN_HANDOFF_MAX_CHARS - CHAIN_HANDOFF_TRUNCATION_MARKER.length;
+	const headLength = Math.ceil(available / 2);
+	const tailLength = Math.floor(available / 2);
+	return `${output.slice(0, headLength)}${CHAIN_HANDOFF_TRUNCATION_MARKER}${output.slice(-tailLength)}`;
+}
+
+export function createSubagentEnvironment(defaultCwd: string): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("HERDR_") || key.startsWith("PI_FIRSTMATE_")) delete env[key];
+	}
+	env.PI_SUBAGENT_CHILD = "1";
+	env.PI_PERMISSION_ROOT = process.env.PI_PERMISSION_ROOT ?? path.resolve(defaultCwd);
+	return env;
+}
+
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
 
 function getDisplayItems(messages: Message[]): DisplayItem[] {
@@ -345,11 +366,7 @@ async function runSingleAgent(
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
-				env: {
-					...process.env,
-					PI_SUBAGENT_CHILD: "1",
-					PI_PERMISSION_ROOT: process.env.PI_PERMISSION_ROOT ?? path.resolve(defaultCwd),
-				},
+				env: createSubagentEnvironment(defaultCwd),
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -610,7 +627,7 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					previousOutput = getFinalOutput(result.messages);
+					previousOutput = truncateChainHandoff(getFinalOutput(result.messages));
 				}
 				return {
 					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],

@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.83.0",
+  "lastChangelogVersion": "0.84.1",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-luna",
   "agents": {
@@ -7,7 +7,7 @@
       "timeoutSeconds": 120
     }
   },
-  "defaultThinkingLevel": "high",
+  "defaultThinkingLevel": "xhigh",
   "theme": "slop",
   "quietStartup": true,
   "packages": [
@@ -20,5 +20,6 @@
   "terminal": {
     "showTerminalProgress": false
   },
-  "extensions": []
+  "extensions": [],
+  "tuiMode": "fullscreen"
 }

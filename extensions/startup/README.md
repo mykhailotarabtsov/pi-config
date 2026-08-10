@@ -27,12 +27,12 @@ The extension counts what is active via pi's command registry and standard pi pa
 
 | Type | Source |
 |------|--------|
-| Models | `~/.pi/agent/settings.json`, `<cwd>/.pi/settings.json` (`enabledModels`) |
+| Models | `~/.pi/agent/settings.json`, `<cwd>/.pi/settings.json` (`defaultModel` and `enabledModels`) |
 | Context files | `~/.pi/agent/AGENTS.md`, `~/.claude/AGENTS.md`, `<cwd>/AGENTS.md`, `<cwd>/CLAUDE.md`, `<cwd>/.pi/AGENTS.md` |
 | Extensions | `~/.pi/agent/settings.json`, `<cwd>/.pi/settings.json` (each package's `package.json` `pi.extensions` manifest — glob-expanded, with `!`/`+`/`-` overrides — under `npm/node_modules/<name>` and `git/<host>/<path>`, user + project scope; packages with no manifest fall back to a convention `extensions/` dir; object-form entries may additionally filter via an `extensions` array, where `[]` disables all), plus local dirs `~/.pi/agent/extensions/`, `<cwd>/.pi/extensions/`, `<cwd>/extensions/` (smart discovery: flat `.ts`/`.js` files and `index.ts` subdirs, mirroring pi's `collectAutoExtensionEntries`) |
 | Skills | pi command registry — `pi.getCommands()` with `source: "skill"` (local + package-installed) |
 | Prompt templates | pi command registry — `pi.getCommands()` with `source: "prompt"` (local + package-installed) |
-| MCP servers | `~/.pi/agent/configs/mcp.json` |
+| MCP servers | `~/.pi/agent/mcp.json` |
 
 ## Icons
 

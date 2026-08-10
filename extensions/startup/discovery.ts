@@ -309,7 +309,7 @@ export interface LoadedCounts {
   mcpServers: number;
 }
 
-function countContextFiles(homeDir: string, cwd: string): number {
+export function countContextFiles(homeDir: string, cwd: string): number {
   const paths = [
     join(homeDir, ".pi", "agent", "AGENTS.md"),
     join(homeDir, ".claude", "AGENTS.md"),
@@ -317,7 +317,7 @@ function countContextFiles(homeDir: string, cwd: string): number {
     join(cwd, "CLAUDE.md"),
     join(cwd, ".pi", "AGENTS.md"),
   ];
-  return paths.filter(existsSync).length;
+  return new Set(paths.filter(existsSync)).size;
 }
 
 // Parse a `git:` source into the host/path segments pi uses for its on-disk
@@ -396,7 +396,7 @@ function countTemplates(commands: CommandLike): number {
   return seen.size;
 }
 
-function countModels(homeDir: string, cwd: string): number {
+export function countModels(homeDir: string, cwd: string): number {
   const seen = new Set<string>();
   const paths = [
     join(homeDir, ".pi", "agent", "settings.json"),
@@ -406,6 +406,8 @@ function countModels(homeDir: string, cwd: string): number {
     if (!existsSync(path)) continue;
     try {
       const settings = JSON.parse(readFileSync(path, "utf8"));
+      const defaultModel = settings?.defaultModel;
+      if (typeof defaultModel === "string" && defaultModel.trim()) seen.add(defaultModel.trim());
       const arr = settings?.enabledModels;
       if (Array.isArray(arr)) {
         for (const m of arr) if (typeof m === "string" && m.trim()) seen.add(m.trim());
@@ -415,8 +417,8 @@ function countModels(homeDir: string, cwd: string): number {
   return seen.size;
 }
 
-function countMcpServers(homeDir: string): number {
-  const configPath = join(homeDir, ".pi", "agent", "configs", "mcp.json");
+export function countMcpServers(homeDir: string): number {
+  const configPath = join(homeDir, ".pi", "agent", "mcp.json");
   if (!existsSync(configPath)) return 0;
   try {
     const cfg = JSON.parse(readFileSync(configPath, "utf-8"));

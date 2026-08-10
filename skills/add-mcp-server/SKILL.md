@@ -16,7 +16,7 @@ Ask the user if not obvious from context:
 | **Global** | `~/.pi/agent/mcp.json` | Server used across all projects |
 | **Project** | `.pi/mcp.json` (project root) | Server specific to one project |
 
-Project-local configs override global ones. Both files use the same format.
+Project-local configs override global ones. Both files use the same format. Pi core has no built-in MCP; this repository uses `~/.pi/agent/mcp.json` as the canonical global path (and `.pi/mcp.json` for project-local configuration).
 
 ## Step 2: Determine Server Type
 
