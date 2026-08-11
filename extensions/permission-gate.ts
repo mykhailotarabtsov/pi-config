@@ -356,6 +356,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (process.env.PI_FIRSTMATE_ACTIVE === "1" && event.toolName === "subagent") {
+      return { block: true, terminate: true, reason: "Firstmate delegates implementation work through visible Herdr worker tabs via herdr_control" };
+    }
+
     // Subagents run in headless `pi --mode json -p --no-session` child processes.
     // They cannot answer UI permission prompts, so allow normal work only inside
     // the parent project and block sensitive or out-of-boundary operations.

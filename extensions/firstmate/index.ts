@@ -16,6 +16,7 @@ const REPORT_VERSION = 1
 const WORKER_ENV = 'PI_FIRSTMATE_WORKER'
 const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
+const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
 const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'herdr_control']
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
@@ -549,6 +550,7 @@ function appendWorkerNativeArgs(args: string[], kind: string, nativeArgs: string
 export default function firstmate(pi: ExtensionAPI) {
   if (!inHerdr()) return
 
+  delete process.env[ACTIVE_ENV]
   let active = false
   let registered = false
   let isolationCommandRegistered = false
@@ -2426,7 +2428,11 @@ export default function firstmate(pi: ExtensionAPI) {
       ctx.ui.notify(`Firstmate marker error: ${(error as Error).message}`, 'warning')
       active = false
     }
-    if (!active) return
+    if (!active) {
+      delete process.env[ACTIVE_ENV]
+      return
+    }
+    process.env[ACTIVE_ENV] = '1'
 
     restoreIsolationMode(ctx)
     restoreWorkerKind(ctx)
@@ -2448,6 +2454,7 @@ export default function firstmate(pi: ExtensionAPI) {
   })
 
   pi.on('session_shutdown', async () => {
+    delete process.env[ACTIVE_ENV]
     stopWatcher()
   })
 
@@ -2466,7 +2473,7 @@ export default function firstmate(pi: ExtensionAPI) {
   pi.on('tool_call', (event) => {
     if (!active) return
     if (!ALLOWED_TOOLS.includes(event.toolName)) {
-      return { block: true, reason: 'Firstmate is coordination-only: only read, grep, find, ls, and herdr_control are active.' }
+      return { block: true, terminate: true, reason: 'Firstmate is coordination-only: only read, grep, find, ls, and herdr_control are active.' }
     }
   })
 }

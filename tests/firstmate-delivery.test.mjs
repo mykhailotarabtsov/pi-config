@@ -208,6 +208,21 @@ test('Firstmate workers and subagents have a hard no-push guard', async () => {
   assert.match(gitWrapper, /exit 126/)
 })
 
+test('Firstmate activation gates the headless path while task_create starts visible workers', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const sessionStart = source.slice(source.indexOf("pi.on('session_start'"), source.indexOf("pi.on('session_shutdown'"))
+  const taskCreateStart = source.indexOf("case 'task_create'")
+  const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
+  const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
+
+  assert.match(sessionStart, /process\.env\[ACTIVE_ENV\] = '1'/)
+  assert.match(source, /delete process\.env\[ACTIVE_ENV\]/)
+  assert.match(source, /ALLOWED_TOOLS = \['read', 'grep', 'find', 'ls', 'herdr_control'\]/)
+  assert.match(taskCreate, /const startArgs = \['agent', 'start'/)
+  assert.match(taskCreate, /const promptArgs = \['agent', 'prompt'/)
+  assert.doesNotMatch(taskCreate, /subagent/)
+})
+
 test('Pi worker starts append enforced Luna/high arguments after caller native arguments', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const helperStart = source.indexOf('function appendWorkerNativeArgs')

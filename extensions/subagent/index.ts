@@ -543,6 +543,14 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
+			if (process.env.PI_FIRSTMATE_ACTIVE === "1") {
+				return {
+					content: [{ type: "text", text: "Blocked: Firstmate delegates implementation work through visible Herdr worker tabs via herdr_control." }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
