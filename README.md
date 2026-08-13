@@ -111,7 +111,13 @@ inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane coordinates work,
 while each worker runs as a visible worker tab.
 
 Firstmate uses a session-scoped worker isolation mode. The default is `shared`,
-which starts the worker in the requested project checkout. Switch modes with:
+which starts the worker in the requested project checkout. For broad codebase
+reconnaissance or read-heavy investigation, delegate rather than spending a long
+local read/grep loop in firstmate: use one visible worker by default, two only for
+genuinely independent bounded scopes, and never uncontrolled fan-out. Narrow
+one-file questions may be inspected directly. `task_create` is asynchronous/no-wait;
+keep firstmate available for the captain and rely on watcher follow-ups instead of
+polling. Switch modes with:
 
 ```text
 /firstmate-isolation shared

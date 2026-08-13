@@ -18,7 +18,7 @@ const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
-const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'herdr_control']
+const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'herdr_control', 'artifact']
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID_RE = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
@@ -44,15 +44,30 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 
 ## Runtime safety delta
 
-- This pane is coordination-only: use only read, grep, find, ls, and herdr_control. Never use local bash, edit, write, delete, or subagent; delegate mutations and required commands through worker panes.
+- This pane is coordination-only: use read, grep, find, and ls for read-only inspection and herdr_control for coordination; artifact is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, write, delete, or subagent; delegate mutations and required commands through worker panes.
 - Preserve unrelated changes and keep worker changes surgical. Workers and their subagents must never push, publish, use MCP, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies.
+- Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Narrow one-file questions may be inspected directly.
+- \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
 - Inspect enough context before delegation, ask focused clarification for ambiguity, create one visible tab per worker without taking focus, and reconcile the structured worker report before claiming completion.
 - Shared tasks stay in the requested checkout and never use task_deliver. Worktree tasks use Treehouse leases, require task_deliver before task_teardown, and are never auto-closed or auto-merged.
 - Keep the captain's focus here and report only verified outcomes, files, tests, validation, reconciliation evidence, and blockers.
 `.trim()
 
 const HerdrControlParams = Type.Object({
-  action: StringEnum(['status', 'task_create', 'task_reconcile', 'task_deliver', 'task_teardown', 'tab_create', 'tab_close', 'pane_run', 'agent_start', 'agent_prompt', 'agent_wait', 'agent_read'] as const),
+  action: StringEnum([
+    'status',
+    'task_create',
+    'task_reconcile',
+    'task_deliver',
+    'task_teardown',
+    'tab_create',
+    'tab_close',
+    'pane_run',
+    'agent_start',
+    'agent_prompt',
+    'agent_wait',
+    'agent_read',
+  ] as const),
   project: Type.Optional(Type.String({ description: 'Requested primary project checkout for task_create or task_deliver. Resolved relative to the firstmate cwd.' })),
   taskId: Type.Optional(Type.String({ description: 'Durable firstmate task id for task_reconcile, task_deliver, or task_teardown.' })),
   tabId: Type.Optional(Type.String({ description: 'Opaque Herdr tab id for tab_close, e.g. w1:t2.' })),
@@ -181,7 +196,8 @@ type TaskRecord = {
 }
 
 type NativeWorkerState = 'working' | 'blocked' | 'idle' | 'done'
-type WatcherObservation = { state: NativeWorkerState; edgeLatched: boolean }
+type WatcherObservation = { state?: NativeWorkerState; edgeLatched: boolean; endpointMissingLatched: boolean }
+type WatcherMissingEndpoint = { taskId: string; workspaceId: string | null; tabId: string | null; paneId: string | null; workerName?: string; workerKind?: string }
 
 function isWatcherTaskRecord(value: unknown, taskId: string): value is TaskRecord {
   if (!isRecord(value) || value.version !== TASK_VERSION || value.taskId !== taskId || !TASK_ID_RE.test(taskId)) return false
@@ -342,32 +358,34 @@ function containsGitPush(command: string): boolean {
 }
 
 function treehouseWorkerBranchCommand(branch: string, reviewTarget?: string): string {
-  return [
-    '#!/bin/sh',
-    `branch=${shellQuote(branch)}`,
-    `review_target=${shellQuote(reviewTarget || '')}`,
-    'if [ -n "$review_target" ]; then',
-    '  base="$review_target"',
-    'else',
-    '  origin_head=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)',
-    '  if [ -n "$origin_head" ]; then',
-    '    base="$origin_head"',
-    '  else',
-    '    base=',
-    '    for candidate in main master; do',
-    '      if git show-ref --verify --quiet "refs/heads/$candidate"; then base="refs/heads/$candidate"; break; fi',
-    '      if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then base="refs/remotes/origin/$candidate"; break; fi',
-    '    done',
-    '  fi',
-    'fi',
-    'if [ -z "$base" ] || ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then',
-    '  echo "could not resolve the worker base ref: ${base:-none}" >&2',
-    '  exit 1',
-    'fi',
-    'git switch --create "$branch" -- "$base"',
-    'current=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)',
-    'if [ "$current" != "$branch" ]; then echo "worker branch checkout did not land on $branch" >&2; exit 1; fi',
-  ].join("\n") + "\n"
+  return (
+    [
+      '#!/bin/sh',
+      `branch=${shellQuote(branch)}`,
+      `review_target=${shellQuote(reviewTarget || '')}`,
+      'if [ -n "$review_target" ]; then',
+      '  base="$review_target"',
+      'else',
+      '  origin_head=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)',
+      '  if [ -n "$origin_head" ]; then',
+      '    base="$origin_head"',
+      '  else',
+      '    base=',
+      '    for candidate in main master; do',
+      '      if git show-ref --verify --quiet "refs/heads/$candidate"; then base="refs/heads/$candidate"; break; fi',
+      '      if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then base="refs/remotes/origin/$candidate"; break; fi',
+      '    done',
+      '  fi',
+      'fi',
+      'if [ -z "$base" ] || ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then',
+      '  echo "could not resolve the worker base ref: ${base:-none}" >&2',
+      '  exit 1',
+      'fi',
+      'git switch --create "$branch" -- "$base"',
+      'current=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)',
+      'if [ "$current" != "$branch" ]; then echo "worker branch checkout did not land on $branch" >&2; exit 1; fi',
+    ].join('\n') + '\n'
+  )
 }
 
 function inHerdr(): boolean {
@@ -571,6 +589,7 @@ export default function firstmate(pi: ExtensionAPI) {
   let turnEndGuardCheckInFlight = false
   let turnEndGuardRegistered = false
   const watcherObservations = new Map<string, WatcherObservation>()
+  const watcherMissingEndpoints = new Map<string, WatcherMissingEndpoint>()
 
   async function runHerdr(args: string[], signal: AbortSignal | undefined, timeout = 30_000): Promise<ExecResult> {
     return await pi.exec('herdr', args, { signal, timeout })
@@ -605,6 +624,7 @@ export default function firstmate(pi: ExtensionAPI) {
       lastPollAt: watcherLastPollAt,
       health: watcherLastError ? 'degraded' : 'ok',
       error: watcherLastError,
+      unverifiedWorkers: [...watcherMissingEndpoints.values()],
       turnEndGuard: {
         status: watcherGuardStatus,
         diagnostic: watcherGuardDiagnostic,
@@ -612,6 +632,28 @@ export default function firstmate(pi: ExtensionAPI) {
         pending: turnEndGuardPending,
       },
     }
+  }
+
+  function durableTaskSummary(tasks: TaskRecord[]): Record<string, unknown> {
+    const records = tasks.map((task) => ({
+      taskId: task.taskId,
+      project: task.project,
+      status: task.status,
+      reportStatus: task.reportStatus,
+      reportOutcome: task.reportOutcome,
+      cleanupStatus: task.cleanupStatus,
+      worktreeProvider: task.worktreeProvider,
+      workspaceId: task.workspaceId,
+      tabId: task.tabId,
+      paneId: task.paneId,
+      workerName: task.workerName,
+      workerKind: task.workerKind,
+      visibility: watcherMissingEndpoints.has(task.taskId) ? 'missing' : task.cleanupStatus === 'tab_closed' ? 'closed' : 'recorded',
+    }))
+    const active = records.filter((record) => record.status !== 'failed' && record.cleanupStatus !== 'tab_closed' && record.reportStatus !== 'completed' && record.reportStatus !== 'failed')
+    const stale = records.filter((record) => record.status === 'failed' || record.cleanupStatus === 'closing' || (record.reportStatus === 'completed' && record.cleanupStatus !== 'tab_closed'))
+    const missing = records.filter((record) => record.visibility === 'missing')
+    return { total: records.length, active, stale, missing, records }
   }
 
   async function readWatcherTaskRecords(onReadError?: (error: unknown, filePath: string) => void): Promise<TaskRecord[]> {
@@ -720,6 +762,32 @@ export default function firstmate(pi: ExtensionAPI) {
     return value === 'working' || value === 'blocked' || value === 'idle' || value === 'done' ? value : undefined
   }
 
+  function watcherTaskCandidate(task: TaskRecord, workspaceId: string): boolean {
+    return task.status === 'started' && task.cleanupStatus !== 'tab_closed' && task.workspaceId === workspaceId && task.reportStatus !== 'completed' && task.reportStatus !== 'failed'
+  }
+
+  function notifyMissingEndpoint(task: TaskRecord): void {
+    const previous = watcherObservations.get(task.taskId)
+    const missing: WatcherMissingEndpoint = {
+      taskId: task.taskId,
+      workspaceId: task.workspaceId,
+      tabId: task.tabId,
+      paneId: task.paneId,
+      workerName: task.workerName,
+      workerKind: task.workerKind,
+    }
+    watcherMissingEndpoints.set(task.taskId, missing)
+    let endpointMissingLatched = previous?.endpointMissingLatched ?? false
+    if (!endpointMissingLatched) {
+      const identity = `tab=${task.tabId ?? 'missing'}, pane=${task.paneId ?? 'missing'}, worker=${task.workerName ?? 'missing'}${task.workerKind ? ` (${task.workerKind})` : ''}`
+      endpointMissingLatched =
+        notifyWatcher(
+          `FIRSTMATE WATCHER: Task ${task.taskId} worker endpoint cannot be verified (${identity}). Do not classify it as idle/done or completed; inspect the durable task and recover/reconcile the recorded endpoint.`,
+        ) || endpointMissingLatched
+    }
+    watcherObservations.set(task.taskId, { state: previous?.state, edgeLatched: false, endpointMissingLatched })
+  }
+
   function notifyWatcher(message: string): boolean {
     if (!watcherRunning) return false
     try {
@@ -736,11 +804,11 @@ export default function firstmate(pi: ExtensionAPI) {
     watcherPollInFlight = true
     watcherLastPollAt = new Date().toISOString()
     const seenTaskIds = new Set<string>()
+    let sweepObservations = false
     try {
       const workspaceId = process.env.HERDR_WORKSPACE_ID
       if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) {
         watcherLastError = 'current Herdr workspace identity is missing or invalid'
-        watcherObservations.clear()
         return
       }
       let readDiagnostic: string | undefined
@@ -752,23 +820,43 @@ export default function firstmate(pi: ExtensionAPI) {
         return
       }
       watcherLastError = undefined
+      sweepObservations = true
       for (const task of tasks) {
         if (!watcherRunning) return
-        if (!hasWatcherEndpoint(task, workspaceId)) continue
+        if (!watcherTaskCandidate(task, workspaceId)) continue
         seenTaskIds.add(task.taskId)
+        if (!hasWatcherEndpoint(task, workspaceId)) {
+          notifyMissingEndpoint(task)
+          continue
+        }
 
         const result = await runHerdr(['agent', 'get', task.paneId!], undefined, 5_000).catch(() => undefined)
-        if (!watcherRunning || !result || result.code !== 0) continue
-        const parsed = parseJsonMaybe(result.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined
+        const parsed = result && result.code === 0 ? (parseJsonMaybe(result.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined) : undefined
         const agent = parsed?.result?.agent
-        if (!agent || agent.pane_id !== task.paneId || agent.tab_id !== task.tabId || agent.workspace_id !== task.workspaceId || agent.name !== task.workerName || agent.agent !== task.workerKind)
+        if (
+          !watcherRunning ||
+          !result ||
+          result.code !== 0 ||
+          !agent ||
+          agent.pane_id !== task.paneId ||
+          agent.tab_id !== task.tabId ||
+          agent.workspace_id !== task.workspaceId ||
+          agent.name !== task.workerName ||
+          agent.agent !== task.workerKind
+        ) {
+          notifyMissingEndpoint(task)
           continue
+        }
 
+        watcherMissingEndpoints.delete(task.taskId)
         const state = watcherState(agent.agent_status)
-        if (!state) continue
+        if (!state) {
+          notifyMissingEndpoint(task)
+          continue
+        }
         const previous = watcherObservations.get(task.taskId)
         if (state === 'working') {
-          watcherObservations.set(task.taskId, { state, edgeLatched: false })
+          watcherObservations.set(task.taskId, { state, edgeLatched: false, endpointMissingLatched: false })
           continue
         }
 
@@ -781,13 +869,18 @@ export default function firstmate(pi: ExtensionAPI) {
               : `FIRSTMATE WATCHER: Task ${task.taskId} worker ${task.workerName} entered ${state} with reportStatus=${task.reportStatus}. Firstmate, run task_reconcile for ${task.taskId} and inspect the worker result.`
           edgeLatched = notifyWatcher(detail) || edgeLatched
         }
-        watcherObservations.set(task.taskId, { state, edgeLatched })
+        watcherObservations.set(task.taskId, { state, edgeLatched, endpointMissingLatched: false })
       }
     } catch (error) {
       watcherLastError = `poll failed: ${(error as Error).message}`
     } finally {
-      for (const taskId of watcherObservations.keys()) {
-        if (!seenTaskIds.has(taskId)) watcherObservations.delete(taskId)
+      if (sweepObservations) {
+        for (const taskId of watcherObservations.keys()) {
+          if (!seenTaskIds.has(taskId)) watcherObservations.delete(taskId)
+        }
+        for (const taskId of watcherMissingEndpoints.keys()) {
+          if (!seenTaskIds.has(taskId)) watcherMissingEndpoints.delete(taskId)
+        }
       }
       watcherPollInFlight = false
     }
@@ -807,6 +900,7 @@ export default function firstmate(pi: ExtensionAPI) {
     watcherInterval = undefined
     watcherPollInFlight = false
     watcherObservations.clear()
+    watcherMissingEndpoints.clear()
   }
 
   function registerTurnEndGuard(): void {
@@ -929,7 +1023,9 @@ export default function firstmate(pi: ExtensionAPI) {
         'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Required commands run through Herdr worker panes with shell-quoted arguments.',
       promptSnippet: 'Coordinate visible Herdr worker tabs and agents: create/start/prompt/wait/read, explicitly close reconciled workers',
       promptGuidelines: [
-        'Use herdr_control as the only coordination tool in this firstmate pane; never use bash, edit, write, or subagent. Delegate mutations and required commands through worker panes.',
+        'Use herdr_control as the only coordination tool in this firstmate pane; use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, write, or subagent. Delegate mutations and required commands through worker panes.',
+        'Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. One visible worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Inspect narrow one-file questions directly when that is simpler.',
+        'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion.',
         'Use task_create with the current session isolation mode, one visible tab per worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
         'Workers and their subagents must not push, publish, use MCP, or commit without explicit captain authorization. Do not auto-close or auto-merge; report only verified outcomes and preserve unrelated changes.',
       ],
@@ -967,8 +1063,23 @@ export default function firstmate(pi: ExtensionAPI) {
           const pane = matchingPanes.length === 1 ? matchingPanes[0] : undefined
           const agentResult = pane && typeof pane.pane_id === 'string' ? await runHerdr(['agent', 'get', pane.pane_id], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
           const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-          if (currentResult.code !== 0 || !current || current.pane_id !== currentPaneId || current.workspace_id !== helper.workspaceId || current.tab_id === helper.tabId) return { closed: false, error: 'refusing to close helper tab because it is the current firstmate tab.' }
-          if (tabResult.code !== 0 || !tab || tab.tab_id !== helper.tabId || tab.workspace_id !== helper.workspaceId || tab.pane_count !== 1 || panesResult.code !== 0 || matchingPanes.length !== 1 || !pane || pane.pane_id !== helper.paneId || pane.workspace_id !== helper.workspaceId || pane.tab_id !== helper.tabId || (agentResult.code === 0 && agent)) return { closed: false, error: 'helper tab identity is no longer exact or has an agent; preserving helper tab.' }
+          if (currentResult.code !== 0 || !current || current.pane_id !== currentPaneId || current.workspace_id !== helper.workspaceId || current.tab_id === helper.tabId)
+            return { closed: false, error: 'refusing to close helper tab because it is the current firstmate tab.' }
+          if (
+            tabResult.code !== 0 ||
+            !tab ||
+            tab.tab_id !== helper.tabId ||
+            tab.workspace_id !== helper.workspaceId ||
+            tab.pane_count !== 1 ||
+            panesResult.code !== 0 ||
+            matchingPanes.length !== 1 ||
+            !pane ||
+            pane.pane_id !== helper.paneId ||
+            pane.workspace_id !== helper.workspaceId ||
+            pane.tab_id !== helper.tabId ||
+            (agentResult.code === 0 && agent)
+          )
+            return { closed: false, error: 'helper tab identity is no longer exact or has an agent; preserving helper tab.' }
           const result = await runHerdr(['tab', 'close', helper.tabId], signal, 10_000)
           return { closed: result.code === 0, error: result.code === 0 ? undefined : commandResultText('herdr tab close (helper)', result), result }
         }
@@ -983,7 +1094,10 @@ export default function firstmate(pi: ExtensionAPI) {
           const helper = typeof tabId === 'string' && TAB_ID_RE.test(tabId) && typeof paneId === 'string' && PANE_ID_RE.test(paneId) ? { tabId, paneId, workspaceId } : undefined
           if (tabResult.code !== 0 || !helper) {
             const helperClose = helper ? await closeRawHelper(helper) : undefined
-            return { error: `${commandResultText('herdr tab create (raw helper)', tabResult)}${helperClose && !helperClose.closed ? ` ${helperClose.error || 'helper cleanup failed.'}` : ''}`, result: { argv: ['herdr', ...tabArgs], returned: payload, helperClose } }
+            return {
+              error: `${commandResultText('herdr tab create (raw helper)', tabResult)}${helperClose && !helperClose.closed ? ` ${helperClose.error || 'helper cleanup failed.'}` : ''}`,
+              result: { argv: ['herdr', ...tabArgs], returned: payload, helperClose },
+            }
           }
           const tabInspectionResult = await runHerdr(['tab', 'get', helper.tabId], signal, 10_000)
           const paneInspectionResult = await runHerdr(['pane', 'get', helper.paneId], signal, 10_000)
@@ -993,19 +1107,49 @@ export default function firstmate(pi: ExtensionAPI) {
           const paneInspection = (parseJsonMaybe(paneInspectionResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
           const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
           const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-          const exactRaw = tabInspectionResult.code === 0 && !!tabInspection && tabInspection.tab_id === helper.tabId && tabInspection.workspace_id === workspaceId && tabInspection.pane_count === 1 && tabInspection.focused === false && paneInspectionResult.code === 0 && !!paneInspection && paneInspection.pane_id === helper.paneId && paneInspection.tab_id === helper.tabId && paneInspection.workspace_id === workspaceId && (paneInspection.cwd === cwd || paneInspection.foreground_cwd === cwd) && currentPaneResult.code === 0 && !!currentPane && currentPane.pane_id === process.env.HERDR_PANE_ID && currentPane.workspace_id === workspaceId && currentPane.tab_id !== helper.tabId && !(agentResult.code === 0 && agent)
+          const exactRaw =
+            tabInspectionResult.code === 0 &&
+            !!tabInspection &&
+            tabInspection.tab_id === helper.tabId &&
+            tabInspection.workspace_id === workspaceId &&
+            tabInspection.pane_count === 1 &&
+            tabInspection.focused === false &&
+            paneInspectionResult.code === 0 &&
+            !!paneInspection &&
+            paneInspection.pane_id === helper.paneId &&
+            paneInspection.tab_id === helper.tabId &&
+            paneInspection.workspace_id === workspaceId &&
+            (paneInspection.cwd === cwd || paneInspection.foreground_cwd === cwd) &&
+            currentPaneResult.code === 0 &&
+            !!currentPane &&
+            currentPane.pane_id === process.env.HERDR_PANE_ID &&
+            currentPane.workspace_id === workspaceId &&
+            currentPane.tab_id !== helper.tabId &&
+            !(agentResult.code === 0 && agent)
           if (!exactRaw) {
             const close = await closeRawHelper(helper)
-            return { error: `raw helper tab identity was incomplete or an agent occupied it.${close.closed ? '' : ` ${close.error || 'helper tab cleanup failed.'}`}`, result: { argv: ['herdr', ...tabArgs], returned: payload, tab: tabInspection, pane: paneInspection, currentPane, agent, helperClose: close } }
+            return {
+              error: `raw helper tab identity was incomplete or an agent occupied it.${close.closed ? '' : ` ${close.error || 'helper tab cleanup failed.'}`}`,
+              result: { argv: ['herdr', ...tabArgs], returned: payload, tab: tabInspection, pane: paneInspection, currentPane, agent, helperClose: close },
+            }
           }
           return { helper }
         }
         const returnTaskLease = async (task: TaskRecord): Promise<{ returned: boolean; idempotent?: boolean; task: TaskRecord; error?: string; result?: Record<string, unknown> }> => {
           if (task.worktreeProvider !== 'treehouse') return { returned: true, idempotent: true, task }
           if (task.leaseReturnHelperTabId || task.leaseReturnHelperPaneId) {
-            if (typeof task.leaseReturnHelperTabId !== 'string' || !TAB_ID_RE.test(task.leaseReturnHelperTabId) || typeof task.leaseReturnHelperPaneId !== 'string' || !PANE_ID_RE.test(task.leaseReturnHelperPaneId) || typeof task.workspaceId !== 'string' || !WORKSPACE_ID_RE.test(task.workspaceId)) return { returned: false, task, error: 'durable Treehouse return helper identity is malformed; preserving task state.' }
+            if (
+              typeof task.leaseReturnHelperTabId !== 'string' ||
+              !TAB_ID_RE.test(task.leaseReturnHelperTabId) ||
+              typeof task.leaseReturnHelperPaneId !== 'string' ||
+              !PANE_ID_RE.test(task.leaseReturnHelperPaneId) ||
+              typeof task.workspaceId !== 'string' ||
+              !WORKSPACE_ID_RE.test(task.workspaceId)
+            )
+              return { returned: false, task, error: 'durable Treehouse return helper identity is malformed; preserving task state.' }
             const helperClose = await closeRawHelper({ tabId: task.leaseReturnHelperTabId, paneId: task.leaseReturnHelperPaneId, workspaceId: task.workspaceId })
-            if (!helperClose.closed) return { returned: false, task, error: helperClose.error || 'previous Treehouse return helper tab could not be closed; preserving task state.', result: { helperClose } }
+            if (!helperClose.closed)
+              return { returned: false, task, error: helperClose.error || 'previous Treehouse return helper tab could not be closed; preserving task state.', result: { helperClose } }
             const clearedTask: TaskRecord = { ...task, leaseReturnHelperTabId: undefined, leaseReturnHelperPaneId: undefined, updatedAt: new Date().toISOString() }
             try {
               await writeTaskState(clearedTask)
@@ -1015,7 +1159,16 @@ export default function firstmate(pi: ExtensionAPI) {
             task = clearedTask
           }
           if (task.leaseStatus === 'returned' && task.leaseReturnStatus === 'returned') return { returned: true, idempotent: true, task }
-          if (task.leaseStatus !== 'leased' || typeof task.worktree !== 'string' || !path.isAbsolute(task.worktree) || task.leaseHolder !== task.taskId || typeof task.leaseId !== 'string' || !task.leaseId || typeof task.paneId !== 'string' || !PANE_ID_RE.test(task.paneId)) {
+          if (
+            task.leaseStatus !== 'leased' ||
+            typeof task.worktree !== 'string' ||
+            !path.isAbsolute(task.worktree) ||
+            task.leaseHolder !== task.taskId ||
+            typeof task.leaseId !== 'string' ||
+            !task.leaseId ||
+            typeof task.paneId !== 'string' ||
+            !PANE_ID_RE.test(task.paneId)
+          ) {
             return { returned: false, task, error: 'exact Treehouse lease identity is missing; preserving the lease.' }
           }
           const stdoutPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stdout`)
@@ -1023,14 +1176,20 @@ export default function firstmate(pi: ExtensionAPI) {
           const statusPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.status`)
           const command = `treehouse return --force ${shellQuote(task.worktree)} --if-lease-holder ${shellQuote(task.leaseHolder)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\n' "$?" > ${shellQuote(statusPath)}`
           const helperResult = await createRawHelper(task.workspaceId || '', task.worktree, `firstmate-lease-return-${task.taskId}`)
-          if (!helperResult.helper) return { returned: false, task, error: helperResult.error || 'could not create raw Treehouse return helper tab; preserving the lease.', result: helperResult.result }
+          if (!helperResult.helper)
+            return { returned: false, task, error: helperResult.error || 'could not create raw Treehouse return helper tab; preserving the lease.', result: helperResult.result }
           const helper = helperResult.helper
           const helperTask: TaskRecord = { ...task, leaseReturnHelperTabId: helper.tabId, leaseReturnHelperPaneId: helper.paneId, updatedAt: new Date().toISOString() }
           try {
             await writeTaskState(helperTask)
           } catch (error) {
             const helperClose = await closeRawHelper(helper)
-            return { returned: false, task, error: `could not persist Treehouse return helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`, result: { helperClose } }
+            return {
+              returned: false,
+              task,
+              error: `could not persist Treehouse return helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`,
+              result: { helperClose },
+            }
           }
           task = helperTask
           const run = await runHerdr(['pane', 'run', helper.paneId, command], signal, 10_000)
@@ -1053,11 +1212,25 @@ export default function firstmate(pi: ExtensionAPI) {
           const commandSucceeded = (!error && code === 0) || markerSucceeded
           if (markerSucceeded) error = undefined
           if (!commandSucceeded && !error) error = `treehouse return exited ${code ?? 'unknown'}; lease is preserved.`
-          const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`], signal, 10_000).catch((cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }))
+          const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`], signal, 10_000).catch(
+            (cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }),
+          )
           const helperClose = await closeRawHelper(helper)
           if (!helperClose.closed) error = `${error ? `${error} ` : ''}${helperClose.error || 'raw Treehouse return helper tab could not be closed.'}`
           const returned = commandSucceeded && helperClose.closed
-          const updatedTask: TaskRecord = { ...task, leaseStatus: commandSucceeded ? 'returned' : 'leased', leaseReturnStatus: commandSucceeded ? 'returned' : 'failed', leaseReturnAt: new Date().toISOString(), leaseReturnCode: code, leaseReturnStdout: stdout, leaseReturnStderr: stderr, leaseReturnError: error, leaseReturnHelperTabId: helperClose.closed ? undefined : helper.tabId, leaseReturnHelperPaneId: helperClose.closed ? undefined : helper.paneId, updatedAt: new Date().toISOString() }
+          const updatedTask: TaskRecord = {
+            ...task,
+            leaseStatus: commandSucceeded ? 'returned' : 'leased',
+            leaseReturnStatus: commandSucceeded ? 'returned' : 'failed',
+            leaseReturnAt: new Date().toISOString(),
+            leaseReturnCode: code,
+            leaseReturnStdout: stdout,
+            leaseReturnStderr: stderr,
+            leaseReturnError: error,
+            leaseReturnHelperTabId: helperClose.closed ? undefined : helper.tabId,
+            leaseReturnHelperPaneId: helperClose.closed ? undefined : helper.paneId,
+            updatedAt: new Date().toISOString(),
+          }
           let persisted = true
           await writeTaskState(updatedTask).catch((persistError) => {
             persisted = false
@@ -1065,7 +1238,12 @@ export default function firstmate(pi: ExtensionAPI) {
             updatedTask.leaseReturnStatus = 'failed'
             updatedTask.leaseReturnError = `${error || ''}${error ? ' ' : ''}could not persist Treehouse return state: ${(persistError as Error).message}`
           })
-          return { returned: returned && persisted, task: persisted ? updatedTask : task, error: updatedTask.leaseReturnError || (persisted ? undefined : 'could not persist Treehouse return state'), result: { argv: ['herdr', 'pane', 'run', helper.paneId, command], code, stdout, stderr, tempCleanup, helperClose } }
+          return {
+            returned: returned && persisted,
+            task: persisted ? updatedTask : task,
+            error: updatedTask.leaseReturnError || (persisted ? undefined : 'could not persist Treehouse return state'),
+            result: { argv: ['herdr', 'pane', 'run', helper.paneId, command], code, stdout, stderr, tempCleanup, helperClose },
+          }
         }
 
         let args: string[]
@@ -1088,6 +1266,16 @@ export default function firstmate(pi: ExtensionAPI) {
               process.env.HERDR_PANE_ID ? runHerdr(['agent', 'get', process.env.HERDR_PANE_ID], signal, 10_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
             ])
             await deriveCurrentAgentKind(signal).catch(() => undefined)
+            let durableTasks: Record<string, unknown>
+            try {
+              let readDiagnostic: string | undefined
+              const taskRecords = await readWatcherTaskRecords((error, filePath) => {
+                readDiagnostic ||= `task-state read failed for ${filePath}: ${(error as Error).message}`
+              })
+              durableTasks = readDiagnostic ? { error: readDiagnostic } : durableTaskSummary(taskRecords)
+            } catch (error) {
+              durableTasks = { error: `task-state read failed: ${(error as Error).message}` }
+            }
             const details = {
               action: params.action,
               workspaceId,
@@ -1095,6 +1283,7 @@ export default function firstmate(pi: ExtensionAPI) {
               currentAgentKind,
               selectedWorkerKind,
               watcher: watcherDetails(),
+              durableTasks,
               workspaceList: parseJsonMaybe(workspaceList.stdout) ?? workspaceList,
               currentPane: parseJsonMaybe(currentPane.stdout) ?? currentPane,
               paneList: parseJsonMaybe(paneList.stdout) ?? paneList,
@@ -1418,7 +1607,12 @@ export default function firstmate(pi: ExtensionAPI) {
               return failTask(failureMessage, { ...details, leaseReturn, tempCleanup, cleanup })
             }
 
-            const envArgs = ['pane', 'run', returnedPaneId, `export ${WORKER_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`]
+            const envArgs = [
+              'pane',
+              'run',
+              returnedPaneId,
+              `export ${WORKER_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
+            ]
             const envResult = await runHerdr(envArgs, signal, 10_000)
             if (envResult.code !== 0) {
               return failAfterTab(commandResultText('herdr pane run (worker environment)', envResult), { argv: ['herdr', ...envArgs] })
@@ -1426,85 +1620,85 @@ export default function firstmate(pi: ExtensionAPI) {
 
             if (taskIsolation === 'worktree') {
               const leaseArgs = ['get', '--lease', '--lease-holder', taskId, '--json']
-            const leaseCommand = `treehouse ${leaseArgs.map(shellQuote).join(' ')} > ${shellQuote(leaseJsonPath)} 2> ${shellQuote(leaseErrorPath)}; printf '%s\\n' "$?" > ${shellQuote(leaseStatusPath)}`
-            const leaseRunArgs = ['pane', 'run', returnedPaneId, leaseCommand]
-            const leaseRunResult = await runHerdr(leaseRunArgs, signal, 10_000)
-            if (leaseRunResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (Treehouse lease)', leaseRunResult), { argv: ['herdr', ...leaseRunArgs] })
+              const leaseCommand = `treehouse ${leaseArgs.map(shellQuote).join(' ')} > ${shellQuote(leaseJsonPath)} 2> ${shellQuote(leaseErrorPath)}; printf '%s\\n' "$?" > ${shellQuote(leaseStatusPath)}`
+              const leaseRunArgs = ['pane', 'run', returnedPaneId, leaseCommand]
+              const leaseRunResult = await runHerdr(leaseRunArgs, signal, 10_000)
+              if (leaseRunResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (Treehouse lease)', leaseRunResult), { argv: ['herdr', ...leaseRunArgs] })
 
-            let leaseStatusText: string
-            try {
-              leaseStatusText = await readPaneFile(leaseStatusPath)
-            } catch (error) {
-              return failAfterTab(`Treehouse lease command did not report completion: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
-            }
-            let leaseJsonText: string
-            try {
-              leaseJsonText = await fs.promises.readFile(leaseJsonPath, 'utf8')
-            } catch (error) {
-              const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
-              return failAfterTab(`treehouse get --lease failed with status ${leaseStatusText.trim()}: ${stderr.trim() || (error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
-            }
-            const leasePayload = parseJsonMaybe(leaseJsonText) as { path?: unknown; lease_id?: unknown; lease_holder?: unknown } | undefined
-            const returnedWorktree = leasePayload?.path
-            const leaseId = typeof leasePayload?.lease_id === 'string' ? leasePayload.lease_id : undefined
-            const leaseHolder = typeof leasePayload?.lease_holder === 'string' ? leasePayload.lease_holder : undefined
-            if (
-              leaseStatusText.trim() !== '0' ||
-              typeof returnedWorktree !== 'string' ||
-              !path.isAbsolute(returnedWorktree) ||
-              returnedWorktree.includes('\u0000') ||
-              typeof leaseId !== 'string' ||
-              !leaseId ||
-              leaseHolder !== taskId
-            ) {
-              const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
-              return failAfterTab('treehouse lease returned incomplete or inconsistent path, lease id, or lease-holder identity.', {
-                argv: ['herdr', ...leaseRunArgs],
-                returned: leasePayload,
-                status: leaseStatusText.trim(),
-                stderr: stderr.trim(),
-              })
-            }
-            try {
-              const worktreeStat = await fs.promises.stat(returnedWorktree)
-              if (!worktreeStat.isDirectory()) throw new Error('leased path is not a directory')
-            } catch (error) {
-              return failAfterTab(`leased Treehouse worktree is not accessible: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
-            }
+              let leaseStatusText: string
+              try {
+                leaseStatusText = await readPaneFile(leaseStatusPath)
+              } catch (error) {
+                return failAfterTab(`Treehouse lease command did not report completion: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
+              }
+              let leaseJsonText: string
+              try {
+                leaseJsonText = await fs.promises.readFile(leaseJsonPath, 'utf8')
+              } catch (error) {
+                const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
+                return failAfterTab(`treehouse get --lease failed with status ${leaseStatusText.trim()}: ${stderr.trim() || (error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
+              }
+              const leasePayload = parseJsonMaybe(leaseJsonText) as { path?: unknown; lease_id?: unknown; lease_holder?: unknown } | undefined
+              const returnedWorktree = leasePayload?.path
+              const leaseId = typeof leasePayload?.lease_id === 'string' ? leasePayload.lease_id : undefined
+              const leaseHolder = typeof leasePayload?.lease_holder === 'string' ? leasePayload.lease_holder : undefined
+              if (
+                leaseStatusText.trim() !== '0' ||
+                typeof returnedWorktree !== 'string' ||
+                !path.isAbsolute(returnedWorktree) ||
+                returnedWorktree.includes('\u0000') ||
+                typeof leaseId !== 'string' ||
+                !leaseId ||
+                leaseHolder !== taskId
+              ) {
+                const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
+                return failAfterTab('treehouse lease returned incomplete or inconsistent path, lease id, or lease-holder identity.', {
+                  argv: ['herdr', ...leaseRunArgs],
+                  returned: leasePayload,
+                  status: leaseStatusText.trim(),
+                  stderr: stderr.trim(),
+                })
+              }
+              try {
+                const worktreeStat = await fs.promises.stat(returnedWorktree)
+                if (!worktreeStat.isDirectory()) throw new Error('leased path is not a directory')
+              } catch (error) {
+                return failAfterTab(`leased Treehouse worktree is not accessible: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
+              }
 
-            task = { ...task, worktree: returnedWorktree, leaseStatus: 'leased', leaseId, leaseHolder, status: 'worktree_leased', updatedAt: new Date().toISOString() }
-            try {
-              await writeTaskState(task)
-            } catch (error) {
-              return failAfterTab(`could not persist Treehouse lease identity: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
-            }
+              task = { ...task, worktree: returnedWorktree, leaseStatus: 'leased', leaseId, leaseHolder, status: 'worktree_leased', updatedAt: new Date().toISOString() }
+              try {
+                await writeTaskState(task)
+              } catch (error) {
+                return failAfterTab(`could not persist Treehouse lease identity: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
+              }
 
-            const removeLeaseTempResult = await removeLeaseTemp()
-            if (removeLeaseTempResult.code !== 0)
-              return failAfterTab(commandResultText('herdr pane run (lease temp cleanup)', removeLeaseTempResult), { argv: ['herdr', 'pane', 'run', returnedPaneId, 'rm -f <lease temp files>'] })
+              const removeLeaseTempResult = await removeLeaseTemp()
+              if (removeLeaseTempResult.code !== 0)
+                return failAfterTab(commandResultText('herdr pane run (lease temp cleanup)', removeLeaseTempResult), { argv: ['herdr', 'pane', 'run', returnedPaneId, 'rm -f <lease temp files>'] })
 
-            const cdArgs = ['pane', 'run', returnedPaneId, `cd ${shellQuote(returnedWorktree)}`]
-            const cdResult = await runHerdr(cdArgs, signal, 10_000)
-            if (cdResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (worker cwd)', cdResult), { argv: ['herdr', ...cdArgs] })
-            const cwdResult = await runHerdr(['pane', 'get', returnedPaneId], signal, 10_000)
-            const cwdPane = (parseJsonMaybe(cwdResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-            if (
-              cwdResult.code !== 0 ||
-              !cwdPane ||
-              cwdPane.pane_id !== returnedPaneId ||
-              cwdPane.tab_id !== returnedTabId ||
-              cwdPane.workspace_id !== workspaceId ||
-              cwdPane.foreground_cwd !== returnedWorktree
-            ) {
-              return failAfterTab('worker pane did not enter the exact leased Treehouse worktree.', { argv: ['herdr', 'pane', 'get', returnedPaneId], cwd: parseJsonMaybe(cwdResult.stdout) })
-            }
+              const cdArgs = ['pane', 'run', returnedPaneId, `cd ${shellQuote(returnedWorktree)}`]
+              const cdResult = await runHerdr(cdArgs, signal, 10_000)
+              if (cdResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (worker cwd)', cdResult), { argv: ['herdr', ...cdArgs] })
+              const cwdResult = await runHerdr(['pane', 'get', returnedPaneId], signal, 10_000)
+              const cwdPane = (parseJsonMaybe(cwdResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+              if (
+                cwdResult.code !== 0 ||
+                !cwdPane ||
+                cwdPane.pane_id !== returnedPaneId ||
+                cwdPane.tab_id !== returnedTabId ||
+                cwdPane.workspace_id !== workspaceId ||
+                cwdPane.foreground_cwd !== returnedWorktree
+              ) {
+                return failAfterTab('worker pane did not enter the exact leased Treehouse worktree.', { argv: ['herdr', 'pane', 'get', returnedPaneId], cwd: parseJsonMaybe(cwdResult.stdout) })
+              }
 
-            const branchSetupCommand = treehouseWorkerBranchCommand(branch, task.reviewTarget)
-            const branchSetupArgs = ['pane', 'run', returnedPaneId, branchSetupCommand]
-            const branchSetupResult = await runHerdr(branchSetupArgs, signal, timeout)
-            if (branchSetupResult.code !== 0) {
-              return failAfterTab(commandResultText('herdr pane run (worker branch setup)', branchSetupResult), { argv: ['herdr', ...branchSetupArgs] })
-            }
+              const branchSetupCommand = treehouseWorkerBranchCommand(branch, task.reviewTarget)
+              const branchSetupArgs = ['pane', 'run', returnedPaneId, branchSetupCommand]
+              const branchSetupResult = await runHerdr(branchSetupArgs, signal, timeout)
+              if (branchSetupResult.code !== 0) {
+                return failAfterTab(commandResultText('herdr pane run (worker branch setup)', branchSetupResult), { argv: ['herdr', ...branchSetupArgs] })
+              }
             }
 
             task = { ...task, workerName, workerKind: kind, status: 'starting', updatedAt: new Date().toISOString() }
@@ -1557,9 +1751,7 @@ export default function firstmate(pi: ExtensionAPI) {
               argv: {
                 tab: ['herdr', ...tabArgs],
                 environment: ['herdr', ...envArgs],
-                ...(taskIsolation === 'worktree'
-                  ? { provisioning: 'Treehouse lease, worker cwd, and branch setup completed.' }
-                  : { provisioning: 'Worker started in the requested shared checkout.' }),
+                ...(taskIsolation === 'worktree' ? { provisioning: 'Treehouse lease, worker cwd, and branch setup completed.' } : { provisioning: 'Worker started in the requested shared checkout.' }),
                 start: ['herdr', ...startArgs],
                 prompt: ['herdr', ...promptArgs],
               },
@@ -1672,15 +1864,44 @@ export default function firstmate(pi: ExtensionAPI) {
             const reportPath = reportFilePath(taskId)
             let task = await readTaskState(taskId)
             if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
-            if (task.project !== path.resolve(ctx.cwd, params.project)) return errorResult('requested primary project does not exactly match the durable task project.', { action: params.action, taskId, task, requestedProject: path.resolve(ctx.cwd, params.project) })
-            if (task.reportPath !== reportPath) return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
-            if (task.worktreeProvider === 'herdr') return errorResult('shared-checkout tasks are already local and must not use task_deliver; reconcile, then use task_teardown.', { action: params.action, taskId, task })
-            if (task.status !== 'started' || task.worktreeProvider !== 'treehouse' || typeof task.worktree !== 'string' || !path.isAbsolute(task.worktree) || (task.leaseStatus !== 'leased' && task.leaseStatus !== 'returned') || task.leaseHolder !== taskId || typeof task.leaseId !== 'string' || !task.leaseId || typeof task.workspaceId !== 'string' || !WORKSPACE_ID_RE.test(task.workspaceId) || typeof task.tabId !== 'string' || !TAB_ID_RE.test(task.tabId) || typeof task.paneId !== 'string' || !PANE_ID_RE.test(task.paneId) || typeof task.workerName !== 'string' || !AGENT_NAME_RE.test(task.workerName) || task.workerName === FIRSTMATE_NAME || typeof task.workerKind !== 'string' || !AGENT_KIND_RE.test(task.workerKind)) {
+            if (task.project !== path.resolve(ctx.cwd, params.project))
+              return errorResult('requested primary project does not exactly match the durable task project.', {
+                action: params.action,
+                taskId,
+                task,
+                requestedProject: path.resolve(ctx.cwd, params.project),
+              })
+            if (task.reportPath !== reportPath)
+              return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
+            if (task.worktreeProvider === 'herdr')
+              return errorResult('shared-checkout tasks are already local and must not use task_deliver; reconcile, then use task_teardown.', { action: params.action, taskId, task })
+            if (
+              task.status !== 'started' ||
+              task.worktreeProvider !== 'treehouse' ||
+              typeof task.worktree !== 'string' ||
+              !path.isAbsolute(task.worktree) ||
+              (task.leaseStatus !== 'leased' && task.leaseStatus !== 'returned') ||
+              task.leaseHolder !== taskId ||
+              typeof task.leaseId !== 'string' ||
+              !task.leaseId ||
+              typeof task.workspaceId !== 'string' ||
+              !WORKSPACE_ID_RE.test(task.workspaceId) ||
+              typeof task.tabId !== 'string' ||
+              !TAB_ID_RE.test(task.tabId) ||
+              typeof task.paneId !== 'string' ||
+              !PANE_ID_RE.test(task.paneId) ||
+              typeof task.workerName !== 'string' ||
+              !AGENT_NAME_RE.test(task.workerName) ||
+              task.workerName === FIRSTMATE_NAME ||
+              typeof task.workerKind !== 'string' ||
+              !AGENT_KIND_RE.test(task.workerKind)
+            ) {
               return errorResult('task delivery requires the exact Treehouse lease, worker endpoint, and worker branch identity.', { action: params.action, taskId, task })
             }
             if (task.branch !== `firstmate/${taskId}`) return errorResult('durable task branch is not the generated exact worker branch.', { action: params.action, taskId, task })
             if (task.reviewTarget) return errorResult('review tasks are inspection-only and cannot be locally delivered.', { action: params.action, taskId, task })
-            if (task.deliveryStatus !== 'landed' && task.leaseStatus !== 'leased') return errorResult('an undelivered task must still hold its active Treehouse lease.', { action: params.action, taskId, task })
+            if (task.deliveryStatus !== 'landed' && task.leaseStatus !== 'leased')
+              return errorResult('an undelivered task must still hold its active Treehouse lease.', { action: params.action, taskId, task })
 
             let reportText: string
             try {
@@ -1695,14 +1916,30 @@ export default function firstmate(pi: ExtensionAPI) {
               return errorResult(`worker report is malformed JSON: ${(error as Error).message}`, { action: params.action, taskId, reportPath, reconciled: false, complete: false, task })
             }
             const reportValidation = validateWorkerReport(parsedReport, taskId)
-            if (!reportValidation.report || reportValidation.report.outcome !== 'completed' || task.reportStatus !== 'completed' || task.reportOutcome !== 'completed' || typeof task.reportUpdatedAt !== 'string' || task.reportSummary !== reportValidation.report.summary) {
+            if (
+              !reportValidation.report ||
+              reportValidation.report.outcome !== 'completed' ||
+              task.reportStatus !== 'completed' ||
+              task.reportOutcome !== 'completed' ||
+              typeof task.reportUpdatedAt !== 'string' ||
+              task.reportSummary !== reportValidation.report.summary
+            ) {
               return errorResult('task delivery requires a reconciled completed worker report.', { action: params.action, taskId, task, report: parsedReport, reconciled: false, complete: false })
             }
 
             if (task.deliveryHelperTabId || task.deliveryHelperPaneId) {
-              if (typeof task.deliveryHelperTabId !== 'string' || !TAB_ID_RE.test(task.deliveryHelperTabId) || typeof task.deliveryHelperPaneId !== 'string' || !PANE_ID_RE.test(task.deliveryHelperPaneId) || typeof task.workspaceId !== 'string' || !WORKSPACE_ID_RE.test(task.workspaceId)) return errorResult('durable delivery helper identity is malformed; preserving task state.', { action: params.action, taskId, task })
+              if (
+                typeof task.deliveryHelperTabId !== 'string' ||
+                !TAB_ID_RE.test(task.deliveryHelperTabId) ||
+                typeof task.deliveryHelperPaneId !== 'string' ||
+                !PANE_ID_RE.test(task.deliveryHelperPaneId) ||
+                typeof task.workspaceId !== 'string' ||
+                !WORKSPACE_ID_RE.test(task.workspaceId)
+              )
+                return errorResult('durable delivery helper identity is malformed; preserving task state.', { action: params.action, taskId, task })
               const helperClose = await closeRawHelper({ tabId: task.deliveryHelperTabId, paneId: task.deliveryHelperPaneId, workspaceId: task.workspaceId })
-              if (!helperClose.closed) return errorResult(helperClose.error || 'previous delivery helper tab could not be closed; preserving task state.', { action: params.action, taskId, task, helperClose })
+              if (!helperClose.closed)
+                return errorResult(helperClose.error || 'previous delivery helper tab could not be closed; preserving task state.', { action: params.action, taskId, task, helperClose })
               const clearedTask: TaskRecord = { ...task, deliveryHelperTabId: undefined, deliveryHelperPaneId: undefined, updatedAt: new Date().toISOString() }
               try {
                 await writeTaskState(clearedTask)
@@ -1711,63 +1948,99 @@ export default function firstmate(pi: ExtensionAPI) {
               }
               task = clearedTask
             }
-            if (task.deliveryStatus === 'landed' && typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) === 'string' && typeof task.deliveryCommit === 'string' && typeof task.deliveryAt === 'string') {
+            if (
+              task.deliveryStatus === 'landed' &&
+              typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) === 'string' &&
+              typeof task.deliveryCommit === 'string' &&
+              typeof task.deliveryAt === 'string'
+            ) {
               const details = { action: params.action, taskId, taskPath, reportPath, delivered: true, idempotent: true, task, report: reportValidation.report }
               return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
             }
 
             const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId) || task.workspaceId !== workspaceId) return errorResult('Treehouse task is outside the current firstmate workspace.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
+            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId) || task.workspaceId !== workspaceId)
+              return errorResult('Treehouse task is outside the current firstmate workspace.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
             const currentPaneId = process.env.HERDR_PANE_ID
             const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
             if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
             const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
             const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-            if (currentPaneResult.code !== 0 || !currentPane || currentPane.pane_id !== currentPaneId || currentPane.workspace_id !== workspaceId || typeof currentPane.tab_id !== 'string' || !TAB_ID_RE.test(currentPane.tab_id) || currentPane.tab_id === task.tabId) return errorResult('could not establish an exact non-worker firstmate pane.', { action: params.action, taskId, task, currentPane: parseJsonMaybe(currentPaneResult.stdout) })
+            if (
+              currentPaneResult.code !== 0 ||
+              !currentPane ||
+              currentPane.pane_id !== currentPaneId ||
+              currentPane.workspace_id !== workspaceId ||
+              typeof currentPane.tab_id !== 'string' ||
+              !TAB_ID_RE.test(currentPane.tab_id) ||
+              currentPane.tab_id === task.tabId
+            )
+              return errorResult('could not establish an exact non-worker firstmate pane.', { action: params.action, taskId, task, currentPane: parseJsonMaybe(currentPaneResult.stdout) })
             const targetPaneResult = await runHerdr(['pane', 'get', task.paneId || ''], signal, 10_000)
             const targetPane = (parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
             const agentResult = await runHerdr(['agent', 'get', task.paneId || ''], signal, 10_000)
             const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-            if (targetPaneResult.code !== 0 || !targetPane || targetPane.pane_id !== task.paneId || targetPane.tab_id !== task.tabId || targetPane.workspace_id !== task.workspaceId || agentResult.code !== 0 || !agent || agent.pane_id !== task.paneId || agent.tab_id !== task.tabId || agent.workspace_id !== task.workspaceId || agent.name !== task.workerName || agent.agent !== task.workerKind || task.workerName === FIRSTMATE_NAME) {
-              return errorResult('live worker endpoint does not match the exact durable Treehouse task identity.', { action: params.action, taskId, task, targetPane: parseJsonMaybe(targetPaneResult.stdout), agent: parseJsonMaybe(agentResult.stdout) })
+            if (
+              targetPaneResult.code !== 0 ||
+              !targetPane ||
+              targetPane.pane_id !== task.paneId ||
+              targetPane.tab_id !== task.tabId ||
+              targetPane.workspace_id !== task.workspaceId ||
+              agentResult.code !== 0 ||
+              !agent ||
+              agent.pane_id !== task.paneId ||
+              agent.tab_id !== task.tabId ||
+              agent.workspace_id !== task.workspaceId ||
+              agent.name !== task.workerName ||
+              agent.agent !== task.workerKind ||
+              task.workerName === FIRSTMATE_NAME
+            ) {
+              return errorResult('live worker endpoint does not match the exact durable Treehouse task identity.', {
+                action: params.action,
+                taskId,
+                task,
+                targetPane: parseJsonMaybe(targetPaneResult.stdout),
+                agent: parseJsonMaybe(agentResult.stdout),
+              })
             }
 
             const evidencePath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.evidence`)
             const dirtyPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.dirty-paths`)
             const workerPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.worker-paths`)
             const dirtyPathOverlapCheck = [
-              "try{",
+              'try{',
               "const fs=require('node:fs');",
-              "const paths=(file)=>{const bytes=fs.readFileSync(file);const entries=[];let start=0;for(let index=0;index<bytes.length;index+=1){if(bytes[index]===0){entries.push(bytes.subarray(start,index));start=index+1}}return entries};",
+              'const paths=(file)=>{const bytes=fs.readFileSync(file);const entries=[];let start=0;for(let index=0;index<bytes.length;index+=1){if(bytes[index]===0){entries.push(bytes.subarray(start,index));start=index+1}}return entries};',
               "const key=(entry)=>entry.toString('hex');",
-              "const dirtyEntries=paths(process.argv[1]);const dirty=new Set(dirtyEntries.map(key));const dirtyAncestors=new Set();",
-              "for(const entry of dirtyEntries){for(let index=0;index<entry.length;index+=1){if(entry[index]===47)dirtyAncestors.add(key(entry.subarray(0,index)))} }",
-              "const overlaps=paths(process.argv[2]).some((entry)=>{const entryKey=key(entry);if(dirty.has(entryKey)||dirtyAncestors.has(entryKey))return true;for(let index=0;index<entry.length;index+=1){if(entry[index]===47&&dirty.has(key(entry.subarray(0,index))))return true}return false});process.exit(overlaps?1:0)",
+              'const dirtyEntries=paths(process.argv[1]);const dirty=new Set(dirtyEntries.map(key));const dirtyAncestors=new Set();',
+              'for(const entry of dirtyEntries){for(let index=0;index<entry.length;index+=1){if(entry[index]===47)dirtyAncestors.add(key(entry.subarray(0,index)))} }',
+              'const overlaps=paths(process.argv[2]).some((entry)=>{const entryKey=key(entry);if(dirty.has(entryKey)||dirtyAncestors.has(entryKey))return true;for(let index=0;index<entry.length;index+=1){if(entry[index]===47&&dirty.has(key(entry.subarray(0,index))))return true}return false});process.exit(overlaps?1:0)',
               '}catch{process.exit(2)}',
             ].join('')
             const stdoutPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stdout`)
             const stderrPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stderr`)
             const statusPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.status`)
             const deliveryScriptPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.sh`)
-            const deliveryScript = [
-              '#!/bin/sh',
-              `project=${shellQuote(task.project)}`,
-              `branch=${shellQuote(task.branch)}`,
-              `evidence=${shellQuote(evidencePath)}`,
-              `dirty_paths=${shellQuote(dirtyPathsPath)}`,
-              `worker_paths=${shellQuote(workerPathsPath)}`,
-              'target_ref=$(git -C "$project" symbolic-ref --quiet HEAD 2>/dev/null || true)',
-              'case "$target_ref" in refs/heads/*) target="${target_ref#refs/heads/}";; *) target=;; esac',
-              'if git -C "$project" show-ref --verify --quiet "refs/heads/$branch"; then branch_exists=true; else branch_exists=false; fi',
-              'dirty_paths_check=not-applicable',
-              'dirty_paths_overlap=false',
-              'if ! { git -C "$project" diff --name-only -z; git -C "$project" diff --cached --name-only -z; git -C "$project" ls-files --others --exclude-standard -z; } > "$dirty_paths"; then dirty_paths_check=failed; elif [ -n "$target" ] && [ "$branch_exists" = true ]; then if git -C "$project" diff --name-only --no-renames -z "$target" "$branch" > "$worker_paths"; then dirty_paths_check=complete; else dirty_paths_check=failed; fi; fi',
-              `if [ "$dirty_paths_check" = complete ] && [ -s "$dirty_paths" ] && [ -s "$worker_paths" ]; then if ${shellQuote(process.execPath)} -e ${shellQuote(dirtyPathOverlapCheck)} "$dirty_paths" "$worker_paths"; then dirty_paths_overlap=false; else case "$?" in 1) dirty_paths_overlap=true;; *) dirty_paths_check=failed;; esac; fi; fi`,
-              'if [ -n "$target" ] && [ "$branch_exists" = true ] && git -C "$project" merge-base --is-ancestor "$target" "$branch"; then fast_forward=true; else fast_forward=false; fi',
-              'printf \'target=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
-              'if [ -z "$target" ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
-              '[ "$code" -eq 0 ]',
-            ].join('\n') + '\n'
+            const deliveryScript =
+              [
+                '#!/bin/sh',
+                `project=${shellQuote(task.project)}`,
+                `branch=${shellQuote(task.branch)}`,
+                `evidence=${shellQuote(evidencePath)}`,
+                `dirty_paths=${shellQuote(dirtyPathsPath)}`,
+                `worker_paths=${shellQuote(workerPathsPath)}`,
+                'target_ref=$(git -C "$project" symbolic-ref --quiet HEAD 2>/dev/null || true)',
+                'case "$target_ref" in refs/heads/*) target="${target_ref#refs/heads/}";; *) target=;; esac',
+                'if git -C "$project" show-ref --verify --quiet "refs/heads/$branch"; then branch_exists=true; else branch_exists=false; fi',
+                'dirty_paths_check=not-applicable',
+                'dirty_paths_overlap=false',
+                'if ! { git -C "$project" diff --name-only -z; git -C "$project" diff --cached --name-only -z; git -C "$project" ls-files --others --exclude-standard -z; } > "$dirty_paths"; then dirty_paths_check=failed; elif [ -n "$target" ] && [ "$branch_exists" = true ]; then if git -C "$project" diff --name-only --no-renames -z "$target" "$branch" > "$worker_paths"; then dirty_paths_check=complete; else dirty_paths_check=failed; fi; fi',
+                `if [ "$dirty_paths_check" = complete ] && [ -s "$dirty_paths" ] && [ -s "$worker_paths" ]; then if ${shellQuote(process.execPath)} -e ${shellQuote(dirtyPathOverlapCheck)} "$dirty_paths" "$worker_paths"; then dirty_paths_overlap=false; else case "$?" in 1) dirty_paths_overlap=true;; *) dirty_paths_check=failed;; esac; fi; fi`,
+                'if [ -n "$target" ] && [ "$branch_exists" = true ] && git -C "$project" merge-base --is-ancestor "$target" "$branch"; then fast_forward=true; else fast_forward=false; fi',
+                'printf \'target=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
+                'if [ -z "$target" ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
+                '[ "$code" -eq 0 ]',
+              ].join('\n') + '\n'
             try {
               await fs.promises.mkdir(TASK_STATE_DIR, { recursive: true, mode: 0o700 })
               await fs.promises.writeFile(deliveryScriptPath, deliveryScript, { encoding: 'utf8', mode: 0o700 })
@@ -1786,7 +2059,12 @@ export default function firstmate(pi: ExtensionAPI) {
             }
             const helperResult = await createRawHelper(workspaceId, task.project, `firstmate-delivery-${taskId}`)
             if (!helperResult.helper) {
-              const failedTask: TaskRecord = { ...landingTask, deliveryStatus: 'failed', deliveryError: helperResult.error || 'could not create raw delivery helper tab.', updatedAt: new Date().toISOString() }
+              const failedTask: TaskRecord = {
+                ...landingTask,
+                deliveryStatus: 'failed',
+                deliveryError: helperResult.error || 'could not create raw delivery helper tab.',
+                updatedAt: new Date().toISOString(),
+              }
               await writeTaskState(failedTask).catch(() => undefined)
               await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
               return errorResult(failedTask.deliveryError || 'could not create raw delivery helper tab.', { action: params.action, taskId, task: failedTask, helper: helperResult.result })
@@ -1798,7 +2076,12 @@ export default function firstmate(pi: ExtensionAPI) {
             } catch (error) {
               const helperClose = await closeRawHelper(helper)
               await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
-              return errorResult(`could not persist delivery helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`, { action: params.action, taskId, task: landingTask, helperClose })
+              return errorResult(`could not persist delivery helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`, {
+                action: params.action,
+                taskId,
+                task: landingTask,
+                helperClose,
+              })
             }
             task = landingTaskWithHelper
             const deliveryRun = await runHerdr(['pane', 'run', helper.paneId, deliveryCommand], signal, timeout)
@@ -1817,23 +2100,98 @@ export default function firstmate(pi: ExtensionAPI) {
                 deliveryError = `local delivery result was ambiguous: ${(error as Error).message}`
               }
             } else deliveryError = commandResultText('herdr pane run (local delivery)', deliveryRun)
-            const values = Object.fromEntries(evidenceText.split(/\r?\n/).flatMap((line) => { const separator = line.indexOf('='); return separator > 0 ? [[line.slice(0, separator), line.slice(separator + 1)]] : [] }))
+            const values = Object.fromEntries(
+              evidenceText.split(/\r?\n/).flatMap((line) => {
+                const separator = line.indexOf('=')
+                return separator > 0 ? [[line.slice(0, separator), line.slice(separator + 1)]] : []
+              }),
+            )
             const resultCode = statusText.trim() && /^-?\d+$/.test(statusText.trim()) ? Number.parseInt(statusText.trim(), 10) : null
-            const deliveryDecision = assessLocalDelivery({ targetBranch: values.target || '', dirtyPathCheckSucceeded: values.dirty_paths_check === 'complete', dirtyPathsOverlap: values.dirty_paths_overlap === 'true', branchExists: values.branch_exists === 'true', fastForward: values.fast_forward === 'true' })
-            const refused = deliveryDecision.allowed ? undefined : deliveryDecision.reason === 'detached' ? 'primary checkout is detached or not on a local branch' : deliveryDecision.reason === 'dirty-path-check-failed' ? 'could not safely compare primary dirty paths with the worker branch' : deliveryDecision.reason === 'dirty-overlap' ? 'primary checkout has dirty paths overlapping the worker branch' : deliveryDecision.reason === 'missing-branch' ? 'recorded worker branch is missing' : 'primary and worker branches have diverged'
+            const deliveryDecision = assessLocalDelivery({
+              targetBranch: values.target || '',
+              dirtyPathCheckSucceeded: values.dirty_paths_check === 'complete',
+              dirtyPathsOverlap: values.dirty_paths_overlap === 'true',
+              branchExists: values.branch_exists === 'true',
+              fastForward: values.fast_forward === 'true',
+            })
+            const refused = deliveryDecision.allowed
+              ? undefined
+              : deliveryDecision.reason === 'detached'
+                ? 'primary checkout is detached or not on a local branch'
+                : deliveryDecision.reason === 'dirty-path-check-failed'
+                  ? 'could not safely compare primary dirty paths with the worker branch'
+                  : deliveryDecision.reason === 'dirty-overlap'
+                    ? 'primary checkout has dirty paths overlapping the worker branch'
+                    : deliveryDecision.reason === 'missing-branch'
+                      ? 'recorded worker branch is missing'
+                      : 'primary and worker branches have diverged'
             const before = values.before
             const after = values.after
-            const mergeSuccess = !deliveryError && resultCode === 0 && !refused && typeof values.target === 'string' && values.target.length > 0 && typeof before === 'string' && /^[0-9a-f]+$/i.test(before) && typeof after === 'string' && /^[0-9a-f]+$/i.test(after)
-            const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(deliveryScriptPath)} ${shellQuote(evidencePath)} ${shellQuote(dirtyPathsPath)} ${shellQuote(workerPathsPath)} ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`], signal, 10_000).catch((cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }))
+            const mergeSuccess =
+              !deliveryError &&
+              resultCode === 0 &&
+              !refused &&
+              typeof values.target === 'string' &&
+              values.target.length > 0 &&
+              typeof before === 'string' &&
+              /^[0-9a-f]+$/i.test(before) &&
+              typeof after === 'string' &&
+              /^[0-9a-f]+$/i.test(after)
+            const tempCleanup = await runHerdr(
+              [
+                'pane',
+                'run',
+                helper.paneId,
+                `rm -f ${shellQuote(deliveryScriptPath)} ${shellQuote(evidencePath)} ${shellQuote(dirtyPathsPath)} ${shellQuote(workerPathsPath)} ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`,
+              ],
+              signal,
+              10_000,
+            ).catch((cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }))
             await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
             const helperClose = await closeRawHelper(helper)
             if (!helperClose.closed) deliveryError = `${deliveryError ? `${deliveryError} ` : ''}${helperClose.error || 'raw delivery helper tab could not be closed.'}`
             const deliverySuccess = mergeSuccess && helperClose.closed
-            const finalTask: TaskRecord = { ...task, deliveryStatus: mergeSuccess ? 'landed' : 'failed', deliveryTargetBranch: values.target, deliveryDefaultBranch: undefined, deliveryBeforeCommit: before, deliveryCommit: after, deliveryCode: resultCode, deliveryStdout: stdout, deliveryStderr: stderr, deliveryError: deliverySuccess ? undefined : deliveryError || refused || 'local delivery failed or returned incomplete evidence', deliveryHelperTabId: helperClose.closed ? undefined : helper.tabId, deliveryHelperPaneId: helperClose.closed ? undefined : helper.paneId, updatedAt: new Date().toISOString() }
+            const finalTask: TaskRecord = {
+              ...task,
+              deliveryStatus: mergeSuccess ? 'landed' : 'failed',
+              deliveryTargetBranch: values.target,
+              deliveryDefaultBranch: undefined,
+              deliveryBeforeCommit: before,
+              deliveryCommit: after,
+              deliveryCode: resultCode,
+              deliveryStdout: stdout,
+              deliveryStderr: stderr,
+              deliveryError: deliverySuccess ? undefined : deliveryError || refused || 'local delivery failed or returned incomplete evidence',
+              deliveryHelperTabId: helperClose.closed ? undefined : helper.tabId,
+              deliveryHelperPaneId: helperClose.closed ? undefined : helper.paneId,
+              updatedAt: new Date().toISOString(),
+            }
             let deliveryPersistError: string | undefined
-            await writeTaskState(finalTask).catch((error) => { deliveryPersistError = `could not persist delivery result: ${(error as Error).message}` })
-            if (!deliverySuccess || deliveryPersistError) return errorResult(deliveryPersistError || finalTask.deliveryError || 'local delivery failed.', { action: params.action, taskId, taskPath, project: task.project, branch: task.branch, task: finalTask, delivery: { result: deliveryRun, evidence: values, tempCleanup, helperClose, durableEvidence: !deliveryPersistError } })
-            const details = { action: params.action, taskId, taskPath, project: task.project, branch: task.branch, delivered: true, idempotent: false, task: finalTask, report: reportValidation.report, delivery: { targetBranch: values.target, beforeCommit: before, landedCommit: after, stdout, stderr } }
+            await writeTaskState(finalTask).catch((error) => {
+              deliveryPersistError = `could not persist delivery result: ${(error as Error).message}`
+            })
+            if (!deliverySuccess || deliveryPersistError)
+              return errorResult(deliveryPersistError || finalTask.deliveryError || 'local delivery failed.', {
+                action: params.action,
+                taskId,
+                taskPath,
+                project: task.project,
+                branch: task.branch,
+                task: finalTask,
+                delivery: { result: deliveryRun, evidence: values, tempCleanup, helperClose, durableEvidence: !deliveryPersistError },
+              })
+            const details = {
+              action: params.action,
+              taskId,
+              taskPath,
+              project: task.project,
+              branch: task.branch,
+              delivered: true,
+              idempotent: false,
+              task: finalTask,
+              report: reportValidation.report,
+              delivery: { targetBranch: values.target, beforeCommit: before, landedCommit: after, stdout, stderr },
+            }
             return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
           }
           case 'task_teardown': {
@@ -1871,7 +2229,18 @@ export default function firstmate(pi: ExtensionAPI) {
               return errorResult('durable task state is malformed or does not identify one exact worker endpoint.', { action: params.action, taskId, taskPath, task })
             }
             const reviewTask = typeof task.reviewTarget === 'string' && task.reviewTarget.length > 0
-            if (task.worktreeProvider === 'treehouse' && !reviewTask && (!canCleanupAfterDelivery({ reportCompleted: task.reportStatus === 'completed' && task.reportOutcome === 'completed', deliveryStatus: task.deliveryStatus, leaseStatus: task.leaseStatus }) || typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) !== 'string' || typeof task.deliveryCommit !== 'string' || typeof task.deliveryAt !== 'string')) {
+            if (
+              task.worktreeProvider === 'treehouse' &&
+              !reviewTask &&
+              (!canCleanupAfterDelivery({
+                reportCompleted: task.reportStatus === 'completed' && task.reportOutcome === 'completed',
+                deliveryStatus: task.deliveryStatus,
+                leaseStatus: task.leaseStatus,
+              }) ||
+                typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) !== 'string' ||
+                typeof task.deliveryCommit !== 'string' ||
+                typeof task.deliveryAt !== 'string')
+            ) {
               return errorResult('task teardown requires successful explicit local delivery before cleanup.', { action: params.action, taskId, taskPath, task, delivered: false })
             }
             if (task.reportStatus !== 'completed' || task.reportOutcome !== 'completed' || typeof task.reportUpdatedAt !== 'string' || typeof task.reportSummary !== 'string') {
@@ -1992,7 +2361,20 @@ export default function firstmate(pi: ExtensionAPI) {
               if (cwdError) return errorResult(cwdError, { action: params.action })
               const workspaceId = process.env.HERDR_WORKSPACE_ID
               if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action })
-              args = ['tab', 'create', '--workspace', workspaceId, '--cwd', params.cwd || ctx.cwd, '--env', `${WORKER_ENV}=1`, '--env', `PATH=${workerPath()}`, '--env', `PI_FIRSTMATE_REAL_GIT=${firstmateGitPath()}`]
+              args = [
+                'tab',
+                'create',
+                '--workspace',
+                workspaceId,
+                '--cwd',
+                params.cwd || ctx.cwd,
+                '--env',
+                `${WORKER_ENV}=1`,
+                '--env',
+                `PATH=${workerPath()}`,
+                '--env',
+                `PI_FIRSTMATE_REAL_GIT=${firstmateGitPath()}`,
+              ]
               if (params.label) args.push('--label', params.label)
               args.push(params.focus ? '--focus' : '--no-focus')
               break
@@ -2042,13 +2424,15 @@ export default function firstmate(pi: ExtensionAPI) {
               parsed: parseJsonMaybe(targetTabResult.stdout),
             }
             if (targetTabResult.code !== 0 || !targetTab) {
-              const recoveryEligible =
+              const treehouseRecoveryEligible =
                 taskTeardownRecord?.worktreeProvider === 'treehouse' &&
                 taskTeardownRecord.leaseStatus === 'leased' &&
                 taskTeardownRecord.leaseReturnStatus === 'failed' &&
                 taskTeardownRecord.workspaceId === targetWorkspaceId &&
                 ((typeof taskTeardownRecord.leaseReturnStdout === 'string' && taskTeardownRecord.leaseReturnStdout.includes(TREEHOUSE_RETURN_SUCCESS_MARKER)) ||
                   (typeof taskTeardownRecord.leaseReturnStderr === 'string' && taskTeardownRecord.leaseReturnStderr.includes(TREEHOUSE_RETURN_SUCCESS_MARKER)))
+              const sharedRecoveryEligible = taskTeardownRecord?.worktreeProvider === 'herdr' && taskTeardownRecord.workspaceId === targetWorkspaceId
+              const recoveryEligible = treehouseRecoveryEligible || sharedRecoveryEligible
               if (recoveryEligible && taskTeardownRecord && taskTeardownRecord.tabId === params.tabId && typeof taskTeardownRecord.paneId === 'string' && PANE_ID_RE.test(taskTeardownRecord.paneId)) {
                 const [tabListResult, paneListResult] = await Promise.all([
                   runHerdr(['tab', 'list', '--workspace', targetWorkspaceId], signal, 10_000),
@@ -2064,17 +2448,36 @@ export default function firstmate(pi: ExtensionAPI) {
                 const recordedPaneAbsent = paneListResult.code === 0 && !!paneEntries && !paneEntries.some((entry) => entry.pane_id === taskTeardownRecord!.paneId)
                 const recoveryInspection = {
                   marker: TREEHOUSE_RETURN_SUCCESS_MARKER,
-                  tab: { argv: ['herdr', 'tab', 'list', '--workspace', targetWorkspaceId], exitCode: tabListResult.code, stdout: tabListResult.stdout, stderr: tabListResult.stderr, parsed: tabListPayload },
-                  pane: { argv: ['herdr', 'pane', 'list', '--workspace', targetWorkspaceId], exitCode: paneListResult.code, stdout: paneListResult.stdout, stderr: paneListResult.stderr, parsed: paneListPayload },
+                  tab: {
+                    argv: ['herdr', 'tab', 'list', '--workspace', targetWorkspaceId],
+                    exitCode: tabListResult.code,
+                    stdout: tabListResult.stdout,
+                    stderr: tabListResult.stderr,
+                    parsed: tabListPayload,
+                  },
+                  pane: {
+                    argv: ['herdr', 'pane', 'list', '--workspace', targetWorkspaceId],
+                    exitCode: paneListResult.code,
+                    stdout: paneListResult.stdout,
+                    stderr: paneListResult.stderr,
+                    parsed: paneListPayload,
+                  },
                   recordedTabAbsent,
                   recordedPaneAbsent,
                 }
                 if (recordedTabAbsent && recordedPaneAbsent) {
-                  const recoveredTask: TaskRecord = { ...taskTeardownRecord, leaseStatus: 'returned', leaseReturnStatus: 'returned', leaseReturnError: undefined, updatedAt: new Date().toISOString() }
+                  const recoveredTask: TaskRecord = treehouseRecoveryEligible
+                    ? { ...taskTeardownRecord, leaseStatus: 'returned', leaseReturnStatus: 'returned', leaseReturnError: undefined, updatedAt: new Date().toISOString() }
+                    : { ...taskTeardownRecord, updatedAt: new Date().toISOString() }
                   try {
                     await writeTaskState(recoveredTask)
                   } catch (error) {
-                    return errorResult(`could not persist recovered Treehouse return state: ${(error as Error).message}`, { action: params.action, taskId: recoveredTask.taskId, task: recoveredTask, recovery: recoveryInspection })
+                    return errorResult(`could not persist recovered absent-worker state: ${(error as Error).message}`, {
+                      action: params.action,
+                      taskId: recoveredTask.taskId,
+                      task: recoveredTask,
+                      recovery: recoveryInspection,
+                    })
                   }
                   taskTeardownRecord = recoveredTask
                   taskTeardownTabAlreadyAbsent = true
@@ -2250,7 +2653,11 @@ export default function firstmate(pi: ExtensionAPI) {
             const kind = params.kind === undefined ? selectedWorkerKind : params.kind
             const kindError = validateWorkerKind(kind)
             if (kindError) return errorResult(kindError, { action: params.action, kind: params.kind })
-            const workerEnvResult = await runHerdr(['pane', 'run', params.paneId!, `export ${WORKER_ENV}=1 PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`], signal, 10_000)
+            const workerEnvResult = await runHerdr(
+              ['pane', 'run', params.paneId!, `export ${WORKER_ENV}=1 PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`],
+              signal,
+              10_000,
+            )
             if (workerEnvResult.code !== 0) return errorResult(commandResultText('herdr pane run (worker environment)', workerEnvResult), { action: params.action, paneId: params.paneId })
             args = ['agent', 'start', params.name!, '--kind', kind!, '--pane', params.paneId!]
             if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
@@ -2289,7 +2696,10 @@ export default function firstmate(pi: ExtensionAPI) {
         }
 
         if (taskTeardownRecord) {
-          if (!taskTeardownTabAlreadyAbsent && (tabCloseTargetPaneId !== taskTeardownRecord.paneId || tabCloseAgentName !== taskTeardownRecord.workerName || tabCloseAgentKind !== taskTeardownRecord.workerKind)) {
+          if (
+            !taskTeardownTabAlreadyAbsent &&
+            (tabCloseTargetPaneId !== taskTeardownRecord.paneId || tabCloseAgentName !== taskTeardownRecord.workerName || tabCloseAgentKind !== taskTeardownRecord.workerKind)
+          ) {
             return errorResult('live worker endpoint does not match the durable task identity.', {
               action: params.action,
               taskId: taskTeardownRecord.taskId,
@@ -2299,7 +2709,16 @@ export default function firstmate(pi: ExtensionAPI) {
           }
           if (!taskTeardownTabAlreadyAbsent) {
             const leaseReturn = await returnTaskLease(taskTeardownRecord)
-            if (!leaseReturn.returned) return errorResult(leaseReturn.error || 'Treehouse lease return failed; preserving the worker tab and lease.', { action: params.action, taskId: taskTeardownRecord.taskId, task: leaseReturn.task, leaseReturned: false, tabClosed: false, inspection: tabCloseInspection, leaseReturn: leaseReturn.result })
+            if (!leaseReturn.returned)
+              return errorResult(leaseReturn.error || 'Treehouse lease return failed; preserving the worker tab and lease.', {
+                action: params.action,
+                taskId: taskTeardownRecord.taskId,
+                task: leaseReturn.task,
+                leaseReturned: false,
+                tabClosed: false,
+                inspection: tabCloseInspection,
+                leaseReturn: leaseReturn.result,
+              })
             taskTeardownRecord = leaseReturn.task
           }
           const closingTask: TaskRecord = { ...taskTeardownRecord, cleanupStatus: 'closing', cleanupUpdatedAt: new Date().toISOString(), cleanupError: undefined, updatedAt: new Date().toISOString() }
@@ -2473,7 +2892,12 @@ export default function firstmate(pi: ExtensionAPI) {
   pi.on('tool_call', (event) => {
     if (!active) return
     if (!ALLOWED_TOOLS.includes(event.toolName)) {
-      return { block: true, terminate: true, reason: 'Firstmate is coordination-only: only read, grep, find, ls, and herdr_control are active.' }
+      return {
+        block: true,
+        terminate: true,
+        reason:
+          'Firstmate is coordination-only: only read, grep, find, ls, herdr_control, and artifact are active; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.',
+      }
     }
   })
 }
