@@ -385,6 +385,30 @@ test('Firstmate activation gates the headless path while task_create starts visi
   assert.doesNotMatch(taskCreate, /subagent/)
 })
 
+test('herdr_control registers compact TUI renderers with bounded expanded details', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const toolStart = source.indexOf("name: 'herdr_control'")
+  const toolEnd = source.indexOf('\n      },\n    })', toolStart)
+  assert.ok(toolStart >= 0)
+  assert.ok(toolEnd > toolStart)
+  const tool = source.slice(toolStart, toolEnd)
+
+  assert.match(source, /import \{ Text \} from '@earendil-works\/pi-tui'/)
+  assert.match(tool, /renderCall\(_args, theme, context\)/)
+  assert.match(tool, /theme\.fg\('warning', '⏳ working'\)/)
+  assert.match(tool, /theme\.fg\('success', '✓ done'\)/)
+  assert.match(tool, /theme\.fg\('error', '✗ failed'\)/)
+  assert.match(tool, /renderResult\(result, \{ expanded, isPartial \}, theme, context\)/)
+  assert.match(tool, /if \(isPartial \|\| !expanded\) return new Text\('', 0, 0\)/)
+  assert.match(tool, /action: \$\{action\}/)
+  assert.match(tool, /result: \$\{resultText\}/)
+  assert.match(tool, /details: \$\{detailsText\}/)
+  assert.match(source, /const FIRSTMATE_RENDER_MAX_CHARS = 2_000/)
+  assert.match(source, /const FIRSTMATE_RENDER_MAX_LINES = 12/)
+  assert.match(source, /lines\.slice\(0, FIRSTMATE_RENDER_MAX_LINES\)/)
+  assert.match(source, /bounded\.length > FIRSTMATE_RENDER_MAX_CHARS/)
+})
+
 test('Pi worker starts append enforced Luna/high arguments after caller native arguments', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const helperStart = source.indexOf('function appendWorkerNativeArgs')

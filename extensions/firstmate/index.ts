@@ -3,6 +3,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import { Text } from '@earendil-works/pi-tui'
 import { assessLocalDelivery, canCleanupAfterDelivery } from './delivery.ts'
 import {
   appendUntilArgs,
@@ -97,10 +98,9 @@ const HerdrControlParams = Type.Object({
   prompt: Type.Optional(Type.String({ description: 'Prompt text for agent_prompt.' })),
   wait: Type.Optional(Type.Boolean({ description: 'For agent_prompt, wait for settled state. Defaults to true.' })),
   until: Type.Optional(
-    Type.Union([
-      StringEnum(['idle', 'done', 'blocked', 'working', 'unknown'] as const),
-      Type.Array(StringEnum(['idle', 'done', 'blocked', 'working', 'unknown'] as const)),
-    ], { description: 'Optional agent wait status; legacy scalar and repeated array forms are accepted.' }),
+    Type.Union([StringEnum(['idle', 'done', 'blocked', 'working', 'unknown'] as const), Type.Array(StringEnum(['idle', 'done', 'blocked', 'working', 'unknown'] as const))], {
+      description: 'Optional agent wait status; legacy scalar and repeated array forms are accepted.',
+    }),
   ),
   timeoutMs: Type.Optional(Type.Number({ description: 'Timeout in milliseconds for Herdr wait/start/prompt/read commands.' })),
   source: Type.Optional(StringEnum(['visible', 'recent', 'recent-unwrapped', 'detection'] as const, { description: 'Read source for agent_read.' })),
@@ -115,7 +115,21 @@ const HerdrControlParams = Type.Object({
 
 type ExecResult = { stdout: string; stderr: string; code: number | null; killed?: boolean }
 type ControlParams = {
-  action: 'status' | 'task_create' | 'task_reconcile' | 'task_deliver' | 'task_teardown' | 'task_abort' | 'task_recover' | 'tab_create' | 'tab_close' | 'pane_run' | 'agent_start' | 'agent_prompt' | 'agent_wait' | 'agent_read'
+  action:
+    | 'status'
+    | 'task_create'
+    | 'task_reconcile'
+    | 'task_deliver'
+    | 'task_teardown'
+    | 'task_abort'
+    | 'task_recover'
+    | 'tab_create'
+    | 'tab_close'
+    | 'pane_run'
+    | 'agent_start'
+    | 'agent_prompt'
+    | 'agent_wait'
+    | 'agent_read'
   project?: string
   taskId?: string
   tabId?: string
@@ -653,6 +667,18 @@ function appendWorkerNativeArgs(args: string[], kind: string, nativeArgs: string
   if (kind === 'pi') args.push(...PI_WORKER_NATIVE_ARGS)
 }
 
+const FIRSTMATE_RENDER_MAX_CHARS = 2_000
+const FIRSTMATE_RENDER_MAX_LINES = 12
+
+function boundedFirstmateRenderText(value: unknown): string {
+  const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
+  const lines = text.trim().split(/\r?\n/)
+  let bounded = lines.slice(0, FIRSTMATE_RENDER_MAX_LINES).join('\n')
+  if (lines.length > FIRSTMATE_RENDER_MAX_LINES) bounded += '\n... more output'
+  if (bounded.length > FIRSTMATE_RENDER_MAX_CHARS) bounded = `${bounded.slice(0, FIRSTMATE_RENDER_MAX_CHARS - 3)}...`
+  return bounded
+}
+
 export default function firstmate(pi: ExtensionAPI) {
   if (!inHerdr()) return
 
@@ -1120,2018 +1146,2279 @@ export default function firstmate(pi: ExtensionAPI) {
         'Workers and their subagents must not push, publish, use MCP, or commit without explicit captain authorization. Do not auto-close or auto-merge; report only verified outcomes and preserve unrelated changes.',
       ],
       parameters: HerdrControlParams,
+      renderCall(_args, theme, context) {
+        if (context.isPartial) return new Text(theme.fg('warning', '⏳ working'), 0, 0)
+        const status = context.isError ? theme.fg('error', '✗ failed') : theme.fg('success', '✓ done')
+        return new Text(status, 0, 0)
+      },
+      renderResult(result, { expanded, isPartial }, theme, context) {
+        if (isPartial || !expanded) return new Text('', 0, 0)
+        const action = typeof context.args.action === 'string' ? context.args.action : 'unknown'
+        const resultText = boundedFirstmateRenderText(result.content.map((entry) => (entry.type === 'text' ? entry.text : `[${entry.type}]`)).join('\n'))
+        const detailsText = result.details === undefined ? '' : boundedFirstmateRenderText(result.details)
+        let text = theme.fg('muted', `action: ${action}`)
+        if (resultText) text += `\n${theme.fg('dim', `result: ${resultText}`)}`
+        if (detailsText) text += `\n${theme.fg('dim', `details: ${detailsText}`)}`
+        return new Text(text, 0, 0)
+      },
       async execute(_toolCallId, params: ControlParams, signal, _onUpdate, ctx) {
         if (!active) return errorResult('herdr_control is only available in the active Herdr firstmate pane.')
         if (!inHerdr()) return errorResult('not running inside Herdr.')
 
         const releaseLifecycle = LIFECYCLE_ACTIONS.has(params.action) ? await lifecycleLock.acquire() : undefined
-        try {
-        const timeoutError = validateTimeout(params.timeoutMs)
-        if (timeoutError) return errorResult(timeoutError, { action: params.action })
-        const timeout = params.timeoutMs ?? 120_000
-        const readPaneFile = async (filePath: string): Promise<string> => {
-          const deadline = Date.now() + timeout
-          while (Date.now() < deadline) {
-            try {
-              return await fs.promises.readFile(filePath, 'utf8')
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-            }
-            await new Promise((resolve) => setTimeout(resolve, 100))
-          }
-          throw new Error(`timed out waiting for ${filePath}`)
-        }
-        type RawHelper = { tabId: string; paneId: string; workspaceId: string }
-        const closeRawHelper = async (helper: RawHelper): Promise<{ closed: boolean; absent?: boolean; error?: string; result?: ExecResult }> => {
-          const [tabListResult, paneListResult] = await Promise.all([
-            runHerdr(['tab', 'list', '--workspace', helper.workspaceId], signal, 10_000),
-            runHerdr(['pane', 'list', '--workspace', helper.workspaceId], signal, 10_000),
-          ])
-          const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-          const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-          if (endpointListsConfirmAbsence({ tabListSucceeded: tabListResult.code === 0, paneListSucceeded: paneListResult.code === 0, tabs, panes, tabId: helper.tabId, paneId: helper.paneId })) {
-            return { closed: true, absent: true, result: tabListResult }
-          }
-          const currentPaneId = process.env.HERDR_PANE_ID
-          if (!currentPaneId || !PANE_ID_RE.test(currentPaneId)) return { closed: false, error: 'current firstmate pane id is invalid; preserving helper tab.' }
-          const currentResult = await runHerdr(['pane', 'get', currentPaneId], signal, 10_000)
-          const current = (parseJsonMaybe(currentResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-          const tabResult = await runHerdr(['tab', 'get', helper.tabId], signal, 10_000)
-          const tab = (parseJsonMaybe(tabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
-          const panesResult = await runHerdr(['pane', 'list', '--workspace', helper.workspaceId], signal, 10_000)
-          const listedPanes = (parseJsonMaybe(panesResult.stdout) as { result?: { panes?: Array<Record<string, unknown>> } } | undefined)?.result?.panes
-          const matchingPanes = listedPanes?.filter((pane) => pane.tab_id === helper.tabId) ?? []
-          const pane = matchingPanes.length === 1 ? matchingPanes[0] : undefined
-          const agentResult = pane && typeof pane.pane_id === 'string' ? await runHerdr(['agent', 'get', pane.pane_id], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
-          const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-          if (currentResult.code !== 0 || !current || current.pane_id !== currentPaneId || current.workspace_id !== helper.workspaceId || current.tab_id === helper.tabId)
-            return { closed: false, error: 'refusing to close helper tab because it is the current firstmate tab.' }
-          if (
-            tabResult.code !== 0 ||
-            !tab ||
-            tab.tab_id !== helper.tabId ||
-            tab.workspace_id !== helper.workspaceId ||
-            tab.pane_count !== 1 ||
-            panesResult.code !== 0 ||
-            matchingPanes.length !== 1 ||
-            !pane ||
-            pane.pane_id !== helper.paneId ||
-            pane.workspace_id !== helper.workspaceId ||
-            pane.tab_id !== helper.tabId ||
-            (agentResult.code === 0 && agent)
-          )
-            return { closed: false, error: 'helper tab identity is no longer exact or has an agent; preserving helper tab.' }
-          const result = await runHerdr(['tab', 'close', helper.tabId], signal, 10_000)
-          if (result.code !== 0) return { closed: false, error: commandResultText('herdr tab close (helper)', result), result }
-          const [verifyTabs, verifyPanes] = await Promise.all([
-            runHerdr(['tab', 'list', '--workspace', helper.workspaceId], signal, 10_000),
-            runHerdr(['pane', 'list', '--workspace', helper.workspaceId], signal, 10_000),
-          ])
-          const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-          const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-          const verifiedAbsent = endpointListsConfirmAbsence({ tabListSucceeded: verifyTabs.code === 0, paneListSucceeded: verifyPanes.code === 0, tabs: verifiedTabs, panes: verifiedPanes, tabId: helper.tabId, paneId: helper.paneId })
-          return { closed: verifiedAbsent, error: verifiedAbsent ? undefined : 'helper tab close was not verified absent; preserving helper identity.', result }
-        }
-        const createRawHelper = async (workspaceId: string, cwd: string, label: string): Promise<{ helper?: RawHelper; error?: string; result?: Record<string, unknown> }> => {
-          const tabArgs = ['tab', 'create', '--workspace', workspaceId, '--cwd', cwd, '--label', label, '--no-focus']
-          const tabResult = await runHerdr(tabArgs, signal, 10_000)
-          const payload = parseJsonMaybe(tabResult.stdout) as { result?: { tab?: Record<string, unknown>; root_pane?: Record<string, unknown> } } | undefined
-          const returnedTab = payload?.result?.tab
-          const returnedPane = payload?.result?.root_pane
-          const tabId = returnedTab?.tab_id
-          const paneId = returnedPane?.pane_id
-          const helper = typeof tabId === 'string' && TAB_ID_RE.test(tabId) && typeof paneId === 'string' && PANE_ID_RE.test(paneId) ? { tabId, paneId, workspaceId } : undefined
-          if (tabResult.code !== 0 || !helper) {
-            const helperClose = helper ? await closeRawHelper(helper) : undefined
-            return {
-              error: `${commandResultText('herdr tab create (raw helper)', tabResult)}${helperClose && !helperClose.closed ? ` ${helperClose.error || 'helper cleanup failed.'}` : ''}`,
-              result: { argv: ['herdr', ...tabArgs], returned: payload, helperClose },
-            }
-          }
-          const tabInspectionResult = await runHerdr(['tab', 'get', helper.tabId], signal, 10_000)
-          const paneInspectionResult = await runHerdr(['pane', 'get', helper.paneId], signal, 10_000)
-          const currentPaneResult = process.env.HERDR_PANE_ID ? await runHerdr(['pane', 'current', '--current'], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
-          const agentResult = await runHerdr(['agent', 'get', helper.paneId], signal, 10_000)
-          const tabInspection = (parseJsonMaybe(tabInspectionResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
-          const paneInspection = (parseJsonMaybe(paneInspectionResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-          const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-          const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-          const exactRaw =
-            tabInspectionResult.code === 0 &&
-            !!tabInspection &&
-            tabInspection.tab_id === helper.tabId &&
-            tabInspection.workspace_id === workspaceId &&
-            tabInspection.pane_count === 1 &&
-            tabInspection.focused === false &&
-            paneInspectionResult.code === 0 &&
-            !!paneInspection &&
-            paneInspection.pane_id === helper.paneId &&
-            paneInspection.tab_id === helper.tabId &&
-            paneInspection.workspace_id === workspaceId &&
-            (paneInspection.cwd === cwd || paneInspection.foreground_cwd === cwd) &&
-            currentPaneResult.code === 0 &&
-            !!currentPane &&
-            currentPane.pane_id === process.env.HERDR_PANE_ID &&
-            currentPane.workspace_id === workspaceId &&
-            currentPane.tab_id !== helper.tabId &&
-            !(agentResult.code === 0 && agent)
-          if (!exactRaw) {
-            const close = await closeRawHelper(helper)
-            return {
-              error: `raw helper tab identity was incomplete or an agent occupied it.${close.closed ? '' : ` ${close.error || 'helper tab cleanup failed.'}`}`,
-              result: { argv: ['herdr', ...tabArgs], returned: payload, tab: tabInspection, pane: paneInspection, currentPane, agent, helperClose: close },
-            }
-          }
-          return { helper }
-        }
-        const removeTaskArtifacts = async (taskId: string, removeState = false): Promise<{ removed: string[]; missing: string[]; errors: Array<{ path: string; error: string }>; success: boolean }> => {
-          const removed: string[] = []
-          const missing: string[] = []
-          const errors: Array<{ path: string; error: string }> = []
-          for (const filePath of taskArtifactPaths(taskId, TASK_STATE_DIR)) {
-            try {
-              await fs.promises.unlink(filePath)
-              removed.push(filePath)
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') missing.push(filePath)
-              else errors.push({ path: filePath, error: (error as Error).message })
-            }
-          }
-          if (removeState && errors.length === 0) {
-            const statePath = taskFilePath(taskId)
-            try {
-              await fs.promises.unlink(statePath)
-              removed.push(statePath)
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') missing.push(statePath)
-              else errors.push({ path: statePath, error: (error as Error).message })
-            }
-          }
-          return { removed, missing, errors, success: errors.length === 0 }
-        }
-        const returnTaskLease = async (task: TaskRecord): Promise<{ returned: boolean; idempotent?: boolean; task: TaskRecord; error?: string; result?: Record<string, unknown> }> => {
-          if (task.worktreeProvider !== 'treehouse') return { returned: true, idempotent: true, task }
-          if (isPendingLeaseNoop(task.leaseStatus)) return { returned: true, idempotent: true, task }
-          if (task.leaseReturnHelperTabId || task.leaseReturnHelperPaneId) {
-            if (
-              typeof task.leaseReturnHelperTabId !== 'string' ||
-              !TAB_ID_RE.test(task.leaseReturnHelperTabId) ||
-              typeof task.leaseReturnHelperPaneId !== 'string' ||
-              !PANE_ID_RE.test(task.leaseReturnHelperPaneId) ||
-              typeof task.workspaceId !== 'string' ||
-              !WORKSPACE_ID_RE.test(task.workspaceId)
-            )
-              return { returned: false, task, error: 'durable Treehouse return helper identity is malformed; preserving task state.' }
-            const helperClose = await closeRawHelper({ tabId: task.leaseReturnHelperTabId, paneId: task.leaseReturnHelperPaneId, workspaceId: task.workspaceId })
-            if (!helperClose.closed)
-              return { returned: false, task, error: helperClose.error || 'previous Treehouse return helper tab could not be closed; preserving task state.', result: { helperClose } }
-            const clearedTask: TaskRecord = { ...task, leaseReturnHelperTabId: undefined, leaseReturnHelperPaneId: undefined, updatedAt: new Date().toISOString() }
-            try {
-              await writeTaskState(clearedTask)
-            } catch (error) {
-              return { returned: false, task, error: `could not persist Treehouse return helper cleanup: ${(error as Error).message}`, result: { helperClose } }
-            }
-            task = clearedTask
-          }
-          if (task.leaseStatus === 'returned' && task.leaseReturnStatus === 'returned') return { returned: true, idempotent: true, task }
-          if (
-            task.leaseStatus !== 'leased' ||
-            typeof task.worktree !== 'string' ||
-            !path.isAbsolute(task.worktree) ||
-            task.leaseHolder !== task.taskId ||
-            typeof task.leaseId !== 'string' ||
-            !task.leaseId
-          ) {
-            return { returned: false, task, error: 'exact Treehouse lease identity is missing; preserving the lease.' }
-          }
-          const stdoutPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stdout`)
-          const stderrPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stderr`)
-          const statusPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.status`)
-          const command = `treehouse return --force ${shellQuote(task.worktree)} --if-lease-holder ${shellQuote(task.leaseHolder)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\n' "$?" > ${shellQuote(statusPath)}`
-          const helperResult = await createRawHelper(task.workspaceId || '', task.worktree, `firstmate-lease-return-${task.taskId}`)
-          if (!helperResult.helper)
-            return { returned: false, task, error: helperResult.error || 'could not create raw Treehouse return helper tab; preserving the lease.', result: helperResult.result }
-          const helper = helperResult.helper
-          const helperTask: TaskRecord = { ...task, leaseReturnHelperTabId: helper.tabId, leaseReturnHelperPaneId: helper.paneId, updatedAt: new Date().toISOString() }
-          try {
-            await writeTaskState(helperTask)
-          } catch (error) {
-            const helperClose = await closeRawHelper(helper)
-            return {
-              returned: false,
-              task,
-              error: `could not persist Treehouse return helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`,
-              result: { helperClose },
-            }
-          }
-          task = helperTask
-          const run = await runHerdr(['pane', 'run', helper.paneId, command], signal, 10_000)
-          let statusText = ''
-          let stdout = ''
-          let stderr = ''
-          let error: string | undefined
-          if (run.code === 0) {
-            try {
-              statusText = await readPaneFile(statusPath)
-            } catch (readError) {
-              error = `Treehouse return result was ambiguous: ${(readError as Error).message}`
-            }
-          } else error = commandResultText('herdr pane run (Treehouse return)', run)
-          stdout = await fs.promises.readFile(stdoutPath, 'utf8').catch(() => '')
-          stderr = await fs.promises.readFile(stderrPath, 'utf8').catch(() => '')
-          const code = statusText.trim() && /^-?\d+$/.test(statusText.trim()) ? Number.parseInt(statusText.trim(), 10) : null
-          const returnSuccessMarker = [stdout, stderr].some((output) => output.includes(TREEHOUSE_RETURN_SUCCESS_MARKER))
-          const markerSucceeded = code === null && returnSuccessMarker
-          const commandSucceeded = (!error && code === 0) || markerSucceeded
-          if (markerSucceeded) error = undefined
-          if (!commandSucceeded && !error) error = `treehouse return exited ${code ?? 'unknown'}; lease is preserved.`
-          const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`], signal, 10_000).catch(
-            (cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }),
-          )
-          const tempCleanupSucceeded = tempCleanup.code === 0
-          const helperClose = tempCleanupSucceeded
-            ? await closeRawHelper(helper)
-            : { closed: false, error: 'Treehouse return temporary-result cleanup was not verified; preserving the return helper.', result: tempCleanup }
-          if (!tempCleanupSucceeded) error = `${error ? `${error} ` : ''}${helperClose.error}`
-          if (!helperClose.closed) error = `${error ? `${error} ` : ''}${helperClose.error || 'raw Treehouse return helper tab could not be closed.'}`
-          const returned = canMarkLeaseReturned({ commandSucceeded, tempCleanupSucceeded, helperClosed: helperClose.closed })
-          const updatedTask: TaskRecord = {
-            ...task,
-            leaseStatus: returned ? 'returned' : 'leased',
-            leaseReturnStatus: returned ? 'returned' : 'failed',
-            leaseReturnAt: new Date().toISOString(),
-            leaseReturnCode: code,
-            leaseReturnStdout: stdout,
-            leaseReturnStderr: stderr,
-            leaseReturnError: error,
-            leaseReturnHelperTabId: returned ? undefined : helper.tabId,
-            leaseReturnHelperPaneId: returned ? undefined : helper.paneId,
-            updatedAt: new Date().toISOString(),
-          }
-          let persisted = true
-          await writeTaskState(updatedTask).catch((persistError) => {
-            persisted = false
-            updatedTask.leaseStatus = 'leased'
-            updatedTask.leaseReturnStatus = 'failed'
-            updatedTask.leaseReturnError = `${error || ''}${error ? ' ' : ''}could not persist Treehouse return state: ${(persistError as Error).message}`
-          })
-          return {
-            returned: returned && persisted,
-            task: persisted ? updatedTask : task,
-            error: updatedTask.leaseReturnError || (persisted ? undefined : 'could not persist Treehouse return state'),
-            result: { argv: ['herdr', 'pane', 'run', helper.paneId, command], code, stdout, stderr, tempCleanup, helperClose },
-          }
-        }
-
         let releaseSharedAdmission: (() => Promise<void>) | undefined
-        let args: string[]
-        let tabCloseInspection: Record<string, unknown> | undefined
-        let tabCloseTargetPaneId: string | undefined
-        let tabCloseAgentName: string | undefined
-        let tabCloseAgentKind: string | undefined
-        let taskTeardownRecord: TaskRecord | undefined
-        let taskTeardownReport: WorkerReport | undefined
-        let taskTeardownTabAlreadyAbsent = false
-        switch (params.action) {
-          case 'status': {
-            const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.')
-            const [workspaceList, currentPane, paneList, agentList, currentAgent] = await Promise.all([
-              runHerdr(['workspace', 'list'], signal, 10_000),
-              runHerdr(['pane', 'current', '--current'], signal, 10_000),
-              runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
-              runHerdr(['agent', 'list'], signal, 10_000),
-              process.env.HERDR_PANE_ID ? runHerdr(['agent', 'get', process.env.HERDR_PANE_ID], signal, 10_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
-            ])
-            await deriveCurrentAgentKind(signal).catch(() => undefined)
-            let durableTasks: Record<string, unknown>
-            try {
-              let readDiagnostic: string | undefined
-              const taskRecords = await readWatcherTaskRecords((error, filePath) => {
-                readDiagnostic ||= `task-state read failed for ${filePath}: ${(error as Error).message}`
-              })
-              durableTasks = readDiagnostic ? { error: readDiagnostic } : durableTaskSummary(taskRecords)
-            } catch (error) {
-              durableTasks = { error: `task-state read failed: ${(error as Error).message}` }
+        try {
+          const timeoutError = validateTimeout(params.timeoutMs)
+          if (timeoutError) return errorResult(timeoutError, { action: params.action })
+          const timeout = params.timeoutMs ?? 120_000
+          const readPaneFile = async (filePath: string): Promise<string> => {
+            const deadline = Date.now() + timeout
+            while (Date.now() < deadline) {
+              try {
+                return await fs.promises.readFile(filePath, 'utf8')
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+              }
+              await new Promise((resolve) => setTimeout(resolve, 100))
             }
-            const details = {
-              action: params.action,
-              workspaceId,
-              paneId: process.env.HERDR_PANE_ID,
-              currentAgentKind,
-              selectedWorkerKind,
-              watcher: watcherDetails(),
-              durableTasks,
-              workspaceList: parseJsonMaybe(workspaceList.stdout) ?? workspaceList,
-              currentPane: parseJsonMaybe(currentPane.stdout) ?? currentPane,
-              paneList: parseJsonMaybe(paneList.stdout) ?? paneList,
-              agentList: parseJsonMaybe(agentList.stdout) ?? agentList,
-              currentAgent: parseJsonMaybe(currentAgent.stdout) ?? currentAgent,
-            }
-            return {
-              content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }],
-              details,
-            }
+            throw new Error(`timed out waiting for ${filePath}`)
           }
-          case 'task_create': {
-            if (!params.project) return errorResult('`project` is required for task_create.', { action: params.action })
-            const projectError = validateOptionalCwd(params.project)
-            if (projectError) return errorResult(projectError, { action: params.action })
-            if (!params.prompt) return errorResult('`prompt` is required for task_create.', { action: params.action })
-            const taskWorkerKind = params.kind === undefined ? selectedWorkerKind : params.kind
-            const taskWorkerKindError = validateWorkerKind(taskWorkerKind)
-            if (taskWorkerKindError) return errorResult(taskWorkerKindError, { action: params.action, kind: params.kind })
-            const reviewTargetError = validateOptionalCwd(params.reviewTarget)
-            if (reviewTargetError) return errorResult(reviewTargetError, { action: params.action })
-            if (params.reviewTarget !== undefined && !params.reviewTarget.trim()) return errorResult('`reviewTarget` must be a non-empty ref when provided.', { action: params.action })
-
-            let project = path.resolve(ctx.cwd, params.project)
-            const taskIsolation = isolationMode
-            if (taskIsolation === 'shared') {
-              try {
-                project = await fs.promises.realpath(project)
-              } catch (error) {
-                return errorResult(`shared-checkout project is not accessible: ${(error as Error).message}`, { action: params.action, project })
-              }
-            }
-            if (taskIsolation === 'shared' && params.reviewTarget !== undefined) {
-              return errorResult('reviewTarget tasks require worktree isolation; switch with /firstmate-isolation worktree.', { action: params.action, project, reviewTarget: params.reviewTarget })
-            }
-            if (taskIsolation === 'shared') {
-              try {
-                releaseSharedAdmission = (await acquireSharedAdmissionLock(project)).release
-              } catch (error) {
-                return errorResult(`shared-checkout admission is unavailable: ${(error as Error).message}`, { action: params.action, project })
-              }
-              const sharedTasks = (await readWatcherTaskRecords()).filter(
-                (record) => record.project === project && record.worktreeProvider === 'herdr' && record.cleanupStatus !== 'tab_closed' && (record.status !== 'failed' || record.endpointStatus === 'unverified'),
-              )
-              for (const sharedTask of sharedTasks) {
-                if (sharedTask.status === 'provisioning' && !sharedTask.tabId && !sharedTask.paneId) {
-                  if (!canDeleteWithoutRecordedEndpoint(sharedTask.endpointStatus)) {
-                    return errorResult('unstarted shared task has no verified endpoint absence; preserving the durable record for explicit recovery.', { action: params.action, project, activeTaskId: sharedTask.taskId, task: sharedTask })
-                  }
-                  const artifactCleanup = await removeTaskArtifacts(sharedTask.taskId, true)
-                  if (!artifactCleanup.success) {
-                    await writeTaskState({ ...sharedTask, status: 'failed', endpointStatus: 'unverified', cleanupError: `provisioning artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }).catch(() => undefined)
-                    return errorResult('unstarted shared task cleanup failed; preserving the record for retry.', { action: params.action, project, activeTaskId: sharedTask.taskId, artifactCleanup })
-                  }
-                  continue
-                }
-                const liveEndpoint =
-                  typeof sharedTask.workspaceId === 'string' &&
-                  sharedTask.workspaceId === process.env.HERDR_WORKSPACE_ID &&
-                  typeof sharedTask.paneId === 'string' &&
-                  PANE_ID_RE.test(sharedTask.paneId) &&
-                  typeof sharedTask.tabId === 'string' &&
-                  TAB_ID_RE.test(sharedTask.tabId) &&
-                  typeof sharedTask.workerName === 'string' &&
-                  AGENT_NAME_RE.test(sharedTask.workerName) &&
-                  (await runHerdr(['agent', 'get', sharedTask.paneId], signal, 5_000).then((result) => {
-                    const agent = (parseJsonMaybe(result.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-                    return result.code === 0 && !!agent && agent.pane_id === sharedTask.paneId && agent.tab_id === sharedTask.tabId && agent.workspace_id === sharedTask.workspaceId && agent.name === sharedTask.workerName
-                  }).catch(() => false))
-                if (liveEndpoint) {
-                  return errorResult('a shared-checkout task is already active for this project; use task_abort/task_recover for stale or blocked work, or switch to worktree isolation.', {
-                    action: params.action,
-                    project,
-                    activeTaskId: sharedTask.taskId,
-                  })
-                }
-                const [tabListResult, paneListResult] = await Promise.all([
-                  typeof sharedTask.workspaceId === 'string' ? runHerdr(['tab', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
-                  typeof sharedTask.workspaceId === 'string' ? runHerdr(['pane', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
-                ])
-                const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-                const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-                const endpointAbsent = tabListResult.code === 0 && paneListResult.code === 0 && Array.isArray(tabs) && Array.isArray(panes) && !tabs.some((entry) => isRecord(entry) && entry.tab_id === sharedTask.tabId) && !panes.some((entry) => isRecord(entry) && entry.pane_id === sharedTask.paneId)
-                if (!endpointAbsent) {
-                  return errorResult('a stale shared-checkout task still has an unverified endpoint; run task_abort/task_recover and preserve the durable record until absence is verified.', {
-                    action: params.action,
-                    project,
-                    activeTaskId: sharedTask.taskId,
-                  })
-                }
-                const staleTask = { ...sharedTask, status: 'failed' as const, cleanupStatus: 'tab_closed' as const, endpointStatus: 'absent_verified' as const, cleanupError: undefined, error: 'recorded worker endpoint is absent; recovered during shared-task admission.', updatedAt: new Date().toISOString() }
-                await writeTaskState(staleTask)
-                const artifactCleanup = await removeTaskArtifacts(sharedTask.taskId, true)
-                if (!artifactCleanup.success) {
-                  await writeTaskState({ ...staleTask, cleanupError: `stale shared-task artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }).catch(() => undefined)
-                  return errorResult('stale shared task endpoint is absent, but durable artifact cleanup failed; preserving the record for retry.', { action: params.action, project, activeTaskId: sharedTask.taskId, artifactCleanup })
-                }
-              }
-            }
-            const taskId = newTaskId()
-            const reportPath = reportFilePath(taskId)
-            const branch = `firstmate/${taskId}`
-            const workerName = `worker-${taskId.slice('task-'.length)}`
-            const now = new Date().toISOString()
-            let task: TaskRecord = {
-              version: TASK_VERSION,
-              taskId,
-              project,
-              worktree: taskIsolation === 'shared' ? project : null,
-              worktreeProvider: taskIsolation === 'shared' ? 'herdr' : 'treehouse',
-              ...(taskIsolation === 'worktree' ? { leaseStatus: 'pending' as const, leaseHolder: taskId } : {}),
-              workspaceId: null,
-              tabId: null,
-              paneId: null,
-              branch,
-              ...(params.reviewTarget !== undefined ? { reviewTarget: params.reviewTarget } : {}),
-              workerKind: taskWorkerKind,
-              status: 'provisioning',
-              reportPath,
-              reportStatus: 'pending',
-              cleanupStatus: 'pending',
-              endpointStatus: 'unverified',
-              createdAt: now,
-              updatedAt: now,
-            }
-            let taskPath: string
-            try {
-              taskPath = await writeTaskState(task)
-            } catch (error) {
-              return errorResult(`could not persist task state: ${(error as Error).message}`, { action: params.action, taskId, project })
-            }
-
-            const failTask = async (message: string, details: Record<string, unknown> = {}) => {
-              task = { ...task, status: 'failed', error: message, updatedAt: new Date().toISOString() }
-              await writeTaskState(task).catch(() => undefined)
-              return errorResult(message, { action: params.action, taskId, taskPath, task, ...details })
-            }
-
-            const kind = taskWorkerKind
-            if (!AGENT_NAME_RE.test(workerName)) return failTask('generated worker name is invalid.')
-
-            const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return failTask('HERDR_WORKSPACE_ID is missing or invalid.')
-
-            const tabArgs = [
-              'tab',
-              'create',
-              '--workspace',
-              workspaceId,
-              '--cwd',
-              project,
-              '--label',
-              params.label || taskId,
-              '--env',
-              `${WORKER_ENV}=1`,
-              '--env',
-              `${TASK_ENV}=${taskId}`,
-              '--env',
-              `${REPORT_ENV}=${reportPath}`,
-              '--env',
-              `PATH=${workerPath()}`,
-              '--env',
-              `PI_FIRSTMATE_REAL_GIT=${firstmateGitPath()}`,
-              '--no-focus',
-            ]
-            const tabResult = await runHerdr(tabArgs, signal, timeout)
-            const tabPayload = parseJsonMaybe(tabResult.stdout) as
-              | {
-                  result?: {
-                    tab?: { tab_id?: unknown; workspace_id?: unknown; focused?: unknown; pane_count?: unknown }
-                    root_pane?: { pane_id?: unknown; tab_id?: unknown; workspace_id?: unknown; cwd?: unknown }
-                  }
-                }
-              | undefined
-            const created = tabPayload?.result
-            const returnedTab = created?.tab
-            const returnedRootPane = created?.root_pane
-            const returnedTabId = returnedTab?.tab_id
-            const returnedPaneId = returnedRootPane?.pane_id
-            if (tabResult.code !== 0) {
-              const orphanCleanup = typeof returnedTabId === 'string' && TAB_ID_RE.test(returnedTabId) && typeof returnedPaneId === 'string' && PANE_ID_RE.test(returnedPaneId) ? await closeRawHelper({ tabId: returnedTabId, paneId: returnedPaneId, workspaceId }) : undefined
-              task = { ...task, endpointStatus: orphanCleanup?.closed ? 'absent_verified' : 'unverified', updatedAt: new Date().toISOString() }
-              return failTask(commandResultText('herdr tab create', tabResult), { argv: ['herdr', ...tabArgs], returned: tabPayload, orphanCleanup })
-            }
-
-            const currentPaneId = process.env.HERDR_PANE_ID
-            const currentPaneResult = currentPaneId ? await runHerdr(['pane', 'current', '--current'], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
-            const currentPanePayload = parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
-            const currentPane = currentPanePayload?.result?.pane
-            const tabInspectionResult = typeof returnedTabId === 'string' ? await runHerdr(['tab', 'get', returnedTabId], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
-            const paneInspectionResult = typeof returnedPaneId === 'string' ? await runHerdr(['pane', 'get', returnedPaneId], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
-            const tabInspection = (parseJsonMaybe(tabInspectionResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
-            const paneInspection = (parseJsonMaybe(paneInspectionResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-            if (
-              typeof returnedTabId !== 'string' ||
-              !TAB_ID_RE.test(returnedTabId) ||
-              typeof returnedPaneId !== 'string' ||
-              !PANE_ID_RE.test(returnedPaneId) ||
-              returnedTab?.workspace_id !== workspaceId ||
-              returnedRootPane?.tab_id !== returnedTabId ||
-              returnedRootPane?.workspace_id !== workspaceId ||
-              tabInspectionResult.code !== 0 ||
-              tabInspection?.tab_id !== returnedTabId ||
-              tabInspection.workspace_id !== workspaceId ||
-              tabInspection.pane_count !== 1 ||
-              tabInspection.focused !== false ||
-              paneInspectionResult.code !== 0 ||
-              paneInspection?.pane_id !== returnedPaneId ||
-              paneInspection.tab_id !== returnedTabId ||
-              paneInspection.workspace_id !== workspaceId ||
-              paneInspection.cwd !== project ||
-              currentPaneResult.code !== 0 ||
-              !currentPane ||
-              currentPane.pane_id !== currentPaneId ||
-              currentPane.workspace_id !== workspaceId ||
-              currentPane.tab_id === returnedTabId
-            ) {
-              const orphanCleanup = typeof returnedTabId === 'string' && TAB_ID_RE.test(returnedTabId) && typeof returnedPaneId === 'string' && PANE_ID_RE.test(returnedPaneId) ? await closeRawHelper({ tabId: returnedTabId, paneId: returnedPaneId, workspaceId }) : undefined
-              task = { ...task, endpointStatus: orphanCleanup?.closed ? 'absent_verified' : 'unverified', updatedAt: new Date().toISOString() }
-              return failTask('herdr tab create returned incomplete or inconsistent current-workspace tab, root pane, cwd, or no-focus identity.', {
-                argv: ['herdr', ...tabArgs],
-                returned: tabPayload,
-                currentPane: currentPanePayload,
-                tabInspection: parseJsonMaybe(tabInspectionResult.stdout),
-                paneInspection: parseJsonMaybe(paneInspectionResult.stdout),
-                orphanCleanup,
-              })
-            }
-
-            task = {
-              ...task,
-              workspaceId,
-              tabId: returnedTabId,
-              paneId: returnedPaneId,
-              endpointStatus: 'recorded',
-              updatedAt: new Date().toISOString(),
-            }
-            try {
-              await writeTaskState(task)
-            } catch (error) {
-              const orphanCleanup = typeof returnedTabId === 'string' && TAB_ID_RE.test(returnedTabId) && typeof returnedPaneId === 'string' && PANE_ID_RE.test(returnedPaneId) ? await closeRawHelper({ tabId: returnedTabId, paneId: returnedPaneId, workspaceId }) : undefined
-              task = { ...task, endpointStatus: orphanCleanup?.closed ? 'absent_verified' : 'unverified', updatedAt: new Date().toISOString() }
-              return failTask(`could not persist worker tab identity: ${(error as Error).message}`, { argv: ['herdr', ...tabArgs], returned: tabPayload, orphanCleanup })
-            }
-
-            const leaseJsonPath = path.join(TASK_STATE_DIR, `.${taskId}.lease.json`)
-            const leaseErrorPath = path.join(TASK_STATE_DIR, `.${taskId}.lease.stderr`)
-            const leaseStatusPath = path.join(TASK_STATE_DIR, `.${taskId}.lease.status`)
-            const removeLeaseTemp = async (): Promise<ExecResult> =>
-              await runHerdr(['pane', 'run', returnedPaneId, `rm -f ${shellQuote(leaseJsonPath)} ${shellQuote(leaseErrorPath)} ${shellQuote(leaseStatusPath)}`], signal, 10_000)
-            const readPaneFile = async (filePath: string): Promise<string> => {
-              const deadline = Date.now() + timeout
-              while (Date.now() < deadline) {
-                try {
-                  return await fs.promises.readFile(filePath, 'utf8')
-                } catch (error) {
-                  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-                }
-                await new Promise((resolve) => setTimeout(resolve, 100))
-              }
-              throw new Error(`timed out waiting for ${filePath}`)
-            }
-
-            const closeProvisionedTab = async (): Promise<Record<string, unknown>> => {
-              const currentId = process.env.HERDR_PANE_ID
-              if (!currentId || !PANE_ID_RE.test(currentId)) return { closed: false, error: 'current firstmate pane id is invalid' }
-              const currentResult = await runHerdr(['pane', 'get', currentId], signal, 10_000)
-              const current = (parseJsonMaybe(currentResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-              const targetTabResult = await runHerdr(['tab', 'get', returnedTabId], signal, 10_000)
-              const targetTab = (parseJsonMaybe(targetTabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
-              const panesResult = await runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000)
-              const panes = (parseJsonMaybe(panesResult.stdout) as { result?: { panes?: Array<Record<string, unknown>> } } | undefined)?.result?.panes
-              const targetPanes = panes?.filter((pane) => pane.tab_id === returnedTabId) ?? []
-              const targetPaneId = targetPanes.length === 1 ? targetPanes[0].pane_id : undefined
-              const agentResult = typeof targetPaneId === 'string' ? await runHerdr(['agent', 'get', targetPaneId], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
-              const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-              if (
-                currentResult.code !== 0 ||
-                !current ||
-                current.pane_id !== currentId ||
-                current.workspace_id !== workspaceId ||
-                current.tab_id === returnedTabId ||
-                targetTabResult.code !== 0 ||
-                !targetTab ||
-                targetTab.tab_id !== returnedTabId ||
-                targetTab.workspace_id !== workspaceId ||
-                targetTab.pane_count !== 1 ||
-                panesResult.code !== 0 ||
-                targetPanes.length !== 1 ||
-                typeof targetPaneId !== 'string' ||
-                !PANE_ID_RE.test(targetPaneId) ||
-                (agentResult.code === 0 && agent && agent.agent_status !== 'idle' && agent.agent_status !== 'done')
-              ) {
-                return { closed: false, error: 'refused to close a non-exact or agent-occupied provisioned tab', current, targetTab, targetPanes, agent }
-              }
-              const closeResult = await runHerdr(['tab', 'close', returnedTabId], signal, 10_000)
-              if (closeResult.code !== 0) return { closed: false, result: closeResult, error: 'provisioned tab close was not acknowledged' }
-              const [verifyTabs, verifyPanes] = await Promise.all([
-                runHerdr(['tab', 'list', '--workspace', workspaceId], signal, 10_000),
-                runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
-              ])
-              const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-              const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-              const verifiedAbsent = endpointListsConfirmAbsence({ tabListSucceeded: verifyTabs.code === 0, paneListSucceeded: verifyPanes.code === 0, tabs: verifiedTabs, panes: verifiedPanes, tabId: returnedTabId, paneId: String(targetPaneId) })
-              return { closed: verifiedAbsent, result: closeResult, error: verifiedAbsent ? undefined : 'provisioned tab close was not verified absent' }
-            }
-            const failAfterTab = async (message: string, details: Record<string, unknown> = {}) => {
-              const cleanup = await closeProvisionedTab()
-              const leaseReturn = cleanup.closed ? await returnTaskLease(task) : { returned: false, attempted: task.worktreeProvider === 'treehouse', error: 'worker tab was not verified closed; lease was not returned.', task }
-              const tempCleanup = await removeTaskArtifacts(taskId, false)
-              const cleanupErrors = [
-                typeof leaseReturn.error === 'string' ? leaseReturn.error : undefined,
-                cleanup.closed ? undefined : String(cleanup.error || 'provisioned tab cleanup failed'),
-                tempCleanup.success ? undefined : `task temporary artifact cleanup failed: ${JSON.stringify(tempCleanup.errors)}`,
-              ].filter((error): error is string => Boolean(error))
-              task = {
-                ...task,
-                endpointStatus: cleanup.closed ? 'absent_verified' : 'unverified',
-                cleanupStatus: cleanup.closed && leaseReturn.returned && tempCleanup.success ? 'tab_closed' : task.cleanupStatus,
-                cleanupError: cleanupErrors.length ? cleanupErrors.join(' ') : undefined,
-                updatedAt: new Date().toISOString(),
-              }
-              const failureMessage = leaseReturn.attempted && leaseReturn.returned !== true ? `${message} Treehouse lease return failed or was ambiguous; the lease remains retained.` : message
-              const failure = await failTask(failureMessage, { ...details, leaseReturn, tempCleanup, cleanup })
-              if (cleanup.closed && leaseReturn.returned && tempCleanup.success) {
-                const artifactCleanup = await removeTaskArtifacts(taskId, true)
-                if (failure.details && typeof failure.details === 'object') Object.assign(failure.details as Record<string, unknown>, { artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing, artifactCleanup })
-              }
-              return failure
-            }
-
-            const envArgs = [
-              'pane',
-              'run',
-              returnedPaneId,
-              `export ${WORKER_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
-            ]
-            const envResult = await runHerdr(envArgs, signal, 10_000)
-            if (envResult.code !== 0) {
-              return failAfterTab(commandResultText('herdr pane run (worker environment)', envResult), { argv: ['herdr', ...envArgs] })
-            }
-
-            if (taskIsolation === 'worktree') {
-              const leaseArgs = ['get', '--lease', '--lease-holder', taskId, '--json']
-              const leaseCommand = `treehouse ${leaseArgs.map(shellQuote).join(' ')} > ${shellQuote(leaseJsonPath)} 2> ${shellQuote(leaseErrorPath)}; printf '%s\\n' "$?" > ${shellQuote(leaseStatusPath)}`
-              const leaseRunArgs = ['pane', 'run', returnedPaneId, leaseCommand]
-              const leaseRunResult = await runHerdr(leaseRunArgs, signal, 10_000)
-              if (leaseRunResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (Treehouse lease)', leaseRunResult), { argv: ['herdr', ...leaseRunArgs] })
-
-              let leaseStatusText: string
-              try {
-                leaseStatusText = await readPaneFile(leaseStatusPath)
-              } catch (error) {
-                return failAfterTab(`Treehouse lease command did not report completion: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
-              }
-              let leaseJsonText: string
-              try {
-                leaseJsonText = await fs.promises.readFile(leaseJsonPath, 'utf8')
-              } catch (error) {
-                const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
-                return failAfterTab(`treehouse get --lease failed with status ${leaseStatusText.trim()}: ${stderr.trim() || (error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
-              }
-              const leasePayload = parseJsonMaybe(leaseJsonText) as { path?: unknown; lease_id?: unknown; lease_holder?: unknown } | undefined
-              const returnedWorktree = leasePayload?.path
-              const leaseId = typeof leasePayload?.lease_id === 'string' ? leasePayload.lease_id : undefined
-              const leaseHolder = typeof leasePayload?.lease_holder === 'string' ? leasePayload.lease_holder : undefined
-              if (
-                leaseStatusText.trim() !== '0' ||
-                typeof returnedWorktree !== 'string' ||
-                !path.isAbsolute(returnedWorktree) ||
-                returnedWorktree.includes('\u0000') ||
-                typeof leaseId !== 'string' ||
-                !leaseId ||
-                leaseHolder !== taskId
-              ) {
-                const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
-                return failAfterTab('treehouse lease returned incomplete or inconsistent path, lease id, or lease-holder identity.', {
-                  argv: ['herdr', ...leaseRunArgs],
-                  returned: leasePayload,
-                  status: leaseStatusText.trim(),
-                  stderr: stderr.trim(),
-                })
-              }
-              try {
-                const worktreeStat = await fs.promises.stat(returnedWorktree)
-                if (!worktreeStat.isDirectory()) throw new Error('leased path is not a directory')
-              } catch (error) {
-                return failAfterTab(`leased Treehouse worktree is not accessible: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
-              }
-
-              task = { ...task, worktree: returnedWorktree, leaseStatus: 'leased', leaseId, leaseHolder, status: 'worktree_leased', updatedAt: new Date().toISOString() }
-              try {
-                await writeTaskState(task)
-              } catch (error) {
-                return failAfterTab(`could not persist Treehouse lease identity: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
-              }
-
-              const removeLeaseTempResult = await removeLeaseTemp()
-              if (removeLeaseTempResult.code !== 0)
-                return failAfterTab(commandResultText('herdr pane run (lease temp cleanup)', removeLeaseTempResult), { argv: ['herdr', 'pane', 'run', returnedPaneId, 'rm -f <lease temp files>'] })
-
-              const cdArgs = ['pane', 'run', returnedPaneId, `cd ${shellQuote(returnedWorktree)}`]
-              const cdResult = await runHerdr(cdArgs, signal, 10_000)
-              if (cdResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (worker cwd)', cdResult), { argv: ['herdr', ...cdArgs] })
-              const cwdResult = await runHerdr(['pane', 'get', returnedPaneId], signal, 10_000)
-              const cwdPane = (parseJsonMaybe(cwdResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-              if (
-                cwdResult.code !== 0 ||
-                !cwdPane ||
-                cwdPane.pane_id !== returnedPaneId ||
-                cwdPane.tab_id !== returnedTabId ||
-                cwdPane.workspace_id !== workspaceId ||
-                cwdPane.foreground_cwd !== returnedWorktree
-              ) {
-                return failAfterTab('worker pane did not enter the exact leased Treehouse worktree.', { argv: ['herdr', 'pane', 'get', returnedPaneId], cwd: parseJsonMaybe(cwdResult.stdout) })
-              }
-
-              const branchSetupCommand = treehouseWorkerBranchCommand(branch, task.reviewTarget)
-              const branchSetupArgs = ['pane', 'run', returnedPaneId, branchSetupCommand]
-              const branchSetupResult = await runHerdr(branchSetupArgs, signal, timeout)
-              if (branchSetupResult.code !== 0) {
-                return failAfterTab(commandResultText('herdr pane run (worker branch setup)', branchSetupResult), { argv: ['herdr', ...branchSetupArgs] })
-              }
-            }
-
-            task = { ...task, workerName, workerKind: kind, status: 'starting', updatedAt: new Date().toISOString() }
-            try {
-              await writeTaskState(task)
-            } catch (error) {
-              return failAfterTab(`could not persist worker identity: ${(error as Error).message}`)
-            }
-
-            const startArgs = ['agent', 'start', workerName, '--kind', kind, '--pane', returnedPaneId]
-            if (params.timeoutMs !== undefined) startArgs.push('--timeout', String(params.timeoutMs))
-            appendWorkerNativeArgs(startArgs, kind)
-            let startResult = await runHerdr(startArgs, signal, timeout)
-            let startAttempt = 1
-            while (isRetryableAgentStartFailure(startResult) && startAttempt < 10) {
-              const delayMs = Math.min(250 * 2 ** (startAttempt - 1), 4_000)
-              await new Promise((resolve) => setTimeout(resolve, delayMs))
-              startAttempt += 1
-              startResult = await runHerdr(startArgs, signal, timeout)
-            }
-            if (startResult.code !== 0) {
-              return failAfterTab(commandResultText('herdr agent start', startResult), { argv: ['herdr', ...startArgs] })
-            }
-
-            task = { ...task, status: 'started', updatedAt: new Date().toISOString() }
-            let stateWriteError: string | undefined
-            try {
-              await writeTaskState(task)
-            } catch (error) {
-              stateWriteError = (error as Error).message
-              return failAfterTab(`could not persist started worker state: ${stateWriteError}`, { argv: ['herdr', ...startArgs], stateWriteError })
-            }
-
-            const reviewPrompt = task.reviewTarget ? `\n\nThis is a review task. Inspect the existing target ref ${task.reviewTarget}; do not silently review the default branch.` : ''
-            const workerPrompt = `${params.prompt}${reviewPrompt}${workerReportContract(taskId, reportPath)}`
-            const promptArgs = ['agent', 'prompt', workerName, workerPrompt]
-            const promptResult = await runHerdr(promptArgs, signal, timeout)
-            if (promptResult.code !== 0) {
-              const promptError = commandResultText('herdr agent prompt', promptResult)
-              return failAfterTab('worker started but its prompt could not be delivered.', { argv: ['herdr', ...promptArgs], promptError, stateWriteError })
-            }
-
-            const details = {
-              action: params.action,
-              taskId,
-              taskPath,
-              task,
-              isolation: taskIsolation,
-              argv: {
-                tab: ['herdr', ...tabArgs],
-                environment: ['herdr', ...envArgs],
-                ...(taskIsolation === 'worktree' ? { provisioning: 'Treehouse lease, worker cwd, and branch setup completed.' } : { provisioning: 'Worker started in the requested shared checkout.' }),
-                start: ['herdr', ...startArgs],
-                prompt: ['herdr', ...promptArgs],
-              },
-              stateWriteError,
-            }
-            return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-          }
-          case 'task_reconcile': {
-            const taskIdError = validateTaskId(params.taskId)
-            if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
-            const taskId = params.taskId!
-            const task = await readTaskState(taskId)
-            if (!task || task.taskId !== taskId) {
-              return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath: taskFilePath(taskId) })
-            }
-            const reportPath = reportFilePath(taskId)
-            if (task.reportPath !== reportPath) {
-              return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath: taskFilePath(taskId), expectedReportPath: reportPath, task })
-            }
-
-            let reportText: string
-            try {
-              reportText = await fs.promises.readFile(reportPath, 'utf8')
-            } catch (error) {
-              const message = `worker report is missing or unreadable: ${(error as Error).message}`
-              const updatedTask = {
-                ...task,
-                reportStatus: 'missing' as const,
-                reportOutcome: undefined,
-                reportUpdatedAt: new Date().toISOString(),
-                reportSummary: undefined,
-                reportError: message,
-                updatedAt: new Date().toISOString(),
-              }
-              await writeTaskState(updatedTask).catch(() => undefined)
-              return errorResult(message, { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: false, task: updatedTask })
-            }
-
-            let parsedReport: unknown
-            try {
-              parsedReport = JSON.parse(reportText)
-            } catch (error) {
-              const message = `worker report is malformed JSON: ${(error as Error).message}`
-              const updatedTask = {
-                ...task,
-                reportStatus: 'malformed' as const,
-                reportOutcome: undefined,
-                reportUpdatedAt: new Date().toISOString(),
-                reportSummary: undefined,
-                reportError: message,
-                updatedAt: new Date().toISOString(),
-              }
-              await writeTaskState(updatedTask).catch(() => undefined)
-              return errorResult(message, { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: false, task: updatedTask })
-            }
-
-            const validation = validateWorkerReport(parsedReport, taskId)
-            if (!validation.report) {
-              const message = `worker report is malformed: ${validation.error}`
-              const updatedTask = {
-                ...task,
-                reportStatus: 'malformed' as const,
-                reportOutcome: undefined,
-                reportUpdatedAt: new Date().toISOString(),
-                reportSummary: undefined,
-                reportError: message,
-                updatedAt: new Date().toISOString(),
-              }
-              await writeTaskState(updatedTask).catch(() => undefined)
-              return errorResult(message, { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: false, task: updatedTask, report: parsedReport })
-            }
-
-            const report = validation.report
-            const reconciledTask: TaskRecord = {
-              ...task,
-              reportStatus: report.outcome,
-              reportOutcome: report.outcome,
-              reportUpdatedAt: new Date().toISOString(),
-              reportSummary: report.summary,
-              reportError: undefined,
-              updatedAt: new Date().toISOString(),
-            }
-            try {
-              await writeTaskState(reconciledTask)
-            } catch (error) {
-              return errorResult(`could not persist report reconciliation: ${(error as Error).message}`, {
-                action: params.action,
-                taskId,
-                taskPath: taskFilePath(taskId),
-                reportPath,
-                complete: false,
-                reconciled: false,
-                task,
-                report,
-              })
-            }
-
-            const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: report.outcome === 'completed', reconciled: true, task: reconciledTask, report }
-            if (report.outcome !== 'completed') return errorResult(`worker report outcome is ${report.outcome}; task is not complete.`, details)
-            return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-          }
-          case 'task_deliver': {
-            const taskIdError = validateTaskId(params.taskId)
-            if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
-            if (!params.project) return errorResult('`project` is required for task_deliver.', { action: params.action })
-            const projectError = validateOptionalCwd(params.project)
-            if (projectError) return errorResult(projectError, { action: params.action })
-            const taskId = params.taskId!
-            const taskPath = taskFilePath(taskId)
-            const reportPath = reportFilePath(taskId)
-            let task = await readTaskState(taskId)
-            if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
-            if (task.project !== path.resolve(ctx.cwd, params.project))
-              return errorResult('requested primary project does not exactly match the durable task project.', {
-                action: params.action,
-                taskId,
-                task,
-                requestedProject: path.resolve(ctx.cwd, params.project),
-              })
-            if (task.reportPath !== reportPath)
-              return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
-            if (task.worktreeProvider === 'herdr')
-              return errorResult('shared-checkout tasks are already local and must not use task_deliver; reconcile, then use task_teardown.', { action: params.action, taskId, task })
-            if (
-              task.status !== 'started' ||
-              task.worktreeProvider !== 'treehouse' ||
-              typeof task.worktree !== 'string' ||
-              !path.isAbsolute(task.worktree) ||
-              (task.leaseStatus !== 'leased' && task.leaseStatus !== 'returned') ||
-              task.leaseHolder !== taskId ||
-              typeof task.leaseId !== 'string' ||
-              !task.leaseId ||
-              typeof task.workspaceId !== 'string' ||
-              !WORKSPACE_ID_RE.test(task.workspaceId) ||
-              typeof task.tabId !== 'string' ||
-              !TAB_ID_RE.test(task.tabId) ||
-              typeof task.paneId !== 'string' ||
-              !PANE_ID_RE.test(task.paneId) ||
-              typeof task.workerName !== 'string' ||
-              !AGENT_NAME_RE.test(task.workerName) ||
-              task.workerName === FIRSTMATE_NAME ||
-              typeof task.workerKind !== 'string' ||
-              !AGENT_KIND_RE.test(task.workerKind)
-            ) {
-              return errorResult('task delivery requires the exact Treehouse lease, worker endpoint, and worker branch identity.', { action: params.action, taskId, task })
-            }
-            if (task.branch !== `firstmate/${taskId}`) return errorResult('durable task branch is not the generated exact worker branch.', { action: params.action, taskId, task })
-            if (task.reviewTarget) return errorResult('review tasks are inspection-only and cannot be locally delivered.', { action: params.action, taskId, task })
-            if (task.deliveryStatus !== 'landed' && task.leaseStatus !== 'leased')
-              return errorResult('an undelivered task must still hold its active Treehouse lease.', { action: params.action, taskId, task })
-
-            let reportText: string
-            try {
-              reportText = await fs.promises.readFile(reportPath, 'utf8')
-            } catch (error) {
-              return errorResult(`worker report is missing or unreadable: ${(error as Error).message}`, { action: params.action, taskId, reportPath, reconciled: false, complete: false, task })
-            }
-            let parsedReport: unknown
-            try {
-              parsedReport = JSON.parse(reportText)
-            } catch (error) {
-              return errorResult(`worker report is malformed JSON: ${(error as Error).message}`, { action: params.action, taskId, reportPath, reconciled: false, complete: false, task })
-            }
-            const reportValidation = validateWorkerReport(parsedReport, taskId)
-            if (
-              !reportValidation.report ||
-              reportValidation.report.outcome !== 'completed' ||
-              task.reportStatus !== 'completed' ||
-              task.reportOutcome !== 'completed' ||
-              typeof task.reportUpdatedAt !== 'string' ||
-              task.reportSummary !== reportValidation.report.summary
-            ) {
-              return errorResult('task delivery requires a reconciled completed worker report.', { action: params.action, taskId, task, report: parsedReport, reconciled: false, complete: false })
-            }
-
-            if (task.deliveryHelperTabId || task.deliveryHelperPaneId) {
-              if (
-                typeof task.deliveryHelperTabId !== 'string' ||
-                !TAB_ID_RE.test(task.deliveryHelperTabId) ||
-                typeof task.deliveryHelperPaneId !== 'string' ||
-                !PANE_ID_RE.test(task.deliveryHelperPaneId) ||
-                typeof task.workspaceId !== 'string' ||
-                !WORKSPACE_ID_RE.test(task.workspaceId)
-              )
-                return errorResult('durable delivery helper identity is malformed; preserving task state.', { action: params.action, taskId, task })
-              const helperClose = await closeRawHelper({ tabId: task.deliveryHelperTabId, paneId: task.deliveryHelperPaneId, workspaceId: task.workspaceId })
-              if (!helperClose.closed)
-                return errorResult(helperClose.error || 'previous delivery helper tab could not be closed; preserving task state.', { action: params.action, taskId, task, helperClose })
-              const clearedTask: TaskRecord = { ...task, deliveryHelperTabId: undefined, deliveryHelperPaneId: undefined, updatedAt: new Date().toISOString() }
-              try {
-                await writeTaskState(clearedTask)
-              } catch (error) {
-                return errorResult(`could not persist delivery helper cleanup: ${(error as Error).message}`, { action: params.action, taskId, task, helperClose })
-              }
-              task = clearedTask
-            }
-            if (
-              task.deliveryStatus === 'landed' &&
-              typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) === 'string' &&
-              typeof task.deliveryCommit === 'string' &&
-              typeof task.deliveryAt === 'string'
-            ) {
-              const details = { action: params.action, taskId, taskPath, reportPath, delivered: true, idempotent: true, task, report: reportValidation.report }
-              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-            }
-
-            const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId) || task.workspaceId !== workspaceId)
-              return errorResult('Treehouse task is outside the current firstmate workspace.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
-            const currentPaneId = process.env.HERDR_PANE_ID
-            const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
-            if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
-            const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
-            const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-            if (
-              currentPaneResult.code !== 0 ||
-              !currentPane ||
-              currentPane.pane_id !== currentPaneId ||
-              currentPane.workspace_id !== workspaceId ||
-              typeof currentPane.tab_id !== 'string' ||
-              !TAB_ID_RE.test(currentPane.tab_id) ||
-              currentPane.tab_id === task.tabId
-            )
-              return errorResult('could not establish an exact non-worker firstmate pane.', { action: params.action, taskId, task, currentPane: parseJsonMaybe(currentPaneResult.stdout) })
-            const targetPaneResult = await runHerdr(['pane', 'get', task.paneId || ''], signal, 10_000)
-            const targetPane = (parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-            const agentResult = await runHerdr(['agent', 'get', task.paneId || ''], signal, 10_000)
-            const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-            if (
-              targetPaneResult.code !== 0 ||
-              !targetPane ||
-              targetPane.pane_id !== task.paneId ||
-              targetPane.tab_id !== task.tabId ||
-              targetPane.workspace_id !== task.workspaceId ||
-              agentResult.code !== 0 ||
-              !agent ||
-              agent.pane_id !== task.paneId ||
-              agent.tab_id !== task.tabId ||
-              agent.workspace_id !== task.workspaceId ||
-              agent.name !== task.workerName ||
-              agent.agent !== task.workerKind ||
-              task.workerName === FIRSTMATE_NAME
-            ) {
-              return errorResult('live worker endpoint does not match the exact durable Treehouse task identity.', {
-                action: params.action,
-                taskId,
-                task,
-                targetPane: parseJsonMaybe(targetPaneResult.stdout),
-                agent: parseJsonMaybe(agentResult.stdout),
-              })
-            }
-
-            const evidencePath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.evidence`)
-            const dirtyPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.dirty-paths`)
-            const workerPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.worker-paths`)
-            const dirtyPathOverlapCheck = [
-              'try{',
-              "const fs=require('node:fs');",
-              'const paths=(file)=>{const bytes=fs.readFileSync(file);const entries=[];let start=0;for(let index=0;index<bytes.length;index+=1){if(bytes[index]===0){entries.push(bytes.subarray(start,index));start=index+1}}return entries};',
-              "const key=(entry)=>entry.toString('hex');",
-              'const dirtyEntries=paths(process.argv[1]);const dirty=new Set(dirtyEntries.map(key));const dirtyAncestors=new Set();',
-              'for(const entry of dirtyEntries){for(let index=0;index<entry.length;index+=1){if(entry[index]===47)dirtyAncestors.add(key(entry.subarray(0,index)))} }',
-              'const overlaps=paths(process.argv[2]).some((entry)=>{const entryKey=key(entry);if(dirty.has(entryKey)||dirtyAncestors.has(entryKey))return true;for(let index=0;index<entry.length;index+=1){if(entry[index]===47&&dirty.has(key(entry.subarray(0,index))))return true}return false});process.exit(overlaps?1:0)',
-              '}catch{process.exit(2)}',
-            ].join('')
-            const stdoutPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stdout`)
-            const stderrPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stderr`)
-            const statusPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.status`)
-            const deliveryScriptPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.sh`)
-            const deliveryScript =
-              [
-                '#!/bin/sh',
-                `project=${shellQuote(task.project)}`,
-                `branch=${shellQuote(task.branch)}`,
-                `evidence=${shellQuote(evidencePath)}`,
-                `dirty_paths=${shellQuote(dirtyPathsPath)}`,
-                `worker_paths=${shellQuote(workerPathsPath)}`,
-                'target_ref=$(git -C "$project" symbolic-ref --quiet HEAD 2>/dev/null || true)',
-                'case "$target_ref" in refs/heads/*) target="${target_ref#refs/heads/}";; *) target=;; esac',
-                'if git -C "$project" show-ref --verify --quiet "refs/heads/$branch"; then branch_exists=true; else branch_exists=false; fi',
-                'dirty_paths_check=not-applicable',
-                'dirty_paths_overlap=false',
-                'if ! { git -C "$project" diff --name-only -z; git -C "$project" diff --cached --name-only -z; git -C "$project" ls-files --others --exclude-standard -z; } > "$dirty_paths"; then dirty_paths_check=failed; elif [ -n "$target" ] && [ "$branch_exists" = true ]; then if git -C "$project" diff --name-only --no-renames -z "$target" "$branch" > "$worker_paths"; then dirty_paths_check=complete; else dirty_paths_check=failed; fi; fi',
-                `if [ "$dirty_paths_check" = complete ] && [ -s "$dirty_paths" ] && [ -s "$worker_paths" ]; then if ${shellQuote(process.execPath)} -e ${shellQuote(dirtyPathOverlapCheck)} "$dirty_paths" "$worker_paths"; then dirty_paths_overlap=false; else case "$?" in 1) dirty_paths_overlap=true;; *) dirty_paths_check=failed;; esac; fi; fi`,
-                'if [ -n "$target" ] && [ "$branch_exists" = true ] && git -C "$project" merge-base --is-ancestor "$target" "$branch"; then fast_forward=true; else fast_forward=false; fi',
-                'printf \'target=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
-                'if [ -z "$target" ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
-                '[ "$code" -eq 0 ]',
-              ].join('\n') + '\n'
-            try {
-              await fs.promises.mkdir(TASK_STATE_DIR, { recursive: true, mode: 0o700 })
-              await fs.promises.writeFile(deliveryScriptPath, deliveryScript, { encoding: 'utf8', mode: 0o700 })
-              await fs.promises.chmod(deliveryScriptPath, 0o700)
-            } catch (error) {
-              await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
-              return errorResult(`could not persist delivery helper script: ${(error as Error).message}`, { action: params.action, taskId, task })
-            }
-            const deliveryCommand = `sh ${shellQuote(deliveryScriptPath)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\n' "$?" > ${shellQuote(statusPath)}`
-            const landingTask: TaskRecord = { ...task, deliveryStatus: 'landing', deliveryAt: new Date().toISOString(), deliveryError: undefined, updatedAt: new Date().toISOString() }
-            try {
-              await writeTaskState(landingTask)
-            } catch (error) {
-              await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
-              return errorResult(`could not persist delivery state before landing: ${(error as Error).message}`, { action: params.action, taskId, task })
-            }
-            const helperResult = await createRawHelper(workspaceId, task.project, `firstmate-delivery-${taskId}`)
-            if (!helperResult.helper) {
-              const failedTask: TaskRecord = {
-                ...landingTask,
-                deliveryStatus: 'failed',
-                deliveryError: helperResult.error || 'could not create raw delivery helper tab.',
-                updatedAt: new Date().toISOString(),
-              }
-              await writeTaskState(failedTask).catch(() => undefined)
-              await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
-              return errorResult(failedTask.deliveryError || 'could not create raw delivery helper tab.', { action: params.action, taskId, task: failedTask, helper: helperResult.result })
-            }
-            const helper = helperResult.helper
-            const landingTaskWithHelper: TaskRecord = { ...landingTask, deliveryHelperTabId: helper.tabId, deliveryHelperPaneId: helper.paneId, updatedAt: new Date().toISOString() }
-            try {
-              await writeTaskState(landingTaskWithHelper)
-            } catch (error) {
-              const helperClose = await closeRawHelper(helper)
-              await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
-              return errorResult(`could not persist delivery helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`, {
-                action: params.action,
-                taskId,
-                task: landingTask,
-                helperClose,
-              })
-            }
-            task = landingTaskWithHelper
-            const deliveryRun = await runHerdr(['pane', 'run', helper.paneId, deliveryCommand], signal, timeout)
-            let statusText = ''
-            let evidenceText = ''
-            let stdout = ''
-            let stderr = ''
-            let deliveryError: string | undefined
-            if (deliveryRun.code === 0) {
-              try {
-                statusText = await readPaneFile(statusPath)
-                evidenceText = await fs.promises.readFile(evidencePath, 'utf8').catch(() => '')
-                stdout = await fs.promises.readFile(stdoutPath, 'utf8').catch(() => '')
-                stderr = await fs.promises.readFile(stderrPath, 'utf8').catch(() => '')
-              } catch (error) {
-                deliveryError = `local delivery result was ambiguous: ${(error as Error).message}`
-              }
-            } else deliveryError = commandResultText('herdr pane run (local delivery)', deliveryRun)
-            const values = Object.fromEntries(
-              evidenceText.split(/\r?\n/).flatMap((line) => {
-                const separator = line.indexOf('=')
-                return separator > 0 ? [[line.slice(0, separator), line.slice(separator + 1)]] : []
-              }),
-            )
-            const resultCode = statusText.trim() && /^-?\d+$/.test(statusText.trim()) ? Number.parseInt(statusText.trim(), 10) : null
-            const deliveryDecision = assessLocalDelivery({
-              targetBranch: values.target || '',
-              dirtyPathCheckSucceeded: values.dirty_paths_check === 'complete',
-              dirtyPathsOverlap: values.dirty_paths_overlap === 'true',
-              branchExists: values.branch_exists === 'true',
-              fastForward: values.fast_forward === 'true',
-            })
-            const refused = deliveryDecision.allowed
-              ? undefined
-              : deliveryDecision.reason === 'detached'
-                ? 'primary checkout is detached or not on a local branch'
-                : deliveryDecision.reason === 'dirty-path-check-failed'
-                  ? 'could not safely compare primary dirty paths with the worker branch'
-                  : deliveryDecision.reason === 'dirty-overlap'
-                    ? 'primary checkout has dirty paths overlapping the worker branch'
-                    : deliveryDecision.reason === 'missing-branch'
-                      ? 'recorded worker branch is missing'
-                      : 'primary and worker branches have diverged'
-            const before = values.before
-            const after = values.after
-            const mergeSuccess =
-              !deliveryError &&
-              resultCode === 0 &&
-              !refused &&
-              typeof values.target === 'string' &&
-              values.target.length > 0 &&
-              typeof before === 'string' &&
-              /^[0-9a-f]+$/i.test(before) &&
-              typeof after === 'string' &&
-              /^[0-9a-f]+$/i.test(after)
-            const tempCleanup = await runHerdr(
-              [
-                'pane',
-                'run',
-                helper.paneId,
-                `rm -f ${shellQuote(deliveryScriptPath)} ${shellQuote(evidencePath)} ${shellQuote(dirtyPathsPath)} ${shellQuote(workerPathsPath)} ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`,
-              ],
-              signal,
-              10_000,
-            ).catch((cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }))
-            const deliveryTempCleanupSucceeded = tempCleanup.code === 0
-            if (deliveryTempCleanupSucceeded) await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
-            const helperClose = deliveryTempCleanupSucceeded
-              ? await closeRawHelper(helper)
-              : { closed: false, error: 'delivery temporary-result cleanup was not verified; preserving the delivery helper.', result: tempCleanup }
-            if (!deliveryTempCleanupSucceeded) deliveryError = `${deliveryError ? `${deliveryError} ` : ''}${helperClose.error}`
-            if (!helperClose.closed) deliveryError = `${deliveryError ? `${deliveryError} ` : ''}${helperClose.error || 'raw delivery helper tab could not be closed.'}`
-            const deliverySuccess = mergeSuccess && deliveryTempCleanupSucceeded && helperClose.closed
-            const finalTask: TaskRecord = {
-              ...task,
-              deliveryStatus: deliverySuccess ? 'landed' : 'failed',
-              deliveryTargetBranch: values.target,
-              deliveryDefaultBranch: undefined,
-              deliveryBeforeCommit: before,
-              deliveryCommit: after,
-              deliveryCode: resultCode,
-              deliveryStdout: stdout,
-              deliveryStderr: stderr,
-              deliveryError: deliverySuccess ? undefined : deliveryError || refused || 'local delivery failed or returned incomplete evidence',
-              deliveryHelperTabId: helperClose.closed ? undefined : helper.tabId,
-              deliveryHelperPaneId: helperClose.closed ? undefined : helper.paneId,
-              updatedAt: new Date().toISOString(),
-            }
-            let deliveryPersistError: string | undefined
-            await writeTaskState(finalTask).catch((error) => {
-              deliveryPersistError = `could not persist delivery result: ${(error as Error).message}`
-            })
-            if (!deliverySuccess || deliveryPersistError)
-              return errorResult(deliveryPersistError || finalTask.deliveryError || 'local delivery failed.', {
-                action: params.action,
-                taskId,
-                taskPath,
-                project: task.project,
-                branch: task.branch,
-                task: finalTask,
-                delivery: { result: deliveryRun, evidence: values, tempCleanup, helperClose, durableEvidence: !deliveryPersistError },
-              })
-            const details = {
-              action: params.action,
-              taskId,
-              taskPath,
-              project: task.project,
-              branch: task.branch,
-              delivered: true,
-              idempotent: false,
-              task: finalTask,
-              report: reportValidation.report,
-              delivery: { targetBranch: values.target, beforeCommit: before, landedCommit: after, stdout, stderr },
-            }
-            return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-          }
-          case 'task_abort':
-          case 'task_recover': {
-            const taskIdError = validateTaskId(params.taskId)
-            if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
-            const taskId = params.taskId!
-            const taskPath = taskFilePath(taskId)
-            const task = await readTaskState(taskId)
-            if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
-            if (task.reportPath !== reportFilePath(taskId)) return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, task })
-            if (params.discard && !params.force) return errorResult('`discard` requires explicit `force: true`.', { action: params.action, taskId, task })
-            if (task.worktreeProvider === 'treehouse' && task.leaseStatus === 'leased' && !params.discard)
-              return errorResult('leased worktree recovery requires explicit discard: true because returning it may discard worker changes.', { action: params.action, taskId, task })
-            if (!task.workspaceId && !task.tabId && !task.paneId && task.leaseStatus !== 'leased') {
-              if (!canDeleteWithoutRecordedEndpoint(task.endpointStatus)) {
-                return errorResult('task has no recorded endpoint but durable endpoint absence was not explicitly verified; preserving state.', { action: params.action, taskId, task })
-              }
-              const recoveredTask = { ...task, status: 'failed' as const, cleanupStatus: 'tab_closed' as const, endpointStatus: 'absent_verified' as const, cleanupUpdatedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
-              await writeTaskState(recoveredTask)
-              const artifactCleanup = await removeTaskArtifacts(taskId, true)
-              if (!artifactCleanup.success) {
-                const retainedTask = { ...recoveredTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
-                await writeTaskState(retainedTask).catch(() => undefined)
-                return errorResult('task has no recorded endpoint, but artifact cleanup is incomplete; durable state is retained.', { action: params.action, taskId, task: retainedTask, artifactCleanup })
-              }
-              const details = { action: params.action, taskId, task: recoveredTask, endpointAbsent: true, artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing }
-              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-            }
-            const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId) || task.workspaceId !== workspaceId) return errorResult('task recovery requires the recorded worker workspace to be the current firstmate workspace.', { action: params.action, taskId, task, workspaceId })
-            const currentPaneId = process.env.HERDR_PANE_ID
-            const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
-            if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
-            const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
-            const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-            if (currentPaneResult.code !== 0 || !currentPane || currentPane.pane_id !== currentPaneId || currentPane.workspace_id !== workspaceId || currentPane.tab_id === task.tabId)
-              return errorResult('could not establish a distinct current firstmate pane before recovery.', { action: params.action, taskId, task, currentPane: parseJsonMaybe(currentPaneResult.stdout) })
-
+          type RawHelper = { tabId: string; paneId: string; workspaceId: string }
+          const closeRawHelper = async (helper: RawHelper): Promise<{ closed: boolean; absent?: boolean; error?: string; result?: ExecResult }> => {
             const [tabListResult, paneListResult] = await Promise.all([
-              runHerdr(['tab', 'list', '--workspace', workspaceId], signal, 10_000),
-              runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
+              runHerdr(['tab', 'list', '--workspace', helper.workspaceId], signal, 10_000),
+              runHerdr(['pane', 'list', '--workspace', helper.workspaceId], signal, 10_000),
             ])
             const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
             const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-            if (tabListResult.code !== 0 || paneListResult.code !== 0 || !Array.isArray(tabs) || !Array.isArray(panes))
-              return errorResult('could not verify the recorded worker endpoint; preserving durable state.', { action: params.action, taskId, task, tabList: tabListResult, paneList: paneListResult })
-            let tab = tabs.find((entry) => isRecord(entry) && entry.tab_id === task.tabId) as Record<string, unknown> | undefined
-            let pane = panes.find((entry) => isRecord(entry) && entry.pane_id === task.paneId) as Record<string, unknown> | undefined
-            if (tab && (!pane || pane.tab_id !== task.tabId)) return errorResult('recorded worker tab has an ambiguous or mismatched pane; preserving durable state.', { action: params.action, taskId, task, tab, pane })
-            if (pane && (!tab || pane.tab_id !== task.tabId)) return errorResult('recorded worker pane has no exact recorded tab; preserving durable state.', { action: params.action, taskId, task, tab, pane })
-            if (!tab && !pane) {
-              // Exact absence is a supported recovery result; no stop command is needed.
-            } else {
-              const targetPaneResult = await runHerdr(['pane', 'get', task.paneId || ''], signal, 10_000)
-              const targetPane = (parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
-              const agentResult = await runHerdr(['agent', 'get', task.paneId || ''], signal, 10_000)
-              const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-              const exactAgent = agentResult.code === 0 && hasExactWorkerIdentity({ workspaceId, tabId: task.tabId!, paneId: task.paneId!, workerName: task.workerName || '', workerKind: task.workerKind || '' }, agent)
-              if (!targetPane || targetPaneResult.code !== 0 || targetPane.pane_id !== task.paneId || targetPane.tab_id !== task.tabId || targetPane.workspace_id !== workspaceId)
-                return errorResult('recorded worker pane could not be verified exactly; preserving durable state.', { action: params.action, taskId, task, targetPane: parseJsonMaybe(targetPaneResult.stdout), agent: parseJsonMaybe(agentResult.stdout) })
-              if (!exactAgent && !params.force) return errorResult('recorded worker agent identity is missing or mismatched; refusing an unforced tab close and preserving durable state.', { action: params.action, taskId, task, targetPane: parseJsonMaybe(targetPaneResult.stdout), agent: parseJsonMaybe(agentResult.stdout) })
-              const statuses = [tab?.agent_status, pane?.agent_status, exactAgent ? agent.agent_status : undefined].filter((status): status is string => typeof status === 'string')
-              const active = exactAgent && statuses.some((status) => status !== 'idle' && status !== 'done')
-              if (active && !params.force) return errorResult('worker is active or hung; retry with explicit force: true to close its pane. Herdr has no native agent stop command.', { action: params.action, taskId, task, statuses })
-              const closeResult = params.force ? await runHerdr(['pane', 'close', task.paneId!], signal, 10_000) : await runHerdr(['tab', 'close', task.tabId!], signal, 10_000)
-              if (closeResult.code !== 0) return errorResult(commandResultText(params.force ? 'herdr pane close (forced recovery)' : 'herdr tab close (recovery)', closeResult), { action: params.action, taskId, task, statuses, force: params.force })
-              const verifyAfterClose = async (): Promise<{ tabAbsent: boolean; paneAbsent: boolean; tabs: unknown; panes: unknown }> => {
-                const [nextTabs, nextPanes] = await Promise.all([
-                  runHerdr(['tab', 'list', '--workspace', workspaceId], signal, 10_000),
-                  runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
-                ])
-                const nextTabEntries = (parseJsonMaybe(nextTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-                const nextPaneEntries = (parseJsonMaybe(nextPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-                return {
-                  tabAbsent: nextTabs.code === 0 && Array.isArray(nextTabEntries) && !nextTabEntries.some((entry) => isRecord(entry) && entry.tab_id === task.tabId),
-                  paneAbsent: nextPanes.code === 0 && Array.isArray(nextPaneEntries) && !nextPaneEntries.some((entry) => isRecord(entry) && entry.pane_id === task.paneId),
-                  tabs: nextTabEntries,
-                  panes: nextPaneEntries,
-                }
-              }
-              let absence = await verifyAfterClose()
-              if (!absence.paneAbsent && params.force) return errorResult('forced pane close did not verify the worker pane absent; preserving durable state.', { action: params.action, taskId, task, absence })
-              if (!params.force && !absence.tabAbsent && absence.paneAbsent) {
-                const tabCloseResult = await runHerdr(['tab', 'close', task.tabId!], signal, 10_000)
-                if (tabCloseResult.code !== 0) return errorResult(commandResultText('herdr tab close after pane close', tabCloseResult), { action: params.action, taskId, task, absence })
-                absence = await verifyAfterClose()
-              }
-              if (!absence.tabAbsent || !absence.paneAbsent) return errorResult('worker endpoint cleanup was not verified; preserving durable state.', { action: params.action, taskId, task, absence })
-              tab = undefined
-              pane = undefined
-            }
-            let recoveredTask = { ...task, status: 'failed' as const, cleanupStatus: 'tab_closed' as const, endpointStatus: 'absent_verified' as const, cleanupUpdatedAt: new Date().toISOString(), cleanupError: undefined, updatedAt: new Date().toISOString() }
-            if (task.worktreeProvider === 'treehouse' && task.leaseStatus === 'leased') {
-              const leaseReturn = await returnTaskLease(recoveredTask)
-              if (!leaseReturn.returned) return errorResult(leaseReturn.error || 'Treehouse lease return failed; preserving durable state.', { action: params.action, taskId, task: leaseReturn.task, leaseReturned: false, force: params.force, discard: params.discard })
-              recoveredTask = leaseReturn.task
-            }
-            await writeTaskState(recoveredTask)
-            const artifactCleanup = await removeTaskArtifacts(taskId, true)
-            if (!artifactCleanup.success) {
-              const retainedTask = { ...recoveredTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
-              await writeTaskState(retainedTask).catch(() => undefined)
-              return errorResult('worker recovery completed only partially; durable state is retained for retry.', { action: params.action, taskId, task: retainedTask, artifactCleanup, tabClosed: true, leaseReturned: task.worktreeProvider === 'treehouse' ? recoveredTask.leaseStatus === 'returned' : undefined })
-            }
-            const details = { action: params.action, taskId, task: recoveredTask, tabClosed: true, leaseReturned: task.worktreeProvider === 'treehouse' ? recoveredTask.leaseStatus === 'returned' : undefined, artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing, force: params.force === true, discard: params.discard === true }
-            return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-          }
-          case 'task_teardown': {
-            const taskIdError = validateTaskId(params.taskId)
-            if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
-            const taskId = params.taskId!
-            const task = await readTaskState(taskId)
-            const taskPath = taskFilePath(taskId)
-            const reportPath = reportFilePath(taskId)
-            if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) {
-              return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
-            }
-            if (task.reportPath !== reportPath) {
-              return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
-            }
-            if (
-              task.status !== 'started' ||
-              typeof task.worktree !== 'string' ||
-              !task.worktree ||
-              typeof task.workspaceId !== 'string' ||
-              !WORKSPACE_ID_RE.test(task.workspaceId) ||
-              typeof task.tabId !== 'string' ||
-              !TAB_ID_RE.test(task.tabId) ||
-              typeof task.paneId !== 'string' ||
-              !PANE_ID_RE.test(task.paneId) ||
-              typeof task.workerName !== 'string' ||
-              !AGENT_NAME_RE.test(task.workerName) ||
-              task.workerName === FIRSTMATE_NAME ||
-              typeof task.workerKind !== 'string' ||
-              !AGENT_KIND_RE.test(task.workerKind) ||
-              (task.cleanupStatus !== undefined && task.cleanupStatus !== 'pending' && task.cleanupStatus !== 'closing' && task.cleanupStatus !== 'tab_closed') ||
-              (task.worktreeProvider !== undefined && task.worktreeProvider !== 'herdr' && task.worktreeProvider !== 'treehouse') ||
-              (task.worktreeProvider === 'treehouse' && task.leaseStatus !== 'leased' && task.leaseStatus !== 'retained' && task.leaseStatus !== 'returned')
-            ) {
-              return errorResult('durable task state is malformed or does not identify one exact worker endpoint.', { action: params.action, taskId, taskPath, task })
-            }
-            const reviewTask = typeof task.reviewTarget === 'string' && task.reviewTarget.length > 0
-            if (
-              task.worktreeProvider === 'treehouse' &&
-              !reviewTask &&
-              (!canCleanupAfterDelivery({
-                reportCompleted: task.reportStatus === 'completed' && task.reportOutcome === 'completed',
-                deliveryStatus: task.deliveryStatus,
-                leaseStatus: task.leaseStatus,
-              }) ||
-                typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) !== 'string' ||
-                typeof task.deliveryCommit !== 'string' ||
-                typeof task.deliveryAt !== 'string')
-            ) {
-              return errorResult('task teardown requires successful explicit local delivery before cleanup.', { action: params.action, taskId, taskPath, task, delivered: false })
-            }
-            if (task.cleanupStatus === 'tab_closed') {
-              const artifactCleanup = await removeTaskArtifacts(taskId, true)
-              if (!artifactCleanup.success) {
-                const retainedTask = { ...task, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
-                await writeTaskState(retainedTask).catch(() => undefined)
-                return errorResult('terminal cleanup is incomplete; durable state is retained for retry.', { action: params.action, taskId, task: retainedTask, artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing })
-              }
-              const details = { action: params.action, taskId, task, tabClosed: true, idempotent: true, artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing }
-              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
-            }
-            if (task.reportStatus !== 'completed' || task.reportOutcome !== 'completed' || typeof task.reportUpdatedAt !== 'string' || typeof task.reportSummary !== 'string') {
-              return errorResult('task teardown requires a reconciled completed worker report.', { action: params.action, taskId, taskPath, reportPath, reconciled: false, complete: false, task })
-            }
-
-            let reportText: string
-            try {
-              reportText = await fs.promises.readFile(reportPath, 'utf8')
-            } catch (error) {
-              return errorResult(`worker report is missing or unreadable: ${(error as Error).message}`, {
-                action: params.action,
-                taskId,
-                taskPath,
-                reportPath,
-                reconciled: false,
-                complete: false,
-                task,
-              })
-            }
-            let parsedReport: unknown
-            try {
-              parsedReport = JSON.parse(reportText)
-            } catch (error) {
-              return errorResult(`worker report is malformed JSON: ${(error as Error).message}`, { action: params.action, taskId, taskPath, reportPath, reconciled: false, complete: false, task })
-            }
-            const validation = validateWorkerReport(parsedReport, taskId)
-            if (!validation.report || validation.report.outcome !== 'completed') {
-              return errorResult(`worker report is not a valid completed report: ${validation.error || `outcome is ${validation.report?.outcome}`}`, {
-                action: params.action,
-                taskId,
-                taskPath,
-                reportPath,
-                reconciled: false,
-                complete: false,
-                task,
-                report: parsedReport,
-              })
-            }
-            if (task.reportSummary !== validation.report.summary) {
-              return errorResult('durable task report summary does not match the reconciled report.', {
-                action: params.action,
-                taskId,
-                taskPath,
-                reportPath,
-                reconciled: false,
-                complete: false,
-                task,
-                report: validation.report,
-              })
-            }
-
-            taskTeardownReport = validation.report
-            const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action, taskId, task })
-            if (typeof task.workspaceId !== 'string' || !WORKSPACE_ID_RE.test(task.workspaceId)) {
-              return errorResult('durable task workspace id is invalid.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
-            }
-            if (task.worktreeProvider === 'treehouse' && task.workspaceId !== workspaceId) {
-              return errorResult('Treehouse-backed task is outside the current firstmate workspace.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
+            if (endpointListsConfirmAbsence({ tabListSucceeded: tabListResult.code === 0, paneListSucceeded: paneListResult.code === 0, tabs, panes, tabId: helper.tabId, paneId: helper.paneId })) {
+              return { closed: true, absent: true, result: tabListResult }
             }
             const currentPaneId = process.env.HERDR_PANE_ID
-            const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
-            if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
-            const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
-            const currentPanePayload = parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
-            const currentPane = currentPanePayload?.result?.pane
+            if (!currentPaneId || !PANE_ID_RE.test(currentPaneId)) return { closed: false, error: 'current firstmate pane id is invalid; preserving helper tab.' }
+            const currentResult = await runHerdr(['pane', 'get', currentPaneId], signal, 10_000)
+            const current = (parseJsonMaybe(currentResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+            const tabResult = await runHerdr(['tab', 'get', helper.tabId], signal, 10_000)
+            const tab = (parseJsonMaybe(tabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
+            const panesResult = await runHerdr(['pane', 'list', '--workspace', helper.workspaceId], signal, 10_000)
+            const listedPanes = (parseJsonMaybe(panesResult.stdout) as { result?: { panes?: Array<Record<string, unknown>> } } | undefined)?.result?.panes
+            const matchingPanes = listedPanes?.filter((pane) => pane.tab_id === helper.tabId) ?? []
+            const pane = matchingPanes.length === 1 ? matchingPanes[0] : undefined
+            const agentResult = pane && typeof pane.pane_id === 'string' ? await runHerdr(['agent', 'get', pane.pane_id], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
+            const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+            if (currentResult.code !== 0 || !current || current.pane_id !== currentPaneId || current.workspace_id !== helper.workspaceId || current.tab_id === helper.tabId)
+              return { closed: false, error: 'refusing to close helper tab because it is the current firstmate tab.' }
             if (
-              currentPaneResult.code !== 0 ||
-              !currentPane ||
-              currentPane.pane_id !== currentPaneId ||
-              currentPane.workspace_id !== workspaceId ||
-              typeof currentPane.tab_id !== 'string' ||
-              !TAB_ID_RE.test(currentPane.tab_id)
+              tabResult.code !== 0 ||
+              !tab ||
+              tab.tab_id !== helper.tabId ||
+              tab.workspace_id !== helper.workspaceId ||
+              tab.pane_count !== 1 ||
+              panesResult.code !== 0 ||
+              matchingPanes.length !== 1 ||
+              !pane ||
+              pane.pane_id !== helper.paneId ||
+              pane.workspace_id !== helper.workspaceId ||
+              pane.tab_id !== helper.tabId ||
+              (agentResult.code === 0 && agent)
+            )
+              return { closed: false, error: 'helper tab identity is no longer exact or has an agent; preserving helper tab.' }
+            const result = await runHerdr(['tab', 'close', helper.tabId], signal, 10_000)
+            if (result.code !== 0) return { closed: false, error: commandResultText('herdr tab close (helper)', result), result }
+            const [verifyTabs, verifyPanes] = await Promise.all([
+              runHerdr(['tab', 'list', '--workspace', helper.workspaceId], signal, 10_000),
+              runHerdr(['pane', 'list', '--workspace', helper.workspaceId], signal, 10_000),
+            ])
+            const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+            const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+            const verifiedAbsent = endpointListsConfirmAbsence({
+              tabListSucceeded: verifyTabs.code === 0,
+              paneListSucceeded: verifyPanes.code === 0,
+              tabs: verifiedTabs,
+              panes: verifiedPanes,
+              tabId: helper.tabId,
+              paneId: helper.paneId,
+            })
+            return { closed: verifiedAbsent, error: verifiedAbsent ? undefined : 'helper tab close was not verified absent; preserving helper identity.', result }
+          }
+          const createRawHelper = async (workspaceId: string, cwd: string, label: string): Promise<{ helper?: RawHelper; error?: string; result?: Record<string, unknown> }> => {
+            const tabArgs = ['tab', 'create', '--workspace', workspaceId, '--cwd', cwd, '--label', label, '--no-focus']
+            const tabResult = await runHerdr(tabArgs, signal, 10_000)
+            const payload = parseJsonMaybe(tabResult.stdout) as { result?: { tab?: Record<string, unknown>; root_pane?: Record<string, unknown> } } | undefined
+            const returnedTab = payload?.result?.tab
+            const returnedPane = payload?.result?.root_pane
+            const tabId = returnedTab?.tab_id
+            const paneId = returnedPane?.pane_id
+            const helper = typeof tabId === 'string' && TAB_ID_RE.test(tabId) && typeof paneId === 'string' && PANE_ID_RE.test(paneId) ? { tabId, paneId, workspaceId } : undefined
+            if (tabResult.code !== 0 || !helper) {
+              const helperClose = helper ? await closeRawHelper(helper) : undefined
+              return {
+                error: `${commandResultText('herdr tab create (raw helper)', tabResult)}${helperClose && !helperClose.closed ? ` ${helperClose.error || 'helper cleanup failed.'}` : ''}`,
+                result: { argv: ['herdr', ...tabArgs], returned: payload, helperClose },
+              }
+            }
+            const tabInspectionResult = await runHerdr(['tab', 'get', helper.tabId], signal, 10_000)
+            const paneInspectionResult = await runHerdr(['pane', 'get', helper.paneId], signal, 10_000)
+            const currentPaneResult = process.env.HERDR_PANE_ID ? await runHerdr(['pane', 'current', '--current'], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
+            const agentResult = await runHerdr(['agent', 'get', helper.paneId], signal, 10_000)
+            const tabInspection = (parseJsonMaybe(tabInspectionResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
+            const paneInspection = (parseJsonMaybe(paneInspectionResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+            const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+            const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+            const exactRaw =
+              tabInspectionResult.code === 0 &&
+              !!tabInspection &&
+              tabInspection.tab_id === helper.tabId &&
+              tabInspection.workspace_id === workspaceId &&
+              tabInspection.pane_count === 1 &&
+              tabInspection.focused === false &&
+              paneInspectionResult.code === 0 &&
+              !!paneInspection &&
+              paneInspection.pane_id === helper.paneId &&
+              paneInspection.tab_id === helper.tabId &&
+              paneInspection.workspace_id === workspaceId &&
+              (paneInspection.cwd === cwd || paneInspection.foreground_cwd === cwd) &&
+              currentPaneResult.code === 0 &&
+              !!currentPane &&
+              currentPane.pane_id === process.env.HERDR_PANE_ID &&
+              currentPane.workspace_id === workspaceId &&
+              currentPane.tab_id !== helper.tabId &&
+              !(agentResult.code === 0 && agent)
+            if (!exactRaw) {
+              const close = await closeRawHelper(helper)
+              return {
+                error: `raw helper tab identity was incomplete or an agent occupied it.${close.closed ? '' : ` ${close.error || 'helper tab cleanup failed.'}`}`,
+                result: { argv: ['herdr', ...tabArgs], returned: payload, tab: tabInspection, pane: paneInspection, currentPane, agent, helperClose: close },
+              }
+            }
+            return { helper }
+          }
+          const removeTaskArtifacts = async (
+            taskId: string,
+            removeState = false,
+          ): Promise<{ removed: string[]; missing: string[]; errors: Array<{ path: string; error: string }>; success: boolean }> => {
+            const removed: string[] = []
+            const missing: string[] = []
+            const errors: Array<{ path: string; error: string }> = []
+            for (const filePath of taskArtifactPaths(taskId, TASK_STATE_DIR)) {
+              try {
+                await fs.promises.unlink(filePath)
+                removed.push(filePath)
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') missing.push(filePath)
+                else errors.push({ path: filePath, error: (error as Error).message })
+              }
+            }
+            if (removeState && errors.length === 0) {
+              const statePath = taskFilePath(taskId)
+              try {
+                await fs.promises.unlink(statePath)
+                removed.push(statePath)
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') missing.push(statePath)
+                else errors.push({ path: statePath, error: (error as Error).message })
+              }
+            }
+            return { removed, missing, errors, success: errors.length === 0 }
+          }
+          const returnTaskLease = async (task: TaskRecord): Promise<{ returned: boolean; idempotent?: boolean; task: TaskRecord; error?: string; result?: Record<string, unknown> }> => {
+            if (task.worktreeProvider !== 'treehouse') return { returned: true, idempotent: true, task }
+            if (isPendingLeaseNoop(task.leaseStatus)) return { returned: true, idempotent: true, task }
+            if (task.leaseReturnHelperTabId || task.leaseReturnHelperPaneId) {
+              if (
+                typeof task.leaseReturnHelperTabId !== 'string' ||
+                !TAB_ID_RE.test(task.leaseReturnHelperTabId) ||
+                typeof task.leaseReturnHelperPaneId !== 'string' ||
+                !PANE_ID_RE.test(task.leaseReturnHelperPaneId) ||
+                typeof task.workspaceId !== 'string' ||
+                !WORKSPACE_ID_RE.test(task.workspaceId)
+              )
+                return { returned: false, task, error: 'durable Treehouse return helper identity is malformed; preserving task state.' }
+              const helperClose = await closeRawHelper({ tabId: task.leaseReturnHelperTabId, paneId: task.leaseReturnHelperPaneId, workspaceId: task.workspaceId })
+              if (!helperClose.closed)
+                return { returned: false, task, error: helperClose.error || 'previous Treehouse return helper tab could not be closed; preserving task state.', result: { helperClose } }
+              const clearedTask: TaskRecord = { ...task, leaseReturnHelperTabId: undefined, leaseReturnHelperPaneId: undefined, updatedAt: new Date().toISOString() }
+              try {
+                await writeTaskState(clearedTask)
+              } catch (error) {
+                return { returned: false, task, error: `could not persist Treehouse return helper cleanup: ${(error as Error).message}`, result: { helperClose } }
+              }
+              task = clearedTask
+            }
+            if (task.leaseStatus === 'returned' && task.leaseReturnStatus === 'returned') return { returned: true, idempotent: true, task }
+            if (
+              task.leaseStatus !== 'leased' ||
+              typeof task.worktree !== 'string' ||
+              !path.isAbsolute(task.worktree) ||
+              task.leaseHolder !== task.taskId ||
+              typeof task.leaseId !== 'string' ||
+              !task.leaseId
             ) {
-              return errorResult('could not establish the exact current firstmate tab.', {
-                action: params.action,
-                taskId,
+              return { returned: false, task, error: 'exact Treehouse lease identity is missing; preserving the lease.' }
+            }
+            const stdoutPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stdout`)
+            const stderrPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stderr`)
+            const statusPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.status`)
+            const command = `treehouse return --force ${shellQuote(task.worktree)} --if-lease-holder ${shellQuote(task.leaseHolder)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\n' "$?" > ${shellQuote(statusPath)}`
+            const helperResult = await createRawHelper(task.workspaceId || '', task.worktree, `firstmate-lease-return-${task.taskId}`)
+            if (!helperResult.helper)
+              return { returned: false, task, error: helperResult.error || 'could not create raw Treehouse return helper tab; preserving the lease.', result: helperResult.result }
+            const helper = helperResult.helper
+            const helperTask: TaskRecord = { ...task, leaseReturnHelperTabId: helper.tabId, leaseReturnHelperPaneId: helper.paneId, updatedAt: new Date().toISOString() }
+            try {
+              await writeTaskState(helperTask)
+            } catch (error) {
+              const helperClose = await closeRawHelper(helper)
+              return {
+                returned: false,
                 task,
-                currentPane: {
-                  argv: ['herdr', 'pane', 'get', currentPaneId!],
-                  exitCode: currentPaneResult.code,
-                  stdout: currentPaneResult.stdout,
-                  stderr: currentPaneResult.stderr,
-                  parsed: parseJsonMaybe(currentPaneResult.stdout),
-                },
-              })
+                error: `could not persist Treehouse return helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`,
+                result: { helperClose },
+              }
             }
-            if (currentPane.tab_id === task.tabId) {
-              return errorResult('refusing to close the current firstmate tab.', { action: params.action, taskId, task, currentTabId: currentPane.tab_id })
+            task = helperTask
+            const run = await runHerdr(['pane', 'run', helper.paneId, command], signal, 10_000)
+            let statusText = ''
+            let stdout = ''
+            let stderr = ''
+            let error: string | undefined
+            if (run.code === 0) {
+              try {
+                statusText = await readPaneFile(statusPath)
+              } catch (readError) {
+                error = `Treehouse return result was ambiguous: ${(readError as Error).message}`
+              }
+            } else error = commandResultText('herdr pane run (Treehouse return)', run)
+            stdout = await fs.promises.readFile(stdoutPath, 'utf8').catch(() => '')
+            stderr = await fs.promises.readFile(stderrPath, 'utf8').catch(() => '')
+            const code = statusText.trim() && /^-?\d+$/.test(statusText.trim()) ? Number.parseInt(statusText.trim(), 10) : null
+            const returnSuccessMarker = [stdout, stderr].some((output) => output.includes(TREEHOUSE_RETURN_SUCCESS_MARKER))
+            const markerSucceeded = code === null && returnSuccessMarker
+            const commandSucceeded = (!error && code === 0) || markerSucceeded
+            if (markerSucceeded) error = undefined
+            if (!commandSucceeded && !error) error = `treehouse return exited ${code ?? 'unknown'}; lease is preserved.`
+            const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`], signal, 10_000).catch(
+              (cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }),
+            )
+            const tempCleanupSucceeded = tempCleanup.code === 0
+            const helperClose = tempCleanupSucceeded
+              ? await closeRawHelper(helper)
+              : { closed: false, error: 'Treehouse return temporary-result cleanup was not verified; preserving the return helper.', result: tempCleanup }
+            if (!tempCleanupSucceeded) error = `${error ? `${error} ` : ''}${helperClose.error}`
+            if (!helperClose.closed) error = `${error ? `${error} ` : ''}${helperClose.error || 'raw Treehouse return helper tab could not be closed.'}`
+            const returned = canMarkLeaseReturned({ commandSucceeded, tempCleanupSucceeded, helperClosed: helperClose.closed })
+            const updatedTask: TaskRecord = {
+              ...task,
+              leaseStatus: returned ? 'returned' : 'leased',
+              leaseReturnStatus: returned ? 'returned' : 'failed',
+              leaseReturnAt: new Date().toISOString(),
+              leaseReturnCode: code,
+              leaseReturnStdout: stdout,
+              leaseReturnStderr: stderr,
+              leaseReturnError: error,
+              leaseReturnHelperTabId: returned ? undefined : helper.tabId,
+              leaseReturnHelperPaneId: returned ? undefined : helper.paneId,
+              updatedAt: new Date().toISOString(),
             }
-            if (task.cleanupStatus === 'tab_closed') {
+            let persisted = true
+            await writeTaskState(updatedTask).catch((persistError) => {
+              persisted = false
+              updatedTask.leaseStatus = 'leased'
+              updatedTask.leaseReturnStatus = 'failed'
+              updatedTask.leaseReturnError = `${error || ''}${error ? ' ' : ''}could not persist Treehouse return state: ${(persistError as Error).message}`
+            })
+            return {
+              returned: returned && persisted,
+              task: persisted ? updatedTask : task,
+              error: updatedTask.leaseReturnError || (persisted ? undefined : 'could not persist Treehouse return state'),
+              result: { argv: ['herdr', 'pane', 'run', helper.paneId, command], code, stdout, stderr, tempCleanup, helperClose },
+            }
+          }
+
+          let args: string[]
+          let tabCloseInspection: Record<string, unknown> | undefined
+          let tabCloseTargetPaneId: string | undefined
+          let tabCloseAgentName: string | undefined
+          let tabCloseAgentKind: string | undefined
+          let taskTeardownRecord: TaskRecord | undefined
+          let taskTeardownReport: WorkerReport | undefined
+          let taskTeardownTabAlreadyAbsent = false
+          switch (params.action) {
+            case 'status': {
+              const workspaceId = process.env.HERDR_WORKSPACE_ID
+              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.')
+              const [workspaceList, currentPane, paneList, agentList, currentAgent] = await Promise.all([
+                runHerdr(['workspace', 'list'], signal, 10_000),
+                runHerdr(['pane', 'current', '--current'], signal, 10_000),
+                runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
+                runHerdr(['agent', 'list'], signal, 10_000),
+                process.env.HERDR_PANE_ID ? runHerdr(['agent', 'get', process.env.HERDR_PANE_ID], signal, 10_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
+              ])
+              await deriveCurrentAgentKind(signal).catch(() => undefined)
+              let durableTasks: Record<string, unknown>
+              try {
+                let readDiagnostic: string | undefined
+                const taskRecords = await readWatcherTaskRecords((error, filePath) => {
+                  readDiagnostic ||= `task-state read failed for ${filePath}: ${(error as Error).message}`
+                })
+                durableTasks = readDiagnostic ? { error: readDiagnostic } : durableTaskSummary(taskRecords)
+              } catch (error) {
+                durableTasks = { error: `task-state read failed: ${(error as Error).message}` }
+              }
               const details = {
                 action: params.action,
-                taskId,
-                taskPath,
-                reportPath,
-                reconciled: true,
-                complete: true,
-                idempotent: true,
-                tabClosed: true,
-                worktreePreserved: true,
-                leaseReturned: task.worktreeProvider === 'treehouse' ? task.leaseStatus === 'returned' && task.leaseReturnStatus === 'returned' : undefined,
-                leaseNotRequired: task.worktreeProvider === 'herdr',
-                task,
-                report: validation.report,
+                workspaceId,
+                paneId: process.env.HERDR_PANE_ID,
+                currentAgentKind,
+                selectedWorkerKind,
+                watcher: watcherDetails(),
+                durableTasks,
+                workspaceList: parseJsonMaybe(workspaceList.stdout) ?? workspaceList,
+                currentPane: parseJsonMaybe(currentPane.stdout) ?? currentPane,
+                paneList: parseJsonMaybe(paneList.stdout) ?? paneList,
+                agentList: parseJsonMaybe(agentList.stdout) ?? agentList,
+                currentAgent: parseJsonMaybe(currentAgent.stdout) ?? currentAgent,
               }
-              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              return {
+                content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }],
+                details,
+              }
             }
+            case 'task_create': {
+              if (!params.project) return errorResult('`project` is required for task_create.', { action: params.action })
+              const projectError = validateOptionalCwd(params.project)
+              if (projectError) return errorResult(projectError, { action: params.action })
+              if (!params.prompt) return errorResult('`prompt` is required for task_create.', { action: params.action })
+              const taskWorkerKind = params.kind === undefined ? selectedWorkerKind : params.kind
+              const taskWorkerKindError = validateWorkerKind(taskWorkerKind)
+              if (taskWorkerKindError) return errorResult(taskWorkerKindError, { action: params.action, kind: params.kind })
+              const reviewTargetError = validateOptionalCwd(params.reviewTarget)
+              if (reviewTargetError) return errorResult(reviewTargetError, { action: params.action })
+              if (params.reviewTarget !== undefined && !params.reviewTarget.trim()) return errorResult('`reviewTarget` must be a non-empty ref when provided.', { action: params.action })
 
-            taskTeardownRecord = task
-            params.tabId = task.tabId
-            // Fall through to the existing exact tab_close inspection and command.
-          }
-          case 'tab_create': {
-            if (!taskTeardownRecord) {
-              const cwdError = validateOptionalCwd(params.cwd)
-              if (cwdError) return errorResult(cwdError, { action: params.action })
+              let project = path.resolve(ctx.cwd, params.project)
+              const taskIsolation = isolationMode
+              if (taskIsolation === 'shared') {
+                try {
+                  project = await fs.promises.realpath(project)
+                } catch (error) {
+                  return errorResult(`shared-checkout project is not accessible: ${(error as Error).message}`, { action: params.action, project })
+                }
+              }
+              if (taskIsolation === 'shared' && params.reviewTarget !== undefined) {
+                return errorResult('reviewTarget tasks require worktree isolation; switch with /firstmate-isolation worktree.', { action: params.action, project, reviewTarget: params.reviewTarget })
+              }
+              if (taskIsolation === 'shared') {
+                try {
+                  releaseSharedAdmission = (await acquireSharedAdmissionLock(project)).release
+                } catch (error) {
+                  return errorResult(`shared-checkout admission is unavailable: ${(error as Error).message}`, { action: params.action, project })
+                }
+                const sharedTasks = (await readWatcherTaskRecords()).filter(
+                  (record) =>
+                    record.project === project &&
+                    record.worktreeProvider === 'herdr' &&
+                    record.cleanupStatus !== 'tab_closed' &&
+                    (record.status !== 'failed' || record.endpointStatus === 'unverified'),
+                )
+                for (const sharedTask of sharedTasks) {
+                  if (sharedTask.status === 'provisioning' && !sharedTask.tabId && !sharedTask.paneId) {
+                    if (!canDeleteWithoutRecordedEndpoint(sharedTask.endpointStatus)) {
+                      return errorResult('unstarted shared task has no verified endpoint absence; preserving the durable record for explicit recovery.', {
+                        action: params.action,
+                        project,
+                        activeTaskId: sharedTask.taskId,
+                        task: sharedTask,
+                      })
+                    }
+                    const artifactCleanup = await removeTaskArtifacts(sharedTask.taskId, true)
+                    if (!artifactCleanup.success) {
+                      await writeTaskState({
+                        ...sharedTask,
+                        status: 'failed',
+                        endpointStatus: 'unverified',
+                        cleanupError: `provisioning artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`,
+                        updatedAt: new Date().toISOString(),
+                      }).catch(() => undefined)
+                      return errorResult('unstarted shared task cleanup failed; preserving the record for retry.', { action: params.action, project, activeTaskId: sharedTask.taskId, artifactCleanup })
+                    }
+                    continue
+                  }
+                  const liveEndpoint =
+                    typeof sharedTask.workspaceId === 'string' &&
+                    sharedTask.workspaceId === process.env.HERDR_WORKSPACE_ID &&
+                    typeof sharedTask.paneId === 'string' &&
+                    PANE_ID_RE.test(sharedTask.paneId) &&
+                    typeof sharedTask.tabId === 'string' &&
+                    TAB_ID_RE.test(sharedTask.tabId) &&
+                    typeof sharedTask.workerName === 'string' &&
+                    AGENT_NAME_RE.test(sharedTask.workerName) &&
+                    (await runHerdr(['agent', 'get', sharedTask.paneId], signal, 5_000)
+                      .then((result) => {
+                        const agent = (parseJsonMaybe(result.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+                        return (
+                          result.code === 0 &&
+                          !!agent &&
+                          agent.pane_id === sharedTask.paneId &&
+                          agent.tab_id === sharedTask.tabId &&
+                          agent.workspace_id === sharedTask.workspaceId &&
+                          agent.name === sharedTask.workerName
+                        )
+                      })
+                      .catch(() => false))
+                  if (liveEndpoint) {
+                    return errorResult('a shared-checkout task is already active for this project; use task_abort/task_recover for stale or blocked work, or switch to worktree isolation.', {
+                      action: params.action,
+                      project,
+                      activeTaskId: sharedTask.taskId,
+                    })
+                  }
+                  const [tabListResult, paneListResult] = await Promise.all([
+                    typeof sharedTask.workspaceId === 'string' ? runHerdr(['tab', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
+                    typeof sharedTask.workspaceId === 'string'
+                      ? runHerdr(['pane', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000)
+                      : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
+                  ])
+                  const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+                  const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+                  const endpointAbsent =
+                    tabListResult.code === 0 &&
+                    paneListResult.code === 0 &&
+                    Array.isArray(tabs) &&
+                    Array.isArray(panes) &&
+                    !tabs.some((entry) => isRecord(entry) && entry.tab_id === sharedTask.tabId) &&
+                    !panes.some((entry) => isRecord(entry) && entry.pane_id === sharedTask.paneId)
+                  if (!endpointAbsent) {
+                    return errorResult('a stale shared-checkout task still has an unverified endpoint; run task_abort/task_recover and preserve the durable record until absence is verified.', {
+                      action: params.action,
+                      project,
+                      activeTaskId: sharedTask.taskId,
+                    })
+                  }
+                  const staleTask = {
+                    ...sharedTask,
+                    status: 'failed' as const,
+                    cleanupStatus: 'tab_closed' as const,
+                    endpointStatus: 'absent_verified' as const,
+                    cleanupError: undefined,
+                    error: 'recorded worker endpoint is absent; recovered during shared-task admission.',
+                    updatedAt: new Date().toISOString(),
+                  }
+                  await writeTaskState(staleTask)
+                  const artifactCleanup = await removeTaskArtifacts(sharedTask.taskId, true)
+                  if (!artifactCleanup.success) {
+                    await writeTaskState({
+                      ...staleTask,
+                      cleanupError: `stale shared-task artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`,
+                      updatedAt: new Date().toISOString(),
+                    }).catch(() => undefined)
+                    return errorResult('stale shared task endpoint is absent, but durable artifact cleanup failed; preserving the record for retry.', {
+                      action: params.action,
+                      project,
+                      activeTaskId: sharedTask.taskId,
+                      artifactCleanup,
+                    })
+                  }
+                }
+              }
+              const taskId = newTaskId()
+              const reportPath = reportFilePath(taskId)
+              const branch = `firstmate/${taskId}`
+              const workerName = `worker-${taskId.slice('task-'.length)}`
+              const now = new Date().toISOString()
+              let task: TaskRecord = {
+                version: TASK_VERSION,
+                taskId,
+                project,
+                worktree: taskIsolation === 'shared' ? project : null,
+                worktreeProvider: taskIsolation === 'shared' ? 'herdr' : 'treehouse',
+                ...(taskIsolation === 'worktree' ? { leaseStatus: 'pending' as const, leaseHolder: taskId } : {}),
+                workspaceId: null,
+                tabId: null,
+                paneId: null,
+                branch,
+                ...(params.reviewTarget !== undefined ? { reviewTarget: params.reviewTarget } : {}),
+                workerKind: taskWorkerKind,
+                status: 'provisioning',
+                reportPath,
+                reportStatus: 'pending',
+                cleanupStatus: 'pending',
+                endpointStatus: 'unverified',
+                createdAt: now,
+                updatedAt: now,
+              }
+              let taskPath: string
+              try {
+                taskPath = await writeTaskState(task)
+              } catch (error) {
+                return errorResult(`could not persist task state: ${(error as Error).message}`, { action: params.action, taskId, project })
+              }
+
+              const failTask = async (message: string, details: Record<string, unknown> = {}) => {
+                task = { ...task, status: 'failed', error: message, updatedAt: new Date().toISOString() }
+                await writeTaskState(task).catch(() => undefined)
+                return errorResult(message, { action: params.action, taskId, taskPath, task, ...details })
+              }
+
+              const kind = taskWorkerKind
+              if (!AGENT_NAME_RE.test(workerName)) return failTask('generated worker name is invalid.')
+
               const workspaceId = process.env.HERDR_WORKSPACE_ID
-              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action })
-              args = [
+              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return failTask('HERDR_WORKSPACE_ID is missing or invalid.')
+
+              const tabArgs = [
                 'tab',
                 'create',
                 '--workspace',
                 workspaceId,
                 '--cwd',
-                params.cwd || ctx.cwd,
+                project,
+                '--label',
+                params.label || taskId,
                 '--env',
                 `${WORKER_ENV}=1`,
+                '--env',
+                `${TASK_ENV}=${taskId}`,
+                '--env',
+                `${REPORT_ENV}=${reportPath}`,
                 '--env',
                 `PATH=${workerPath()}`,
                 '--env',
                 `PI_FIRSTMATE_REAL_GIT=${firstmateGitPath()}`,
+                '--no-focus',
               ]
-              if (params.label) args.push('--label', params.label)
-              args.push(params.focus ? '--focus' : '--no-focus')
+              const tabResult = await runHerdr(tabArgs, signal, timeout)
+              const tabPayload = parseJsonMaybe(tabResult.stdout) as
+                | {
+                    result?: {
+                      tab?: { tab_id?: unknown; workspace_id?: unknown; focused?: unknown; pane_count?: unknown }
+                      root_pane?: { pane_id?: unknown; tab_id?: unknown; workspace_id?: unknown; cwd?: unknown }
+                    }
+                  }
+                | undefined
+              const created = tabPayload?.result
+              const returnedTab = created?.tab
+              const returnedRootPane = created?.root_pane
+              const returnedTabId = returnedTab?.tab_id
+              const returnedPaneId = returnedRootPane?.pane_id
+              if (tabResult.code !== 0) {
+                const orphanCleanup =
+                  typeof returnedTabId === 'string' && TAB_ID_RE.test(returnedTabId) && typeof returnedPaneId === 'string' && PANE_ID_RE.test(returnedPaneId)
+                    ? await closeRawHelper({ tabId: returnedTabId, paneId: returnedPaneId, workspaceId })
+                    : undefined
+                task = { ...task, endpointStatus: orphanCleanup?.closed ? 'absent_verified' : 'unverified', updatedAt: new Date().toISOString() }
+                return failTask(commandResultText('herdr tab create', tabResult), { argv: ['herdr', ...tabArgs], returned: tabPayload, orphanCleanup })
+              }
+
+              const currentPaneId = process.env.HERDR_PANE_ID
+              const currentPaneResult = currentPaneId ? await runHerdr(['pane', 'current', '--current'], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
+              const currentPanePayload = parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
+              const currentPane = currentPanePayload?.result?.pane
+              const tabInspectionResult = typeof returnedTabId === 'string' ? await runHerdr(['tab', 'get', returnedTabId], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
+              const paneInspectionResult = typeof returnedPaneId === 'string' ? await runHerdr(['pane', 'get', returnedPaneId], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
+              const tabInspection = (parseJsonMaybe(tabInspectionResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
+              const paneInspection = (parseJsonMaybe(paneInspectionResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+              if (
+                typeof returnedTabId !== 'string' ||
+                !TAB_ID_RE.test(returnedTabId) ||
+                typeof returnedPaneId !== 'string' ||
+                !PANE_ID_RE.test(returnedPaneId) ||
+                returnedTab?.workspace_id !== workspaceId ||
+                returnedRootPane?.tab_id !== returnedTabId ||
+                returnedRootPane?.workspace_id !== workspaceId ||
+                tabInspectionResult.code !== 0 ||
+                tabInspection?.tab_id !== returnedTabId ||
+                tabInspection.workspace_id !== workspaceId ||
+                tabInspection.pane_count !== 1 ||
+                tabInspection.focused !== false ||
+                paneInspectionResult.code !== 0 ||
+                paneInspection?.pane_id !== returnedPaneId ||
+                paneInspection.tab_id !== returnedTabId ||
+                paneInspection.workspace_id !== workspaceId ||
+                paneInspection.cwd !== project ||
+                currentPaneResult.code !== 0 ||
+                !currentPane ||
+                currentPane.pane_id !== currentPaneId ||
+                currentPane.workspace_id !== workspaceId ||
+                currentPane.tab_id === returnedTabId
+              ) {
+                const orphanCleanup =
+                  typeof returnedTabId === 'string' && TAB_ID_RE.test(returnedTabId) && typeof returnedPaneId === 'string' && PANE_ID_RE.test(returnedPaneId)
+                    ? await closeRawHelper({ tabId: returnedTabId, paneId: returnedPaneId, workspaceId })
+                    : undefined
+                task = { ...task, endpointStatus: orphanCleanup?.closed ? 'absent_verified' : 'unverified', updatedAt: new Date().toISOString() }
+                return failTask('herdr tab create returned incomplete or inconsistent current-workspace tab, root pane, cwd, or no-focus identity.', {
+                  argv: ['herdr', ...tabArgs],
+                  returned: tabPayload,
+                  currentPane: currentPanePayload,
+                  tabInspection: parseJsonMaybe(tabInspectionResult.stdout),
+                  paneInspection: parseJsonMaybe(paneInspectionResult.stdout),
+                  orphanCleanup,
+                })
+              }
+
+              task = {
+                ...task,
+                workspaceId,
+                tabId: returnedTabId,
+                paneId: returnedPaneId,
+                endpointStatus: 'recorded',
+                updatedAt: new Date().toISOString(),
+              }
+              try {
+                await writeTaskState(task)
+              } catch (error) {
+                const orphanCleanup =
+                  typeof returnedTabId === 'string' && TAB_ID_RE.test(returnedTabId) && typeof returnedPaneId === 'string' && PANE_ID_RE.test(returnedPaneId)
+                    ? await closeRawHelper({ tabId: returnedTabId, paneId: returnedPaneId, workspaceId })
+                    : undefined
+                task = { ...task, endpointStatus: orphanCleanup?.closed ? 'absent_verified' : 'unverified', updatedAt: new Date().toISOString() }
+                return failTask(`could not persist worker tab identity: ${(error as Error).message}`, { argv: ['herdr', ...tabArgs], returned: tabPayload, orphanCleanup })
+              }
+
+              const leaseJsonPath = path.join(TASK_STATE_DIR, `.${taskId}.lease.json`)
+              const leaseErrorPath = path.join(TASK_STATE_DIR, `.${taskId}.lease.stderr`)
+              const leaseStatusPath = path.join(TASK_STATE_DIR, `.${taskId}.lease.status`)
+              const removeLeaseTemp = async (): Promise<ExecResult> =>
+                await runHerdr(['pane', 'run', returnedPaneId, `rm -f ${shellQuote(leaseJsonPath)} ${shellQuote(leaseErrorPath)} ${shellQuote(leaseStatusPath)}`], signal, 10_000)
+              const readPaneFile = async (filePath: string): Promise<string> => {
+                const deadline = Date.now() + timeout
+                while (Date.now() < deadline) {
+                  try {
+                    return await fs.promises.readFile(filePath, 'utf8')
+                  } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 100))
+                }
+                throw new Error(`timed out waiting for ${filePath}`)
+              }
+
+              const closeProvisionedTab = async (): Promise<Record<string, unknown>> => {
+                const currentId = process.env.HERDR_PANE_ID
+                if (!currentId || !PANE_ID_RE.test(currentId)) return { closed: false, error: 'current firstmate pane id is invalid' }
+                const currentResult = await runHerdr(['pane', 'get', currentId], signal, 10_000)
+                const current = (parseJsonMaybe(currentResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+                const targetTabResult = await runHerdr(['tab', 'get', returnedTabId], signal, 10_000)
+                const targetTab = (parseJsonMaybe(targetTabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
+                const panesResult = await runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000)
+                const panes = (parseJsonMaybe(panesResult.stdout) as { result?: { panes?: Array<Record<string, unknown>> } } | undefined)?.result?.panes
+                const targetPanes = panes?.filter((pane) => pane.tab_id === returnedTabId) ?? []
+                const targetPaneId = targetPanes.length === 1 ? targetPanes[0].pane_id : undefined
+                const agentResult = typeof targetPaneId === 'string' ? await runHerdr(['agent', 'get', targetPaneId], signal, 10_000) : { stdout: '', stderr: '', code: 1 }
+                const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+                if (
+                  currentResult.code !== 0 ||
+                  !current ||
+                  current.pane_id !== currentId ||
+                  current.workspace_id !== workspaceId ||
+                  current.tab_id === returnedTabId ||
+                  targetTabResult.code !== 0 ||
+                  !targetTab ||
+                  targetTab.tab_id !== returnedTabId ||
+                  targetTab.workspace_id !== workspaceId ||
+                  targetTab.pane_count !== 1 ||
+                  panesResult.code !== 0 ||
+                  targetPanes.length !== 1 ||
+                  typeof targetPaneId !== 'string' ||
+                  !PANE_ID_RE.test(targetPaneId) ||
+                  (agentResult.code === 0 && agent && agent.agent_status !== 'idle' && agent.agent_status !== 'done')
+                ) {
+                  return { closed: false, error: 'refused to close a non-exact or agent-occupied provisioned tab', current, targetTab, targetPanes, agent }
+                }
+                const closeResult = await runHerdr(['tab', 'close', returnedTabId], signal, 10_000)
+                if (closeResult.code !== 0) return { closed: false, result: closeResult, error: 'provisioned tab close was not acknowledged' }
+                const [verifyTabs, verifyPanes] = await Promise.all([
+                  runHerdr(['tab', 'list', '--workspace', workspaceId], signal, 10_000),
+                  runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
+                ])
+                const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+                const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+                const verifiedAbsent = endpointListsConfirmAbsence({
+                  tabListSucceeded: verifyTabs.code === 0,
+                  paneListSucceeded: verifyPanes.code === 0,
+                  tabs: verifiedTabs,
+                  panes: verifiedPanes,
+                  tabId: returnedTabId,
+                  paneId: String(targetPaneId),
+                })
+                return { closed: verifiedAbsent, result: closeResult, error: verifiedAbsent ? undefined : 'provisioned tab close was not verified absent' }
+              }
+              const failAfterTab = async (message: string, details: Record<string, unknown> = {}) => {
+                const cleanup = await closeProvisionedTab()
+                const leaseReturn = cleanup.closed
+                  ? await returnTaskLease(task)
+                  : { returned: false, attempted: task.worktreeProvider === 'treehouse', error: 'worker tab was not verified closed; lease was not returned.', task }
+                const tempCleanup = await removeTaskArtifacts(taskId, false)
+                const cleanupErrors = [
+                  typeof leaseReturn.error === 'string' ? leaseReturn.error : undefined,
+                  cleanup.closed ? undefined : String(cleanup.error || 'provisioned tab cleanup failed'),
+                  tempCleanup.success ? undefined : `task temporary artifact cleanup failed: ${JSON.stringify(tempCleanup.errors)}`,
+                ].filter((error): error is string => Boolean(error))
+                task = {
+                  ...task,
+                  endpointStatus: cleanup.closed ? 'absent_verified' : 'unverified',
+                  cleanupStatus: cleanup.closed && leaseReturn.returned && tempCleanup.success ? 'tab_closed' : task.cleanupStatus,
+                  cleanupError: cleanupErrors.length ? cleanupErrors.join(' ') : undefined,
+                  updatedAt: new Date().toISOString(),
+                }
+                const failureMessage = leaseReturn.attempted && leaseReturn.returned !== true ? `${message} Treehouse lease return failed or was ambiguous; the lease remains retained.` : message
+                const failure = await failTask(failureMessage, { ...details, leaseReturn, tempCleanup, cleanup })
+                if (cleanup.closed && leaseReturn.returned && tempCleanup.success) {
+                  const artifactCleanup = await removeTaskArtifacts(taskId, true)
+                  if (failure.details && typeof failure.details === 'object')
+                    Object.assign(failure.details as Record<string, unknown>, { artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing, artifactCleanup })
+                }
+                return failure
+              }
+
+              const envArgs = [
+                'pane',
+                'run',
+                returnedPaneId,
+                `export ${WORKER_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
+              ]
+              const envResult = await runHerdr(envArgs, signal, 10_000)
+              if (envResult.code !== 0) {
+                return failAfterTab(commandResultText('herdr pane run (worker environment)', envResult), { argv: ['herdr', ...envArgs] })
+              }
+
+              if (taskIsolation === 'worktree') {
+                const leaseArgs = ['get', '--lease', '--lease-holder', taskId, '--json']
+                const leaseCommand = `treehouse ${leaseArgs.map(shellQuote).join(' ')} > ${shellQuote(leaseJsonPath)} 2> ${shellQuote(leaseErrorPath)}; printf '%s\\n' "$?" > ${shellQuote(leaseStatusPath)}`
+                const leaseRunArgs = ['pane', 'run', returnedPaneId, leaseCommand]
+                const leaseRunResult = await runHerdr(leaseRunArgs, signal, 10_000)
+                if (leaseRunResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (Treehouse lease)', leaseRunResult), { argv: ['herdr', ...leaseRunArgs] })
+
+                let leaseStatusText: string
+                try {
+                  leaseStatusText = await readPaneFile(leaseStatusPath)
+                } catch (error) {
+                  return failAfterTab(`Treehouse lease command did not report completion: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
+                }
+                let leaseJsonText: string
+                try {
+                  leaseJsonText = await fs.promises.readFile(leaseJsonPath, 'utf8')
+                } catch (error) {
+                  const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
+                  return failAfterTab(`treehouse get --lease failed with status ${leaseStatusText.trim()}: ${stderr.trim() || (error as Error).message}`, { argv: ['herdr', ...leaseRunArgs] })
+                }
+                const leasePayload = parseJsonMaybe(leaseJsonText) as { path?: unknown; lease_id?: unknown; lease_holder?: unknown } | undefined
+                const returnedWorktree = leasePayload?.path
+                const leaseId = typeof leasePayload?.lease_id === 'string' ? leasePayload.lease_id : undefined
+                const leaseHolder = typeof leasePayload?.lease_holder === 'string' ? leasePayload.lease_holder : undefined
+                if (
+                  leaseStatusText.trim() !== '0' ||
+                  typeof returnedWorktree !== 'string' ||
+                  !path.isAbsolute(returnedWorktree) ||
+                  returnedWorktree.includes('\u0000') ||
+                  typeof leaseId !== 'string' ||
+                  !leaseId ||
+                  leaseHolder !== taskId
+                ) {
+                  const stderr = await fs.promises.readFile(leaseErrorPath, 'utf8').catch(() => '')
+                  return failAfterTab('treehouse lease returned incomplete or inconsistent path, lease id, or lease-holder identity.', {
+                    argv: ['herdr', ...leaseRunArgs],
+                    returned: leasePayload,
+                    status: leaseStatusText.trim(),
+                    stderr: stderr.trim(),
+                  })
+                }
+                try {
+                  const worktreeStat = await fs.promises.stat(returnedWorktree)
+                  if (!worktreeStat.isDirectory()) throw new Error('leased path is not a directory')
+                } catch (error) {
+                  return failAfterTab(`leased Treehouse worktree is not accessible: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
+                }
+
+                task = { ...task, worktree: returnedWorktree, leaseStatus: 'leased', leaseId, leaseHolder, status: 'worktree_leased', updatedAt: new Date().toISOString() }
+                try {
+                  await writeTaskState(task)
+                } catch (error) {
+                  return failAfterTab(`could not persist Treehouse lease identity: ${(error as Error).message}`, { argv: ['herdr', ...leaseRunArgs], returned: leasePayload })
+                }
+
+                const removeLeaseTempResult = await removeLeaseTemp()
+                if (removeLeaseTempResult.code !== 0)
+                  return failAfterTab(commandResultText('herdr pane run (lease temp cleanup)', removeLeaseTempResult), { argv: ['herdr', 'pane', 'run', returnedPaneId, 'rm -f <lease temp files>'] })
+
+                const cdArgs = ['pane', 'run', returnedPaneId, `cd ${shellQuote(returnedWorktree)}`]
+                const cdResult = await runHerdr(cdArgs, signal, 10_000)
+                if (cdResult.code !== 0) return failAfterTab(commandResultText('herdr pane run (worker cwd)', cdResult), { argv: ['herdr', ...cdArgs] })
+                const cwdResult = await runHerdr(['pane', 'get', returnedPaneId], signal, 10_000)
+                const cwdPane = (parseJsonMaybe(cwdResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+                if (
+                  cwdResult.code !== 0 ||
+                  !cwdPane ||
+                  cwdPane.pane_id !== returnedPaneId ||
+                  cwdPane.tab_id !== returnedTabId ||
+                  cwdPane.workspace_id !== workspaceId ||
+                  cwdPane.foreground_cwd !== returnedWorktree
+                ) {
+                  return failAfterTab('worker pane did not enter the exact leased Treehouse worktree.', { argv: ['herdr', 'pane', 'get', returnedPaneId], cwd: parseJsonMaybe(cwdResult.stdout) })
+                }
+
+                const branchSetupCommand = treehouseWorkerBranchCommand(branch, task.reviewTarget)
+                const branchSetupArgs = ['pane', 'run', returnedPaneId, branchSetupCommand]
+                const branchSetupResult = await runHerdr(branchSetupArgs, signal, timeout)
+                if (branchSetupResult.code !== 0) {
+                  return failAfterTab(commandResultText('herdr pane run (worker branch setup)', branchSetupResult), { argv: ['herdr', ...branchSetupArgs] })
+                }
+              }
+
+              task = { ...task, workerName, workerKind: kind, status: 'starting', updatedAt: new Date().toISOString() }
+              try {
+                await writeTaskState(task)
+              } catch (error) {
+                return failAfterTab(`could not persist worker identity: ${(error as Error).message}`)
+              }
+
+              const startArgs = ['agent', 'start', workerName, '--kind', kind, '--pane', returnedPaneId]
+              if (params.timeoutMs !== undefined) startArgs.push('--timeout', String(params.timeoutMs))
+              appendWorkerNativeArgs(startArgs, kind)
+              let startResult = await runHerdr(startArgs, signal, timeout)
+              let startAttempt = 1
+              while (isRetryableAgentStartFailure(startResult) && startAttempt < 10) {
+                const delayMs = Math.min(250 * 2 ** (startAttempt - 1), 4_000)
+                await new Promise((resolve) => setTimeout(resolve, delayMs))
+                startAttempt += 1
+                startResult = await runHerdr(startArgs, signal, timeout)
+              }
+              if (startResult.code !== 0) {
+                return failAfterTab(commandResultText('herdr agent start', startResult), { argv: ['herdr', ...startArgs] })
+              }
+
+              task = { ...task, status: 'started', updatedAt: new Date().toISOString() }
+              let stateWriteError: string | undefined
+              try {
+                await writeTaskState(task)
+              } catch (error) {
+                stateWriteError = (error as Error).message
+                return failAfterTab(`could not persist started worker state: ${stateWriteError}`, { argv: ['herdr', ...startArgs], stateWriteError })
+              }
+
+              const reviewPrompt = task.reviewTarget ? `\n\nThis is a review task. Inspect the existing target ref ${task.reviewTarget}; do not silently review the default branch.` : ''
+              const workerPrompt = `${params.prompt}${reviewPrompt}${workerReportContract(taskId, reportPath)}`
+              const promptArgs = ['agent', 'prompt', workerName, workerPrompt]
+              const promptResult = await runHerdr(promptArgs, signal, timeout)
+              if (promptResult.code !== 0) {
+                const promptError = commandResultText('herdr agent prompt', promptResult)
+                return failAfterTab('worker started but its prompt could not be delivered.', { argv: ['herdr', ...promptArgs], promptError, stateWriteError })
+              }
+
+              const details = {
+                action: params.action,
+                taskId,
+                taskPath,
+                task,
+                isolation: taskIsolation,
+                argv: {
+                  tab: ['herdr', ...tabArgs],
+                  environment: ['herdr', ...envArgs],
+                  ...(taskIsolation === 'worktree'
+                    ? { provisioning: 'Treehouse lease, worker cwd, and branch setup completed.' }
+                    : { provisioning: 'Worker started in the requested shared checkout.' }),
+                  start: ['herdr', ...startArgs],
+                  prompt: ['herdr', ...promptArgs],
+                },
+                stateWriteError,
+              }
+              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+            }
+            case 'task_reconcile': {
+              const taskIdError = validateTaskId(params.taskId)
+              if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
+              const taskId = params.taskId!
+              const task = await readTaskState(taskId)
+              if (!task || task.taskId !== taskId) {
+                return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath: taskFilePath(taskId) })
+              }
+              const reportPath = reportFilePath(taskId)
+              if (task.reportPath !== reportPath) {
+                return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath: taskFilePath(taskId), expectedReportPath: reportPath, task })
+              }
+
+              let reportText: string
+              try {
+                reportText = await fs.promises.readFile(reportPath, 'utf8')
+              } catch (error) {
+                const message = `worker report is missing or unreadable: ${(error as Error).message}`
+                const updatedTask = {
+                  ...task,
+                  reportStatus: 'missing' as const,
+                  reportOutcome: undefined,
+                  reportUpdatedAt: new Date().toISOString(),
+                  reportSummary: undefined,
+                  reportError: message,
+                  updatedAt: new Date().toISOString(),
+                }
+                await writeTaskState(updatedTask).catch(() => undefined)
+                return errorResult(message, { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: false, task: updatedTask })
+              }
+
+              let parsedReport: unknown
+              try {
+                parsedReport = JSON.parse(reportText)
+              } catch (error) {
+                const message = `worker report is malformed JSON: ${(error as Error).message}`
+                const updatedTask = {
+                  ...task,
+                  reportStatus: 'malformed' as const,
+                  reportOutcome: undefined,
+                  reportUpdatedAt: new Date().toISOString(),
+                  reportSummary: undefined,
+                  reportError: message,
+                  updatedAt: new Date().toISOString(),
+                }
+                await writeTaskState(updatedTask).catch(() => undefined)
+                return errorResult(message, { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: false, task: updatedTask })
+              }
+
+              const validation = validateWorkerReport(parsedReport, taskId)
+              if (!validation.report) {
+                const message = `worker report is malformed: ${validation.error}`
+                const updatedTask = {
+                  ...task,
+                  reportStatus: 'malformed' as const,
+                  reportOutcome: undefined,
+                  reportUpdatedAt: new Date().toISOString(),
+                  reportSummary: undefined,
+                  reportError: message,
+                  updatedAt: new Date().toISOString(),
+                }
+                await writeTaskState(updatedTask).catch(() => undefined)
+                return errorResult(message, { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: false, task: updatedTask, report: parsedReport })
+              }
+
+              const report = validation.report
+              const reconciledTask: TaskRecord = {
+                ...task,
+                reportStatus: report.outcome,
+                reportOutcome: report.outcome,
+                reportUpdatedAt: new Date().toISOString(),
+                reportSummary: report.summary,
+                reportError: undefined,
+                updatedAt: new Date().toISOString(),
+              }
+              try {
+                await writeTaskState(reconciledTask)
+              } catch (error) {
+                return errorResult(`could not persist report reconciliation: ${(error as Error).message}`, {
+                  action: params.action,
+                  taskId,
+                  taskPath: taskFilePath(taskId),
+                  reportPath,
+                  complete: false,
+                  reconciled: false,
+                  task,
+                  report,
+                })
+              }
+
+              const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: report.outcome === 'completed', reconciled: true, task: reconciledTask, report }
+              if (report.outcome !== 'completed') return errorResult(`worker report outcome is ${report.outcome}; task is not complete.`, details)
+              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+            }
+            case 'task_deliver': {
+              const taskIdError = validateTaskId(params.taskId)
+              if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
+              if (!params.project) return errorResult('`project` is required for task_deliver.', { action: params.action })
+              const projectError = validateOptionalCwd(params.project)
+              if (projectError) return errorResult(projectError, { action: params.action })
+              const taskId = params.taskId!
+              const taskPath = taskFilePath(taskId)
+              const reportPath = reportFilePath(taskId)
+              let task = await readTaskState(taskId)
+              if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
+              if (task.project !== path.resolve(ctx.cwd, params.project))
+                return errorResult('requested primary project does not exactly match the durable task project.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  requestedProject: path.resolve(ctx.cwd, params.project),
+                })
+              if (task.reportPath !== reportPath)
+                return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
+              if (task.worktreeProvider === 'herdr')
+                return errorResult('shared-checkout tasks are already local and must not use task_deliver; reconcile, then use task_teardown.', { action: params.action, taskId, task })
+              if (
+                task.status !== 'started' ||
+                task.worktreeProvider !== 'treehouse' ||
+                typeof task.worktree !== 'string' ||
+                !path.isAbsolute(task.worktree) ||
+                (task.leaseStatus !== 'leased' && task.leaseStatus !== 'returned') ||
+                task.leaseHolder !== taskId ||
+                typeof task.leaseId !== 'string' ||
+                !task.leaseId ||
+                typeof task.workspaceId !== 'string' ||
+                !WORKSPACE_ID_RE.test(task.workspaceId) ||
+                typeof task.tabId !== 'string' ||
+                !TAB_ID_RE.test(task.tabId) ||
+                typeof task.paneId !== 'string' ||
+                !PANE_ID_RE.test(task.paneId) ||
+                typeof task.workerName !== 'string' ||
+                !AGENT_NAME_RE.test(task.workerName) ||
+                task.workerName === FIRSTMATE_NAME ||
+                typeof task.workerKind !== 'string' ||
+                !AGENT_KIND_RE.test(task.workerKind)
+              ) {
+                return errorResult('task delivery requires the exact Treehouse lease, worker endpoint, and worker branch identity.', { action: params.action, taskId, task })
+              }
+              if (task.branch !== `firstmate/${taskId}`) return errorResult('durable task branch is not the generated exact worker branch.', { action: params.action, taskId, task })
+              if (task.reviewTarget) return errorResult('review tasks are inspection-only and cannot be locally delivered.', { action: params.action, taskId, task })
+              if (task.deliveryStatus !== 'landed' && task.leaseStatus !== 'leased')
+                return errorResult('an undelivered task must still hold its active Treehouse lease.', { action: params.action, taskId, task })
+
+              let reportText: string
+              try {
+                reportText = await fs.promises.readFile(reportPath, 'utf8')
+              } catch (error) {
+                return errorResult(`worker report is missing or unreadable: ${(error as Error).message}`, { action: params.action, taskId, reportPath, reconciled: false, complete: false, task })
+              }
+              let parsedReport: unknown
+              try {
+                parsedReport = JSON.parse(reportText)
+              } catch (error) {
+                return errorResult(`worker report is malformed JSON: ${(error as Error).message}`, { action: params.action, taskId, reportPath, reconciled: false, complete: false, task })
+              }
+              const reportValidation = validateWorkerReport(parsedReport, taskId)
+              if (
+                !reportValidation.report ||
+                reportValidation.report.outcome !== 'completed' ||
+                task.reportStatus !== 'completed' ||
+                task.reportOutcome !== 'completed' ||
+                typeof task.reportUpdatedAt !== 'string' ||
+                task.reportSummary !== reportValidation.report.summary
+              ) {
+                return errorResult('task delivery requires a reconciled completed worker report.', { action: params.action, taskId, task, report: parsedReport, reconciled: false, complete: false })
+              }
+
+              if (task.deliveryHelperTabId || task.deliveryHelperPaneId) {
+                if (
+                  typeof task.deliveryHelperTabId !== 'string' ||
+                  !TAB_ID_RE.test(task.deliveryHelperTabId) ||
+                  typeof task.deliveryHelperPaneId !== 'string' ||
+                  !PANE_ID_RE.test(task.deliveryHelperPaneId) ||
+                  typeof task.workspaceId !== 'string' ||
+                  !WORKSPACE_ID_RE.test(task.workspaceId)
+                )
+                  return errorResult('durable delivery helper identity is malformed; preserving task state.', { action: params.action, taskId, task })
+                const helperClose = await closeRawHelper({ tabId: task.deliveryHelperTabId, paneId: task.deliveryHelperPaneId, workspaceId: task.workspaceId })
+                if (!helperClose.closed)
+                  return errorResult(helperClose.error || 'previous delivery helper tab could not be closed; preserving task state.', { action: params.action, taskId, task, helperClose })
+                const clearedTask: TaskRecord = { ...task, deliveryHelperTabId: undefined, deliveryHelperPaneId: undefined, updatedAt: new Date().toISOString() }
+                try {
+                  await writeTaskState(clearedTask)
+                } catch (error) {
+                  return errorResult(`could not persist delivery helper cleanup: ${(error as Error).message}`, { action: params.action, taskId, task, helperClose })
+                }
+                task = clearedTask
+              }
+              if (
+                task.deliveryStatus === 'landed' &&
+                typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) === 'string' &&
+                typeof task.deliveryCommit === 'string' &&
+                typeof task.deliveryAt === 'string'
+              ) {
+                const details = { action: params.action, taskId, taskPath, reportPath, delivered: true, idempotent: true, task, report: reportValidation.report }
+                return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              }
+
+              const workspaceId = process.env.HERDR_WORKSPACE_ID
+              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId) || task.workspaceId !== workspaceId)
+                return errorResult('Treehouse task is outside the current firstmate workspace.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
+              const currentPaneId = process.env.HERDR_PANE_ID
+              const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
+              if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
+              const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
+              const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+              if (
+                currentPaneResult.code !== 0 ||
+                !currentPane ||
+                currentPane.pane_id !== currentPaneId ||
+                currentPane.workspace_id !== workspaceId ||
+                typeof currentPane.tab_id !== 'string' ||
+                !TAB_ID_RE.test(currentPane.tab_id) ||
+                currentPane.tab_id === task.tabId
+              )
+                return errorResult('could not establish an exact non-worker firstmate pane.', { action: params.action, taskId, task, currentPane: parseJsonMaybe(currentPaneResult.stdout) })
+              const targetPaneResult = await runHerdr(['pane', 'get', task.paneId || ''], signal, 10_000)
+              const targetPane = (parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+              const agentResult = await runHerdr(['agent', 'get', task.paneId || ''], signal, 10_000)
+              const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+              if (
+                targetPaneResult.code !== 0 ||
+                !targetPane ||
+                targetPane.pane_id !== task.paneId ||
+                targetPane.tab_id !== task.tabId ||
+                targetPane.workspace_id !== task.workspaceId ||
+                agentResult.code !== 0 ||
+                !agent ||
+                agent.pane_id !== task.paneId ||
+                agent.tab_id !== task.tabId ||
+                agent.workspace_id !== task.workspaceId ||
+                agent.name !== task.workerName ||
+                agent.agent !== task.workerKind ||
+                task.workerName === FIRSTMATE_NAME
+              ) {
+                return errorResult('live worker endpoint does not match the exact durable Treehouse task identity.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  targetPane: parseJsonMaybe(targetPaneResult.stdout),
+                  agent: parseJsonMaybe(agentResult.stdout),
+                })
+              }
+
+              const evidencePath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.evidence`)
+              const dirtyPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.dirty-paths`)
+              const workerPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.worker-paths`)
+              const dirtyPathOverlapCheck = [
+                'try{',
+                "const fs=require('node:fs');",
+                'const paths=(file)=>{const bytes=fs.readFileSync(file);const entries=[];let start=0;for(let index=0;index<bytes.length;index+=1){if(bytes[index]===0){entries.push(bytes.subarray(start,index));start=index+1}}return entries};',
+                "const key=(entry)=>entry.toString('hex');",
+                'const dirtyEntries=paths(process.argv[1]);const dirty=new Set(dirtyEntries.map(key));const dirtyAncestors=new Set();',
+                'for(const entry of dirtyEntries){for(let index=0;index<entry.length;index+=1){if(entry[index]===47)dirtyAncestors.add(key(entry.subarray(0,index)))} }',
+                'const overlaps=paths(process.argv[2]).some((entry)=>{const entryKey=key(entry);if(dirty.has(entryKey)||dirtyAncestors.has(entryKey))return true;for(let index=0;index<entry.length;index+=1){if(entry[index]===47&&dirty.has(key(entry.subarray(0,index))))return true}return false});process.exit(overlaps?1:0)',
+                '}catch{process.exit(2)}',
+              ].join('')
+              const stdoutPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stdout`)
+              const stderrPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stderr`)
+              const statusPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.status`)
+              const deliveryScriptPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.sh`)
+              const deliveryScript =
+                [
+                  '#!/bin/sh',
+                  `project=${shellQuote(task.project)}`,
+                  `branch=${shellQuote(task.branch)}`,
+                  `evidence=${shellQuote(evidencePath)}`,
+                  `dirty_paths=${shellQuote(dirtyPathsPath)}`,
+                  `worker_paths=${shellQuote(workerPathsPath)}`,
+                  'target_ref=$(git -C "$project" symbolic-ref --quiet HEAD 2>/dev/null || true)',
+                  'case "$target_ref" in refs/heads/*) target="${target_ref#refs/heads/}";; *) target=;; esac',
+                  'if git -C "$project" show-ref --verify --quiet "refs/heads/$branch"; then branch_exists=true; else branch_exists=false; fi',
+                  'dirty_paths_check=not-applicable',
+                  'dirty_paths_overlap=false',
+                  'if ! { git -C "$project" diff --name-only -z; git -C "$project" diff --cached --name-only -z; git -C "$project" ls-files --others --exclude-standard -z; } > "$dirty_paths"; then dirty_paths_check=failed; elif [ -n "$target" ] && [ "$branch_exists" = true ]; then if git -C "$project" diff --name-only --no-renames -z "$target" "$branch" > "$worker_paths"; then dirty_paths_check=complete; else dirty_paths_check=failed; fi; fi',
+                  `if [ "$dirty_paths_check" = complete ] && [ -s "$dirty_paths" ] && [ -s "$worker_paths" ]; then if ${shellQuote(process.execPath)} -e ${shellQuote(dirtyPathOverlapCheck)} "$dirty_paths" "$worker_paths"; then dirty_paths_overlap=false; else case "$?" in 1) dirty_paths_overlap=true;; *) dirty_paths_check=failed;; esac; fi; fi`,
+                  'if [ -n "$target" ] && [ "$branch_exists" = true ] && git -C "$project" merge-base --is-ancestor "$target" "$branch"; then fast_forward=true; else fast_forward=false; fi',
+                  'printf \'target=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
+                  'if [ -z "$target" ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
+                  '[ "$code" -eq 0 ]',
+                ].join('\n') + '\n'
+              try {
+                await fs.promises.mkdir(TASK_STATE_DIR, { recursive: true, mode: 0o700 })
+                await fs.promises.writeFile(deliveryScriptPath, deliveryScript, { encoding: 'utf8', mode: 0o700 })
+                await fs.promises.chmod(deliveryScriptPath, 0o700)
+              } catch (error) {
+                await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
+                return errorResult(`could not persist delivery helper script: ${(error as Error).message}`, { action: params.action, taskId, task })
+              }
+              const deliveryCommand = `sh ${shellQuote(deliveryScriptPath)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\n' "$?" > ${shellQuote(statusPath)}`
+              const landingTask: TaskRecord = { ...task, deliveryStatus: 'landing', deliveryAt: new Date().toISOString(), deliveryError: undefined, updatedAt: new Date().toISOString() }
+              try {
+                await writeTaskState(landingTask)
+              } catch (error) {
+                await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
+                return errorResult(`could not persist delivery state before landing: ${(error as Error).message}`, { action: params.action, taskId, task })
+              }
+              const helperResult = await createRawHelper(workspaceId, task.project, `firstmate-delivery-${taskId}`)
+              if (!helperResult.helper) {
+                const failedTask: TaskRecord = {
+                  ...landingTask,
+                  deliveryStatus: 'failed',
+                  deliveryError: helperResult.error || 'could not create raw delivery helper tab.',
+                  updatedAt: new Date().toISOString(),
+                }
+                await writeTaskState(failedTask).catch(() => undefined)
+                await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
+                return errorResult(failedTask.deliveryError || 'could not create raw delivery helper tab.', { action: params.action, taskId, task: failedTask, helper: helperResult.result })
+              }
+              const helper = helperResult.helper
+              const landingTaskWithHelper: TaskRecord = { ...landingTask, deliveryHelperTabId: helper.tabId, deliveryHelperPaneId: helper.paneId, updatedAt: new Date().toISOString() }
+              try {
+                await writeTaskState(landingTaskWithHelper)
+              } catch (error) {
+                const helperClose = await closeRawHelper(helper)
+                await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
+                return errorResult(`could not persist delivery helper identity: ${(error as Error).message}${helperClose.closed ? '' : ` ${helperClose.error || 'helper cleanup failed.'}`}`, {
+                  action: params.action,
+                  taskId,
+                  task: landingTask,
+                  helperClose,
+                })
+              }
+              task = landingTaskWithHelper
+              const deliveryRun = await runHerdr(['pane', 'run', helper.paneId, deliveryCommand], signal, timeout)
+              let statusText = ''
+              let evidenceText = ''
+              let stdout = ''
+              let stderr = ''
+              let deliveryError: string | undefined
+              if (deliveryRun.code === 0) {
+                try {
+                  statusText = await readPaneFile(statusPath)
+                  evidenceText = await fs.promises.readFile(evidencePath, 'utf8').catch(() => '')
+                  stdout = await fs.promises.readFile(stdoutPath, 'utf8').catch(() => '')
+                  stderr = await fs.promises.readFile(stderrPath, 'utf8').catch(() => '')
+                } catch (error) {
+                  deliveryError = `local delivery result was ambiguous: ${(error as Error).message}`
+                }
+              } else deliveryError = commandResultText('herdr pane run (local delivery)', deliveryRun)
+              const values = Object.fromEntries(
+                evidenceText.split(/\r?\n/).flatMap((line) => {
+                  const separator = line.indexOf('=')
+                  return separator > 0 ? [[line.slice(0, separator), line.slice(separator + 1)]] : []
+                }),
+              )
+              const resultCode = statusText.trim() && /^-?\d+$/.test(statusText.trim()) ? Number.parseInt(statusText.trim(), 10) : null
+              const deliveryDecision = assessLocalDelivery({
+                targetBranch: values.target || '',
+                dirtyPathCheckSucceeded: values.dirty_paths_check === 'complete',
+                dirtyPathsOverlap: values.dirty_paths_overlap === 'true',
+                branchExists: values.branch_exists === 'true',
+                fastForward: values.fast_forward === 'true',
+              })
+              const refused = deliveryDecision.allowed
+                ? undefined
+                : deliveryDecision.reason === 'detached'
+                  ? 'primary checkout is detached or not on a local branch'
+                  : deliveryDecision.reason === 'dirty-path-check-failed'
+                    ? 'could not safely compare primary dirty paths with the worker branch'
+                    : deliveryDecision.reason === 'dirty-overlap'
+                      ? 'primary checkout has dirty paths overlapping the worker branch'
+                      : deliveryDecision.reason === 'missing-branch'
+                        ? 'recorded worker branch is missing'
+                        : 'primary and worker branches have diverged'
+              const before = values.before
+              const after = values.after
+              const mergeSuccess =
+                !deliveryError &&
+                resultCode === 0 &&
+                !refused &&
+                typeof values.target === 'string' &&
+                values.target.length > 0 &&
+                typeof before === 'string' &&
+                /^[0-9a-f]+$/i.test(before) &&
+                typeof after === 'string' &&
+                /^[0-9a-f]+$/i.test(after)
+              const tempCleanup = await runHerdr(
+                [
+                  'pane',
+                  'run',
+                  helper.paneId,
+                  `rm -f ${shellQuote(deliveryScriptPath)} ${shellQuote(evidencePath)} ${shellQuote(dirtyPathsPath)} ${shellQuote(workerPathsPath)} ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`,
+                ],
+                signal,
+                10_000,
+              ).catch((cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }))
+              const deliveryTempCleanupSucceeded = tempCleanup.code === 0
+              if (deliveryTempCleanupSucceeded) await fs.promises.unlink(deliveryScriptPath).catch(() => undefined)
+              const helperClose = deliveryTempCleanupSucceeded
+                ? await closeRawHelper(helper)
+                : { closed: false, error: 'delivery temporary-result cleanup was not verified; preserving the delivery helper.', result: tempCleanup }
+              if (!deliveryTempCleanupSucceeded) deliveryError = `${deliveryError ? `${deliveryError} ` : ''}${helperClose.error}`
+              if (!helperClose.closed) deliveryError = `${deliveryError ? `${deliveryError} ` : ''}${helperClose.error || 'raw delivery helper tab could not be closed.'}`
+              const deliverySuccess = mergeSuccess && deliveryTempCleanupSucceeded && helperClose.closed
+              const finalTask: TaskRecord = {
+                ...task,
+                deliveryStatus: deliverySuccess ? 'landed' : 'failed',
+                deliveryTargetBranch: values.target,
+                deliveryDefaultBranch: undefined,
+                deliveryBeforeCommit: before,
+                deliveryCommit: after,
+                deliveryCode: resultCode,
+                deliveryStdout: stdout,
+                deliveryStderr: stderr,
+                deliveryError: deliverySuccess ? undefined : deliveryError || refused || 'local delivery failed or returned incomplete evidence',
+                deliveryHelperTabId: helperClose.closed ? undefined : helper.tabId,
+                deliveryHelperPaneId: helperClose.closed ? undefined : helper.paneId,
+                updatedAt: new Date().toISOString(),
+              }
+              let deliveryPersistError: string | undefined
+              await writeTaskState(finalTask).catch((error) => {
+                deliveryPersistError = `could not persist delivery result: ${(error as Error).message}`
+              })
+              if (!deliverySuccess || deliveryPersistError)
+                return errorResult(deliveryPersistError || finalTask.deliveryError || 'local delivery failed.', {
+                  action: params.action,
+                  taskId,
+                  taskPath,
+                  project: task.project,
+                  branch: task.branch,
+                  task: finalTask,
+                  delivery: { result: deliveryRun, evidence: values, tempCleanup, helperClose, durableEvidence: !deliveryPersistError },
+                })
+              const details = {
+                action: params.action,
+                taskId,
+                taskPath,
+                project: task.project,
+                branch: task.branch,
+                delivered: true,
+                idempotent: false,
+                task: finalTask,
+                report: reportValidation.report,
+                delivery: { targetBranch: values.target, beforeCommit: before, landedCommit: after, stdout, stderr },
+              }
+              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+            }
+            case 'task_abort':
+            case 'task_recover': {
+              const taskIdError = validateTaskId(params.taskId)
+              if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
+              const taskId = params.taskId!
+              const taskPath = taskFilePath(taskId)
+              const task = await readTaskState(taskId)
+              if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
+              if (task.reportPath !== reportFilePath(taskId)) return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, task })
+              if (params.discard && !params.force) return errorResult('`discard` requires explicit `force: true`.', { action: params.action, taskId, task })
+              if (task.worktreeProvider === 'treehouse' && task.leaseStatus === 'leased' && !params.discard)
+                return errorResult('leased worktree recovery requires explicit discard: true because returning it may discard worker changes.', { action: params.action, taskId, task })
+              if (!task.workspaceId && !task.tabId && !task.paneId && task.leaseStatus !== 'leased') {
+                if (!canDeleteWithoutRecordedEndpoint(task.endpointStatus)) {
+                  return errorResult('task has no recorded endpoint but durable endpoint absence was not explicitly verified; preserving state.', { action: params.action, taskId, task })
+                }
+                const recoveredTask = {
+                  ...task,
+                  status: 'failed' as const,
+                  cleanupStatus: 'tab_closed' as const,
+                  endpointStatus: 'absent_verified' as const,
+                  cleanupUpdatedAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                }
+                await writeTaskState(recoveredTask)
+                const artifactCleanup = await removeTaskArtifacts(taskId, true)
+                if (!artifactCleanup.success) {
+                  const retainedTask = { ...recoveredTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
+                  await writeTaskState(retainedTask).catch(() => undefined)
+                  return errorResult('task has no recorded endpoint, but artifact cleanup is incomplete; durable state is retained.', {
+                    action: params.action,
+                    taskId,
+                    task: retainedTask,
+                    artifactCleanup,
+                  })
+                }
+                const details = { action: params.action, taskId, task: recoveredTask, endpointAbsent: true, artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing }
+                return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              }
+              const workspaceId = process.env.HERDR_WORKSPACE_ID
+              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId) || task.workspaceId !== workspaceId)
+                return errorResult('task recovery requires the recorded worker workspace to be the current firstmate workspace.', { action: params.action, taskId, task, workspaceId })
+              const currentPaneId = process.env.HERDR_PANE_ID
+              const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
+              if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
+              const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
+              const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+              if (currentPaneResult.code !== 0 || !currentPane || currentPane.pane_id !== currentPaneId || currentPane.workspace_id !== workspaceId || currentPane.tab_id === task.tabId)
+                return errorResult('could not establish a distinct current firstmate pane before recovery.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  currentPane: parseJsonMaybe(currentPaneResult.stdout),
+                })
+
+              const [tabListResult, paneListResult] = await Promise.all([
+                runHerdr(['tab', 'list', '--workspace', workspaceId], signal, 10_000),
+                runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
+              ])
+              const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+              const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+              if (tabListResult.code !== 0 || paneListResult.code !== 0 || !Array.isArray(tabs) || !Array.isArray(panes))
+                return errorResult('could not verify the recorded worker endpoint; preserving durable state.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  tabList: tabListResult,
+                  paneList: paneListResult,
+                })
+              let tab = tabs.find((entry) => isRecord(entry) && entry.tab_id === task.tabId) as Record<string, unknown> | undefined
+              let pane = panes.find((entry) => isRecord(entry) && entry.pane_id === task.paneId) as Record<string, unknown> | undefined
+              if (tab && (!pane || pane.tab_id !== task.tabId))
+                return errorResult('recorded worker tab has an ambiguous or mismatched pane; preserving durable state.', { action: params.action, taskId, task, tab, pane })
+              if (pane && (!tab || pane.tab_id !== task.tabId))
+                return errorResult('recorded worker pane has no exact recorded tab; preserving durable state.', { action: params.action, taskId, task, tab, pane })
+              if (!tab && !pane) {
+                // Exact absence is a supported recovery result; no stop command is needed.
+              } else {
+                const targetPaneResult = await runHerdr(['pane', 'get', task.paneId || ''], signal, 10_000)
+                const targetPane = (parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+                const agentResult = await runHerdr(['agent', 'get', task.paneId || ''], signal, 10_000)
+                const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+                const exactAgent =
+                  agentResult.code === 0 &&
+                  hasExactWorkerIdentity({ workspaceId, tabId: task.tabId!, paneId: task.paneId!, workerName: task.workerName || '', workerKind: task.workerKind || '' }, agent)
+                if (!targetPane || targetPaneResult.code !== 0 || targetPane.pane_id !== task.paneId || targetPane.tab_id !== task.tabId || targetPane.workspace_id !== workspaceId)
+                  return errorResult('recorded worker pane could not be verified exactly; preserving durable state.', {
+                    action: params.action,
+                    taskId,
+                    task,
+                    targetPane: parseJsonMaybe(targetPaneResult.stdout),
+                    agent: parseJsonMaybe(agentResult.stdout),
+                  })
+                if (!exactAgent && !params.force)
+                  return errorResult('recorded worker agent identity is missing or mismatched; refusing an unforced tab close and preserving durable state.', {
+                    action: params.action,
+                    taskId,
+                    task,
+                    targetPane: parseJsonMaybe(targetPaneResult.stdout),
+                    agent: parseJsonMaybe(agentResult.stdout),
+                  })
+                const statuses = [tab?.agent_status, pane?.agent_status, exactAgent ? agent.agent_status : undefined].filter((status): status is string => typeof status === 'string')
+                const active = exactAgent && statuses.some((status) => status !== 'idle' && status !== 'done')
+                if (active && !params.force)
+                  return errorResult('worker is active or hung; retry with explicit force: true to close its pane. Herdr has no native agent stop command.', {
+                    action: params.action,
+                    taskId,
+                    task,
+                    statuses,
+                  })
+                const closeResult = params.force ? await runHerdr(['pane', 'close', task.paneId!], signal, 10_000) : await runHerdr(['tab', 'close', task.tabId!], signal, 10_000)
+                if (closeResult.code !== 0)
+                  return errorResult(commandResultText(params.force ? 'herdr pane close (forced recovery)' : 'herdr tab close (recovery)', closeResult), {
+                    action: params.action,
+                    taskId,
+                    task,
+                    statuses,
+                    force: params.force,
+                  })
+                const verifyAfterClose = async (): Promise<{ tabAbsent: boolean; paneAbsent: boolean; tabs: unknown; panes: unknown }> => {
+                  const [nextTabs, nextPanes] = await Promise.all([
+                    runHerdr(['tab', 'list', '--workspace', workspaceId], signal, 10_000),
+                    runHerdr(['pane', 'list', '--workspace', workspaceId], signal, 10_000),
+                  ])
+                  const nextTabEntries = (parseJsonMaybe(nextTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+                  const nextPaneEntries = (parseJsonMaybe(nextPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+                  return {
+                    tabAbsent: nextTabs.code === 0 && Array.isArray(nextTabEntries) && !nextTabEntries.some((entry) => isRecord(entry) && entry.tab_id === task.tabId),
+                    paneAbsent: nextPanes.code === 0 && Array.isArray(nextPaneEntries) && !nextPaneEntries.some((entry) => isRecord(entry) && entry.pane_id === task.paneId),
+                    tabs: nextTabEntries,
+                    panes: nextPaneEntries,
+                  }
+                }
+                let absence = await verifyAfterClose()
+                if (!absence.paneAbsent && params.force)
+                  return errorResult('forced pane close did not verify the worker pane absent; preserving durable state.', { action: params.action, taskId, task, absence })
+                if (!params.force && !absence.tabAbsent && absence.paneAbsent) {
+                  const tabCloseResult = await runHerdr(['tab', 'close', task.tabId!], signal, 10_000)
+                  if (tabCloseResult.code !== 0) return errorResult(commandResultText('herdr tab close after pane close', tabCloseResult), { action: params.action, taskId, task, absence })
+                  absence = await verifyAfterClose()
+                }
+                if (!absence.tabAbsent || !absence.paneAbsent)
+                  return errorResult('worker endpoint cleanup was not verified; preserving durable state.', { action: params.action, taskId, task, absence })
+                tab = undefined
+                pane = undefined
+              }
+              let recoveredTask = {
+                ...task,
+                status: 'failed' as const,
+                cleanupStatus: 'tab_closed' as const,
+                endpointStatus: 'absent_verified' as const,
+                cleanupUpdatedAt: new Date().toISOString(),
+                cleanupError: undefined,
+                updatedAt: new Date().toISOString(),
+              }
+              if (task.worktreeProvider === 'treehouse' && task.leaseStatus === 'leased') {
+                const leaseReturn = await returnTaskLease(recoveredTask)
+                if (!leaseReturn.returned)
+                  return errorResult(leaseReturn.error || 'Treehouse lease return failed; preserving durable state.', {
+                    action: params.action,
+                    taskId,
+                    task: leaseReturn.task,
+                    leaseReturned: false,
+                    force: params.force,
+                    discard: params.discard,
+                  })
+                recoveredTask = leaseReturn.task
+              }
+              await writeTaskState(recoveredTask)
+              const artifactCleanup = await removeTaskArtifacts(taskId, true)
+              if (!artifactCleanup.success) {
+                const retainedTask = { ...recoveredTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
+                await writeTaskState(retainedTask).catch(() => undefined)
+                return errorResult('worker recovery completed only partially; durable state is retained for retry.', {
+                  action: params.action,
+                  taskId,
+                  task: retainedTask,
+                  artifactCleanup,
+                  tabClosed: true,
+                  leaseReturned: task.worktreeProvider === 'treehouse' ? recoveredTask.leaseStatus === 'returned' : undefined,
+                })
+              }
+              const details = {
+                action: params.action,
+                taskId,
+                task: recoveredTask,
+                tabClosed: true,
+                leaseReturned: task.worktreeProvider === 'treehouse' ? recoveredTask.leaseStatus === 'returned' : undefined,
+                artifactsRemoved: artifactCleanup.removed,
+                artifactsMissing: artifactCleanup.missing,
+                force: params.force === true,
+                discard: params.discard === true,
+              }
+              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+            }
+            case 'task_teardown': {
+              const taskIdError = validateTaskId(params.taskId)
+              if (taskIdError) return errorResult(taskIdError, { action: params.action, taskId: params.taskId })
+              const taskId = params.taskId!
+              const task = await readTaskState(taskId)
+              const taskPath = taskFilePath(taskId)
+              const reportPath = reportFilePath(taskId)
+              if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) {
+                return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
+              }
+              if (task.reportPath !== reportPath) {
+                return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
+              }
+              if (
+                task.status !== 'started' ||
+                typeof task.worktree !== 'string' ||
+                !task.worktree ||
+                typeof task.workspaceId !== 'string' ||
+                !WORKSPACE_ID_RE.test(task.workspaceId) ||
+                typeof task.tabId !== 'string' ||
+                !TAB_ID_RE.test(task.tabId) ||
+                typeof task.paneId !== 'string' ||
+                !PANE_ID_RE.test(task.paneId) ||
+                typeof task.workerName !== 'string' ||
+                !AGENT_NAME_RE.test(task.workerName) ||
+                task.workerName === FIRSTMATE_NAME ||
+                typeof task.workerKind !== 'string' ||
+                !AGENT_KIND_RE.test(task.workerKind) ||
+                (task.cleanupStatus !== undefined && task.cleanupStatus !== 'pending' && task.cleanupStatus !== 'closing' && task.cleanupStatus !== 'tab_closed') ||
+                (task.worktreeProvider !== undefined && task.worktreeProvider !== 'herdr' && task.worktreeProvider !== 'treehouse') ||
+                (task.worktreeProvider === 'treehouse' && task.leaseStatus !== 'leased' && task.leaseStatus !== 'retained' && task.leaseStatus !== 'returned')
+              ) {
+                return errorResult('durable task state is malformed or does not identify one exact worker endpoint.', { action: params.action, taskId, taskPath, task })
+              }
+              const reviewTask = typeof task.reviewTarget === 'string' && task.reviewTarget.length > 0
+              if (
+                task.worktreeProvider === 'treehouse' &&
+                !reviewTask &&
+                (!canCleanupAfterDelivery({
+                  reportCompleted: task.reportStatus === 'completed' && task.reportOutcome === 'completed',
+                  deliveryStatus: task.deliveryStatus,
+                  leaseStatus: task.leaseStatus,
+                }) ||
+                  typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) !== 'string' ||
+                  typeof task.deliveryCommit !== 'string' ||
+                  typeof task.deliveryAt !== 'string')
+              ) {
+                return errorResult('task teardown requires successful explicit local delivery before cleanup.', { action: params.action, taskId, taskPath, task, delivered: false })
+              }
+              if (task.cleanupStatus === 'tab_closed') {
+                const artifactCleanup = await removeTaskArtifacts(taskId, true)
+                if (!artifactCleanup.success) {
+                  const retainedTask = { ...task, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
+                  await writeTaskState(retainedTask).catch(() => undefined)
+                  return errorResult('terminal cleanup is incomplete; durable state is retained for retry.', {
+                    action: params.action,
+                    taskId,
+                    task: retainedTask,
+                    artifactsRemoved: artifactCleanup.removed,
+                    artifactsMissing: artifactCleanup.missing,
+                  })
+                }
+                const details = { action: params.action, taskId, task, tabClosed: true, idempotent: true, artifactsRemoved: artifactCleanup.removed, artifactsMissing: artifactCleanup.missing }
+                return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              }
+              if (task.reportStatus !== 'completed' || task.reportOutcome !== 'completed' || typeof task.reportUpdatedAt !== 'string' || typeof task.reportSummary !== 'string') {
+                return errorResult('task teardown requires a reconciled completed worker report.', { action: params.action, taskId, taskPath, reportPath, reconciled: false, complete: false, task })
+              }
+
+              let reportText: string
+              try {
+                reportText = await fs.promises.readFile(reportPath, 'utf8')
+              } catch (error) {
+                return errorResult(`worker report is missing or unreadable: ${(error as Error).message}`, {
+                  action: params.action,
+                  taskId,
+                  taskPath,
+                  reportPath,
+                  reconciled: false,
+                  complete: false,
+                  task,
+                })
+              }
+              let parsedReport: unknown
+              try {
+                parsedReport = JSON.parse(reportText)
+              } catch (error) {
+                return errorResult(`worker report is malformed JSON: ${(error as Error).message}`, { action: params.action, taskId, taskPath, reportPath, reconciled: false, complete: false, task })
+              }
+              const validation = validateWorkerReport(parsedReport, taskId)
+              if (!validation.report || validation.report.outcome !== 'completed') {
+                return errorResult(`worker report is not a valid completed report: ${validation.error || `outcome is ${validation.report?.outcome}`}`, {
+                  action: params.action,
+                  taskId,
+                  taskPath,
+                  reportPath,
+                  reconciled: false,
+                  complete: false,
+                  task,
+                  report: parsedReport,
+                })
+              }
+              if (task.reportSummary !== validation.report.summary) {
+                return errorResult('durable task report summary does not match the reconciled report.', {
+                  action: params.action,
+                  taskId,
+                  taskPath,
+                  reportPath,
+                  reconciled: false,
+                  complete: false,
+                  task,
+                  report: validation.report,
+                })
+              }
+
+              taskTeardownReport = validation.report
+              const workspaceId = process.env.HERDR_WORKSPACE_ID
+              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action, taskId, task })
+              if (typeof task.workspaceId !== 'string' || !WORKSPACE_ID_RE.test(task.workspaceId)) {
+                return errorResult('durable task workspace id is invalid.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
+              }
+              if (task.worktreeProvider === 'treehouse' && task.workspaceId !== workspaceId) {
+                return errorResult('Treehouse-backed task is outside the current firstmate workspace.', { action: params.action, taskId, task, currentWorkspaceId: workspaceId })
+              }
+              const currentPaneId = process.env.HERDR_PANE_ID
+              const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
+              if (currentPaneError) return errorResult(currentPaneError, { action: params.action, taskId, task })
+              const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
+              const currentPanePayload = parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
+              const currentPane = currentPanePayload?.result?.pane
+              if (
+                currentPaneResult.code !== 0 ||
+                !currentPane ||
+                currentPane.pane_id !== currentPaneId ||
+                currentPane.workspace_id !== workspaceId ||
+                typeof currentPane.tab_id !== 'string' ||
+                !TAB_ID_RE.test(currentPane.tab_id)
+              ) {
+                return errorResult('could not establish the exact current firstmate tab.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  currentPane: {
+                    argv: ['herdr', 'pane', 'get', currentPaneId!],
+                    exitCode: currentPaneResult.code,
+                    stdout: currentPaneResult.stdout,
+                    stderr: currentPaneResult.stderr,
+                    parsed: parseJsonMaybe(currentPaneResult.stdout),
+                  },
+                })
+              }
+              if (currentPane.tab_id === task.tabId) {
+                return errorResult('refusing to close the current firstmate tab.', { action: params.action, taskId, task, currentTabId: currentPane.tab_id })
+              }
+              if (task.cleanupStatus === 'tab_closed') {
+                const details = {
+                  action: params.action,
+                  taskId,
+                  taskPath,
+                  reportPath,
+                  reconciled: true,
+                  complete: true,
+                  idempotent: true,
+                  tabClosed: true,
+                  worktreePreserved: true,
+                  leaseReturned: task.worktreeProvider === 'treehouse' ? task.leaseStatus === 'returned' && task.leaseReturnStatus === 'returned' : undefined,
+                  leaseNotRequired: task.worktreeProvider === 'herdr',
+                  task,
+                  report: validation.report,
+                }
+                return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              }
+
+              taskTeardownRecord = task
+              params.tabId = task.tabId
+              // Fall through to the existing exact tab_close inspection and command.
+            }
+            case 'tab_create': {
+              if (!taskTeardownRecord) {
+                const cwdError = validateOptionalCwd(params.cwd)
+                if (cwdError) return errorResult(cwdError, { action: params.action })
+                const workspaceId = process.env.HERDR_WORKSPACE_ID
+                if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action })
+                args = [
+                  'tab',
+                  'create',
+                  '--workspace',
+                  workspaceId,
+                  '--cwd',
+                  params.cwd || ctx.cwd,
+                  '--env',
+                  `${WORKER_ENV}=1`,
+                  '--env',
+                  `PATH=${workerPath()}`,
+                  '--env',
+                  `PI_FIRSTMATE_REAL_GIT=${firstmateGitPath()}`,
+                ]
+                if (params.label) args.push('--label', params.label)
+                args.push(params.focus ? '--focus' : '--no-focus')
+                break
+              }
+            }
+            case 'tab_close': {
+              const tabIdError = validateTabId(params.tabId)
+              if (tabIdError) return errorResult(tabIdError, { action: params.action, tabId: params.tabId })
+
+              const workspaceId = process.env.HERDR_WORKSPACE_ID
+              if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) {
+                return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action, tabId: params.tabId })
+              }
+              const targetWorkspaceId = taskTeardownRecord?.workspaceId ?? workspaceId
+              const currentPaneId = process.env.HERDR_PANE_ID
+              const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
+              if (currentPaneError) return errorResult(currentPaneError, { action: params.action, tabId: params.tabId })
+
+              const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
+              const currentPanePayload = parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
+              const currentPane = currentPanePayload?.result?.pane
+              const currentPaneInspection = {
+                argv: ['herdr', 'pane', 'get', currentPaneId!],
+                exitCode: currentPaneResult.code,
+                stdout: currentPaneResult.stdout,
+                stderr: currentPaneResult.stderr,
+                parsed: parseJsonMaybe(currentPaneResult.stdout),
+              }
+              if (currentPaneResult.code !== 0 || !currentPane) {
+                return errorResult('could not inspect the current firstmate pane.', { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection })
+              }
+              if (currentPane.pane_id !== currentPaneId || currentPane.workspace_id !== workspaceId || typeof currentPane.tab_id !== 'string' || !TAB_ID_RE.test(currentPane.tab_id)) {
+                return errorResult('could not establish the exact current firstmate tab.', { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection })
+              }
+              if (currentPane.tab_id === params.tabId) {
+                return errorResult('refusing to close the current firstmate tab.', { action: params.action, tabId: params.tabId, currentTabId: currentPane.tab_id, currentPane: currentPaneInspection })
+              }
+
+              const targetTabResult = await runHerdr(['tab', 'get', params.tabId!], signal, 10_000)
+              const targetTabPayload = parseJsonMaybe(targetTabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined
+              const targetTab = targetTabPayload?.result?.tab
+              const targetTabInspection = {
+                argv: ['herdr', 'tab', 'get', params.tabId!],
+                exitCode: targetTabResult.code,
+                stdout: targetTabResult.stdout,
+                stderr: targetTabResult.stderr,
+                parsed: parseJsonMaybe(targetTabResult.stdout),
+              }
+              if (targetTabResult.code !== 0 || !targetTab) {
+                const treehouseRecoveryEligible =
+                  taskTeardownRecord?.worktreeProvider === 'treehouse' && taskTeardownRecord.leaseStatus === 'leased' && taskTeardownRecord.workspaceId === targetWorkspaceId
+                const sharedRecoveryEligible = taskTeardownRecord?.worktreeProvider === 'herdr' && taskTeardownRecord.workspaceId === targetWorkspaceId
+                const recoveryEligible = treehouseRecoveryEligible || sharedRecoveryEligible
+                if (
+                  recoveryEligible &&
+                  taskTeardownRecord &&
+                  taskTeardownRecord.tabId === params.tabId &&
+                  typeof taskTeardownRecord.paneId === 'string' &&
+                  PANE_ID_RE.test(taskTeardownRecord.paneId)
+                ) {
+                  const [tabListResult, paneListResult] = await Promise.all([
+                    runHerdr(['tab', 'list', '--workspace', targetWorkspaceId], signal, 10_000),
+                    runHerdr(['pane', 'list', '--workspace', targetWorkspaceId], signal, 10_000),
+                  ])
+                  const tabListPayload = parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined
+                  const paneListPayload = parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined
+                  const tabEntriesValue = tabListPayload?.result?.tabs
+                  const paneEntriesValue = paneListPayload?.result?.panes
+                  const tabEntries = Array.isArray(tabEntriesValue) && tabEntriesValue.every((entry) => isRecord(entry)) ? (tabEntriesValue as Array<Record<string, unknown>>) : undefined
+                  const paneEntries = Array.isArray(paneEntriesValue) && paneEntriesValue.every((entry) => isRecord(entry)) ? (paneEntriesValue as Array<Record<string, unknown>>) : undefined
+                  const recordedTabAbsent = tabListResult.code === 0 && !!tabEntries && !tabEntries.some((entry) => entry.tab_id === params.tabId)
+                  const recordedPaneAbsent = paneListResult.code === 0 && !!paneEntries && !paneEntries.some((entry) => entry.pane_id === taskTeardownRecord!.paneId)
+                  const recoveryInspection = {
+                    marker: TREEHOUSE_RETURN_SUCCESS_MARKER,
+                    tab: {
+                      argv: ['herdr', 'tab', 'list', '--workspace', targetWorkspaceId],
+                      exitCode: tabListResult.code,
+                      stdout: tabListResult.stdout,
+                      stderr: tabListResult.stderr,
+                      parsed: tabListPayload,
+                    },
+                    pane: {
+                      argv: ['herdr', 'pane', 'list', '--workspace', targetWorkspaceId],
+                      exitCode: paneListResult.code,
+                      stdout: paneListResult.stdout,
+                      stderr: paneListResult.stderr,
+                      parsed: paneListPayload,
+                    },
+                    recordedTabAbsent,
+                    recordedPaneAbsent,
+                  }
+                  if (recordedTabAbsent && recordedPaneAbsent) {
+                    const recoveredTask: TaskRecord = treehouseRecoveryEligible
+                      ? {
+                          ...taskTeardownRecord,
+                          endpointStatus: 'absent_verified',
+                          leaseStatus: 'returned',
+                          leaseReturnStatus: 'returned',
+                          leaseReturnError: undefined,
+                          updatedAt: new Date().toISOString(),
+                        }
+                      : { ...taskTeardownRecord, endpointStatus: 'absent_verified', updatedAt: new Date().toISOString() }
+                    try {
+                      await writeTaskState(recoveredTask)
+                    } catch (error) {
+                      return errorResult(`could not persist recovered absent-worker state: ${(error as Error).message}`, {
+                        action: params.action,
+                        taskId: recoveredTask.taskId,
+                        task: recoveredTask,
+                        recovery: recoveryInspection,
+                      })
+                    }
+                    taskTeardownRecord = recoveredTask
+                    taskTeardownTabAlreadyAbsent = true
+                    tabCloseInspection = { currentPane: currentPaneInspection, tab: targetTabInspection, recovery: recoveryInspection }
+                    break
+                  }
+                }
+                return errorResult('target tab is absent or could not be inspected.', { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection, tab: targetTabInspection })
+              }
+              if (targetTab.tab_id !== params.tabId || targetTab.workspace_id !== targetWorkspaceId) {
+                return errorResult('target tab is ambiguous or outside the firstmate workspace.', {
+                  action: params.action,
+                  tabId: params.tabId,
+                  currentPane: currentPaneInspection,
+                  tab: targetTabInspection,
+                })
+              }
+
+              const paneListResult = await runHerdr(['pane', 'list', '--workspace', targetWorkspaceId], signal, 10_000)
+              const paneListPayload = parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: Array<Record<string, unknown>> } } | undefined
+              const panes = paneListPayload?.result?.panes
+              const paneListInspection = {
+                argv: ['herdr', 'pane', 'list', '--workspace', targetWorkspaceId],
+                exitCode: paneListResult.code,
+                stdout: paneListResult.stdout,
+                stderr: paneListResult.stderr,
+                parsed: parseJsonMaybe(paneListResult.stdout),
+              }
+              if (paneListResult.code !== 0 || !panes) {
+                return errorResult("could not inspect the target tab's panes.", {
+                  action: params.action,
+                  tabId: params.tabId,
+                  currentPane: currentPaneInspection,
+                  tab: targetTabInspection,
+                  panes: paneListInspection,
+                })
+              }
+              const targetPanes = panes.filter((pane) => pane.tab_id === params.tabId)
+              if (targetTab.pane_count !== 1 || targetPanes.length !== 1) {
+                return errorResult(
+                  targetPanes.length > 1 || targetTab.pane_count !== 1 ? 'refusing to close a tab with multiple panes or an ambiguous pane layout.' : 'target tab is absent; it has no exact pane.',
+                  { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection, tab: targetTabInspection, panes: paneListInspection, matchingPaneCount: targetPanes.length },
+                )
+              }
+
+              const targetPaneId = targetPanes[0].pane_id
+              if (typeof targetPaneId !== 'string' || !PANE_ID_RE.test(targetPaneId)) {
+                return errorResult('target tab has an absent or malformed pane id.', {
+                  action: params.action,
+                  tabId: params.tabId,
+                  currentPane: currentPaneInspection,
+                  tab: targetTabInspection,
+                  panes: paneListInspection,
+                  targetPane: targetPanes[0],
+                })
+              }
+              const targetPaneResult = await runHerdr(['pane', 'get', targetPaneId], signal, 10_000)
+              const targetPanePayload = parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
+              const targetPane = targetPanePayload?.result?.pane
+              const targetPaneInspection = {
+                argv: ['herdr', 'pane', 'get', targetPaneId],
+                exitCode: targetPaneResult.code,
+                stdout: targetPaneResult.stdout,
+                stderr: targetPaneResult.stderr,
+                parsed: parseJsonMaybe(targetPaneResult.stdout),
+              }
+              if (targetPaneResult.code !== 0 || !targetPane || targetPane.pane_id !== targetPaneId || targetPane.tab_id !== params.tabId || targetPane.workspace_id !== targetWorkspaceId) {
+                return errorResult('target pane is absent, ambiguous, or does not belong exactly to the target tab.', {
+                  action: params.action,
+                  tabId: params.tabId,
+                  currentPane: currentPaneInspection,
+                  tab: targetTabInspection,
+                  panes: paneListInspection,
+                  pane: targetPaneInspection,
+                })
+              }
+
+              const agentResult = await runHerdr(['agent', 'get', targetPaneId], signal, 10_000)
+              const agentPayload = parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined
+              const agent = agentPayload?.result?.agent
+              const agentInspection = {
+                argv: ['herdr', 'agent', 'get', targetPaneId],
+                exitCode: agentResult.code,
+                stdout: agentResult.stdout,
+                stderr: agentResult.stderr,
+                parsed: parseJsonMaybe(agentResult.stdout),
+              }
+              if (
+                agentResult.code !== 0 ||
+                !agent ||
+                agent.pane_id !== targetPaneId ||
+                agent.tab_id !== params.tabId ||
+                agent.workspace_id !== targetWorkspaceId ||
+                typeof agent.name !== 'string' ||
+                !AGENT_NAME_RE.test(agent.name) ||
+                agent.name === FIRSTMATE_NAME
+              ) {
+                return errorResult('target pane has no exact registered worker agent.', {
+                  action: params.action,
+                  tabId: params.tabId,
+                  currentPane: currentPaneInspection,
+                  tab: targetTabInspection,
+                  panes: paneListInspection,
+                  pane: targetPaneInspection,
+                  agent: agentInspection,
+                })
+              }
+
+              const statuses = {
+                tab: typeof targetTab.agent_status === 'string' ? targetTab.agent_status : 'unknown',
+                pane: typeof targetPane.agent_status === 'string' ? targetPane.agent_status : 'unknown',
+                agent: typeof agent.agent_status === 'string' ? agent.agent_status : 'unknown',
+              }
+              tabCloseTargetPaneId = targetPaneId
+              tabCloseAgentName = typeof agent.name === 'string' ? agent.name : undefined
+              tabCloseAgentKind = typeof agent.agent === 'string' ? agent.agent : undefined
+              const refusedStatus = Object.entries(statuses).find(([, status]) => status !== 'idle' && status !== 'done')
+              tabCloseInspection = { currentPane: currentPaneInspection, tab: targetTabInspection, panes: paneListInspection, pane: targetPaneInspection, agent: agentInspection, statuses }
+              if (refusedStatus) {
+                return errorResult(`refusing to close target tab: ${refusedStatus[0]} agent status is ${refusedStatus[1]}.`, {
+                  action: params.action,
+                  tabId: params.tabId,
+                  currentPane: currentPaneInspection,
+                  ...tabCloseInspection,
+                })
+              }
+
+              const sameWorkspace = taskTeardownRecord?.workspaceId === workspaceId
+              if (taskTeardownRecord && !sameWorkspace) {
+                const workspaceListResult = await runHerdr(['workspace', 'list'], signal, 10_000)
+                const workspaceListPayload = parseJsonMaybe(workspaceListResult.stdout) as { result?: { workspaces?: unknown } } | undefined
+                const workspaceEntriesValue = workspaceListPayload?.result?.workspaces
+                const workspaceEntries = Array.isArray(workspaceEntriesValue) ? (workspaceEntriesValue as Array<Record<string, unknown>>) : undefined
+                const workspaceListMalformed = !workspaceEntries || workspaceEntries.some((entry) => !isRecord(entry))
+                const matchingWorkspaces = workspaceEntries?.filter((entry) => isRecord(entry) && entry.workspace_id === taskTeardownRecord!.workspaceId) ?? []
+                const targetWorkspace = matchingWorkspaces.length === 1 ? matchingWorkspaces[0] : undefined
+                const workspaceInspection = {
+                  argv: ['herdr', 'workspace', 'list'],
+                  exitCode: workspaceListResult.code,
+                  stdout: workspaceListResult.stdout,
+                  stderr: workspaceListResult.stderr,
+                  parsed: parseJsonMaybe(workspaceListResult.stdout),
+                }
+                if (workspaceListResult.code !== 0 || workspaceListMalformed || !targetWorkspace || targetWorkspace.tab_count !== 1 || targetWorkspace.active_tab_id !== params.tabId) {
+                  return errorResult('target workspace is absent, malformed, ambiguous, or does not contain exactly the durable task tab.', {
+                    action: params.action,
+                    taskId: taskTeardownRecord.taskId,
+                    task: taskTeardownRecord,
+                    workspace: workspaceInspection,
+                    expectedWorkspaceId: taskTeardownRecord.workspaceId,
+                    expectedTabId: params.tabId,
+                  })
+                }
+                args = ['workspace', 'close', targetWorkspaceId]
+              } else {
+                args = ['tab', 'close', params.tabId!]
+              }
+              break
+            }
+            case 'pane_run': {
+              const paneError = validatePaneId(params.paneId)
+              if (paneError) return errorResult(paneError, { action: params.action })
+              if (!params.command) return errorResult('`command` is required for pane_run.', { action: params.action })
+              if (containsGitPush(params.command)) return errorResult('git push is blocked for Firstmate workers and their subagents.', { action: params.action, paneId: params.paneId })
+              args = ['pane', 'run', params.paneId!, params.command]
+              break
+            }
+            case 'agent_start': {
+              const nameError = validateAgentName(params.name)
+              if (nameError) return errorResult(nameError, { action: params.action })
+              const paneError = validatePaneId(params.paneId)
+              if (paneError) return errorResult(paneError, { action: params.action })
+              const kind = params.kind === undefined ? selectedWorkerKind : params.kind
+              const kindError = validateWorkerKind(kind)
+              if (kindError) return errorResult(kindError, { action: params.action, kind: params.kind })
+              const workerEnvResult = await runHerdr(
+                ['pane', 'run', params.paneId!, `export ${WORKER_ENV}=1 PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`],
+                signal,
+                10_000,
+              )
+              if (workerEnvResult.code !== 0) return errorResult(commandResultText('herdr pane run (worker environment)', workerEnvResult), { action: params.action, paneId: params.paneId })
+              args = ['agent', 'start', params.name!, '--kind', kind!, '--pane', params.paneId!]
+              if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
+              appendWorkerNativeArgs(args, kind!, params.args)
+              break
+            }
+            case 'agent_prompt': {
+              const targetError = validateTarget(params.target)
+              if (targetError) return errorResult(targetError, { action: params.action })
+              if (!params.prompt) return errorResult('`prompt` is required for agent_prompt.', { action: params.action })
+              args = ['agent', 'prompt', params.target!, params.prompt]
+              if (params.wait !== false) args.push('--wait')
+              appendUntilArgs(args, params.until)
+              if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
+              break
+            }
+            case 'agent_wait': {
+              const targetError = validateTarget(params.target)
+              if (targetError) return errorResult(targetError, { action: params.action })
+              args = ['agent', 'wait', params.target!]
+              appendUntilArgs(args, params.until)
+              if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
+              break
+            }
+            case 'agent_read': {
+              const targetError = validateTarget(params.target)
+              if (targetError) return errorResult(targetError, { action: params.action })
+              const linesError = validatePositiveInteger(params.lines, 'lines')
+              if (linesError) return errorResult(linesError, { action: params.action })
+              args = ['agent', 'read', params.target!]
+              if (params.source) args.push('--source', params.source)
+              if (params.lines !== undefined) args.push('--lines', String(params.lines))
+              if (params.format) args.push('--format', params.format)
               break
             }
           }
-          case 'tab_close': {
-            const tabIdError = validateTabId(params.tabId)
-            if (tabIdError) return errorResult(tabIdError, { action: params.action, tabId: params.tabId })
 
-            const workspaceId = process.env.HERDR_WORKSPACE_ID
-            if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) {
-              return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action, tabId: params.tabId })
-            }
-            const targetWorkspaceId = taskTeardownRecord?.workspaceId ?? workspaceId
-            const currentPaneId = process.env.HERDR_PANE_ID
-            const currentPaneError = validatePaneId(currentPaneId, 'HERDR_PANE_ID')
-            if (currentPaneError) return errorResult(currentPaneError, { action: params.action, tabId: params.tabId })
-
-            const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId!], signal, 10_000)
-            const currentPanePayload = parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
-            const currentPane = currentPanePayload?.result?.pane
-            const currentPaneInspection = {
-              argv: ['herdr', 'pane', 'get', currentPaneId!],
-              exitCode: currentPaneResult.code,
-              stdout: currentPaneResult.stdout,
-              stderr: currentPaneResult.stderr,
-              parsed: parseJsonMaybe(currentPaneResult.stdout),
-            }
-            if (currentPaneResult.code !== 0 || !currentPane) {
-              return errorResult('could not inspect the current firstmate pane.', { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection })
-            }
-            if (currentPane.pane_id !== currentPaneId || currentPane.workspace_id !== workspaceId || typeof currentPane.tab_id !== 'string' || !TAB_ID_RE.test(currentPane.tab_id)) {
-              return errorResult('could not establish the exact current firstmate tab.', { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection })
-            }
-            if (currentPane.tab_id === params.tabId) {
-              return errorResult('refusing to close the current firstmate tab.', { action: params.action, tabId: params.tabId, currentTabId: currentPane.tab_id, currentPane: currentPaneInspection })
-            }
-
-            const targetTabResult = await runHerdr(['tab', 'get', params.tabId!], signal, 10_000)
-            const targetTabPayload = parseJsonMaybe(targetTabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined
-            const targetTab = targetTabPayload?.result?.tab
-            const targetTabInspection = {
-              argv: ['herdr', 'tab', 'get', params.tabId!],
-              exitCode: targetTabResult.code,
-              stdout: targetTabResult.stdout,
-              stderr: targetTabResult.stderr,
-              parsed: parseJsonMaybe(targetTabResult.stdout),
-            }
-            if (targetTabResult.code !== 0 || !targetTab) {
-              const treehouseRecoveryEligible =
-                taskTeardownRecord?.worktreeProvider === 'treehouse' &&
-                taskTeardownRecord.leaseStatus === 'leased' &&
-                taskTeardownRecord.workspaceId === targetWorkspaceId
-              const sharedRecoveryEligible = taskTeardownRecord?.worktreeProvider === 'herdr' && taskTeardownRecord.workspaceId === targetWorkspaceId
-              const recoveryEligible = treehouseRecoveryEligible || sharedRecoveryEligible
-              if (recoveryEligible && taskTeardownRecord && taskTeardownRecord.tabId === params.tabId && typeof taskTeardownRecord.paneId === 'string' && PANE_ID_RE.test(taskTeardownRecord.paneId)) {
-                const [tabListResult, paneListResult] = await Promise.all([
-                  runHerdr(['tab', 'list', '--workspace', targetWorkspaceId], signal, 10_000),
-                  runHerdr(['pane', 'list', '--workspace', targetWorkspaceId], signal, 10_000),
-                ])
-                const tabListPayload = parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined
-                const paneListPayload = parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined
-                const tabEntriesValue = tabListPayload?.result?.tabs
-                const paneEntriesValue = paneListPayload?.result?.panes
-                const tabEntries = Array.isArray(tabEntriesValue) && tabEntriesValue.every((entry) => isRecord(entry)) ? (tabEntriesValue as Array<Record<string, unknown>>) : undefined
-                const paneEntries = Array.isArray(paneEntriesValue) && paneEntriesValue.every((entry) => isRecord(entry)) ? (paneEntriesValue as Array<Record<string, unknown>>) : undefined
-                const recordedTabAbsent = tabListResult.code === 0 && !!tabEntries && !tabEntries.some((entry) => entry.tab_id === params.tabId)
-                const recordedPaneAbsent = paneListResult.code === 0 && !!paneEntries && !paneEntries.some((entry) => entry.pane_id === taskTeardownRecord!.paneId)
-                const recoveryInspection = {
-                  marker: TREEHOUSE_RETURN_SUCCESS_MARKER,
-                  tab: {
-                    argv: ['herdr', 'tab', 'list', '--workspace', targetWorkspaceId],
-                    exitCode: tabListResult.code,
-                    stdout: tabListResult.stdout,
-                    stderr: tabListResult.stderr,
-                    parsed: tabListPayload,
-                  },
-                  pane: {
-                    argv: ['herdr', 'pane', 'list', '--workspace', targetWorkspaceId],
-                    exitCode: paneListResult.code,
-                    stdout: paneListResult.stdout,
-                    stderr: paneListResult.stderr,
-                    parsed: paneListPayload,
-                  },
-                  recordedTabAbsent,
-                  recordedPaneAbsent,
-                }
-                if (recordedTabAbsent && recordedPaneAbsent) {
-                  const recoveredTask: TaskRecord = treehouseRecoveryEligible
-                    ? { ...taskTeardownRecord, endpointStatus: 'absent_verified', leaseStatus: 'returned', leaseReturnStatus: 'returned', leaseReturnError: undefined, updatedAt: new Date().toISOString() }
-                    : { ...taskTeardownRecord, endpointStatus: 'absent_verified', updatedAt: new Date().toISOString() }
-                  try {
-                    await writeTaskState(recoveredTask)
-                  } catch (error) {
-                    return errorResult(`could not persist recovered absent-worker state: ${(error as Error).message}`, {
-                      action: params.action,
-                      taskId: recoveredTask.taskId,
-                      task: recoveredTask,
-                      recovery: recoveryInspection,
-                    })
-                  }
-                  taskTeardownRecord = recoveredTask
-                  taskTeardownTabAlreadyAbsent = true
-                  tabCloseInspection = { currentPane: currentPaneInspection, tab: targetTabInspection, recovery: recoveryInspection }
-                  break
-                }
-              }
-              return errorResult('target tab is absent or could not be inspected.', { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection, tab: targetTabInspection })
-            }
-            if (targetTab.tab_id !== params.tabId || targetTab.workspace_id !== targetWorkspaceId) {
-              return errorResult('target tab is ambiguous or outside the firstmate workspace.', {
-                action: params.action,
-                tabId: params.tabId,
-                currentPane: currentPaneInspection,
-                tab: targetTabInspection,
-              })
-            }
-
-            const paneListResult = await runHerdr(['pane', 'list', '--workspace', targetWorkspaceId], signal, 10_000)
-            const paneListPayload = parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: Array<Record<string, unknown>> } } | undefined
-            const panes = paneListPayload?.result?.panes
-            const paneListInspection = {
-              argv: ['herdr', 'pane', 'list', '--workspace', targetWorkspaceId],
-              exitCode: paneListResult.code,
-              stdout: paneListResult.stdout,
-              stderr: paneListResult.stderr,
-              parsed: parseJsonMaybe(paneListResult.stdout),
-            }
-            if (paneListResult.code !== 0 || !panes) {
-              return errorResult("could not inspect the target tab's panes.", {
-                action: params.action,
-                tabId: params.tabId,
-                currentPane: currentPaneInspection,
-                tab: targetTabInspection,
-                panes: paneListInspection,
-              })
-            }
-            const targetPanes = panes.filter((pane) => pane.tab_id === params.tabId)
-            if (targetTab.pane_count !== 1 || targetPanes.length !== 1) {
-              return errorResult(
-                targetPanes.length > 1 || targetTab.pane_count !== 1 ? 'refusing to close a tab with multiple panes or an ambiguous pane layout.' : 'target tab is absent; it has no exact pane.',
-                { action: params.action, tabId: params.tabId, currentPane: currentPaneInspection, tab: targetTabInspection, panes: paneListInspection, matchingPaneCount: targetPanes.length },
-              )
-            }
-
-            const targetPaneId = targetPanes[0].pane_id
-            if (typeof targetPaneId !== 'string' || !PANE_ID_RE.test(targetPaneId)) {
-              return errorResult('target tab has an absent or malformed pane id.', {
-                action: params.action,
-                tabId: params.tabId,
-                currentPane: currentPaneInspection,
-                tab: targetTabInspection,
-                panes: paneListInspection,
-                targetPane: targetPanes[0],
-              })
-            }
-            const targetPaneResult = await runHerdr(['pane', 'get', targetPaneId], signal, 10_000)
-            const targetPanePayload = parseJsonMaybe(targetPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined
-            const targetPane = targetPanePayload?.result?.pane
-            const targetPaneInspection = {
-              argv: ['herdr', 'pane', 'get', targetPaneId],
-              exitCode: targetPaneResult.code,
-              stdout: targetPaneResult.stdout,
-              stderr: targetPaneResult.stderr,
-              parsed: parseJsonMaybe(targetPaneResult.stdout),
-            }
-            if (targetPaneResult.code !== 0 || !targetPane || targetPane.pane_id !== targetPaneId || targetPane.tab_id !== params.tabId || targetPane.workspace_id !== targetWorkspaceId) {
-              return errorResult('target pane is absent, ambiguous, or does not belong exactly to the target tab.', {
-                action: params.action,
-                tabId: params.tabId,
-                currentPane: currentPaneInspection,
-                tab: targetTabInspection,
-                panes: paneListInspection,
-                pane: targetPaneInspection,
-              })
-            }
-
-            const agentResult = await runHerdr(['agent', 'get', targetPaneId], signal, 10_000)
-            const agentPayload = parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined
-            const agent = agentPayload?.result?.agent
-            const agentInspection = {
-              argv: ['herdr', 'agent', 'get', targetPaneId],
-              exitCode: agentResult.code,
-              stdout: agentResult.stdout,
-              stderr: agentResult.stderr,
-              parsed: parseJsonMaybe(agentResult.stdout),
-            }
+          if (taskTeardownRecord) {
             if (
-              agentResult.code !== 0 ||
-              !agent ||
-              agent.pane_id !== targetPaneId ||
-              agent.tab_id !== params.tabId ||
-              agent.workspace_id !== targetWorkspaceId ||
-              typeof agent.name !== 'string' ||
-              !AGENT_NAME_RE.test(agent.name) ||
-              agent.name === FIRSTMATE_NAME
+              !taskTeardownTabAlreadyAbsent &&
+              (tabCloseTargetPaneId !== taskTeardownRecord.paneId || tabCloseAgentName !== taskTeardownRecord.workerName || tabCloseAgentKind !== taskTeardownRecord.workerKind)
             ) {
-              return errorResult('target pane has no exact registered worker agent.', {
+              return errorResult('live worker endpoint does not match the durable task identity.', {
                 action: params.action,
-                tabId: params.tabId,
-                currentPane: currentPaneInspection,
-                tab: targetTabInspection,
-                panes: paneListInspection,
-                pane: targetPaneInspection,
-                agent: agentInspection,
+                taskId: taskTeardownRecord.taskId,
+                task: taskTeardownRecord,
+                inspection: tabCloseInspection,
               })
             }
-
-            const statuses = {
-              tab: typeof targetTab.agent_status === 'string' ? targetTab.agent_status : 'unknown',
-              pane: typeof targetPane.agent_status === 'string' ? targetPane.agent_status : 'unknown',
-              agent: typeof agent.agent_status === 'string' ? agent.agent_status : 'unknown',
+            const closingTask: TaskRecord = {
+              ...taskTeardownRecord,
+              cleanupStatus: 'closing',
+              cleanupUpdatedAt: new Date().toISOString(),
+              cleanupError: undefined,
+              updatedAt: new Date().toISOString(),
             }
-            tabCloseTargetPaneId = targetPaneId
-            tabCloseAgentName = typeof agent.name === 'string' ? agent.name : undefined
-            tabCloseAgentKind = typeof agent.agent === 'string' ? agent.agent : undefined
-            const refusedStatus = Object.entries(statuses).find(([, status]) => status !== 'idle' && status !== 'done')
-            tabCloseInspection = { currentPane: currentPaneInspection, tab: targetTabInspection, panes: paneListInspection, pane: targetPaneInspection, agent: agentInspection, statuses }
-            if (refusedStatus) {
-              return errorResult(`refusing to close target tab: ${refusedStatus[0]} agent status is ${refusedStatus[1]}.`, {
+            try {
+              await writeTaskState(closingTask)
+            } catch (error) {
+              return errorResult(`could not persist task teardown state before closing the tab: ${(error as Error).message}`, {
                 action: params.action,
-                tabId: params.tabId,
-                currentPane: currentPaneInspection,
-                ...tabCloseInspection,
+                taskId: closingTask.taskId,
+                taskPath: taskFilePath(closingTask.taskId),
+                task: closingTask,
+                tabClosed: false,
+                inspection: tabCloseInspection,
               })
             }
-
-            const sameWorkspace = taskTeardownRecord?.workspaceId === workspaceId
-            if (taskTeardownRecord && !sameWorkspace) {
-              const workspaceListResult = await runHerdr(['workspace', 'list'], signal, 10_000)
-              const workspaceListPayload = parseJsonMaybe(workspaceListResult.stdout) as { result?: { workspaces?: unknown } } | undefined
-              const workspaceEntriesValue = workspaceListPayload?.result?.workspaces
-              const workspaceEntries = Array.isArray(workspaceEntriesValue) ? (workspaceEntriesValue as Array<Record<string, unknown>>) : undefined
-              const workspaceListMalformed = !workspaceEntries || workspaceEntries.some((entry) => !isRecord(entry))
-              const matchingWorkspaces = workspaceEntries?.filter((entry) => isRecord(entry) && entry.workspace_id === taskTeardownRecord!.workspaceId) ?? []
-              const targetWorkspace = matchingWorkspaces.length === 1 ? matchingWorkspaces[0] : undefined
-              const workspaceInspection = {
-                argv: ['herdr', 'workspace', 'list'],
-                exitCode: workspaceListResult.code,
-                stdout: workspaceListResult.stdout,
-                stderr: workspaceListResult.stderr,
-                parsed: parseJsonMaybe(workspaceListResult.stdout),
-              }
-              if (workspaceListResult.code !== 0 || workspaceListMalformed || !targetWorkspace || targetWorkspace.tab_count !== 1 || targetWorkspace.active_tab_id !== params.tabId) {
-                return errorResult('target workspace is absent, malformed, ambiguous, or does not contain exactly the durable task tab.', {
+            taskTeardownRecord = closingTask
+            if (taskTeardownTabAlreadyAbsent) {
+              const leaseReturn = await returnTaskLease(closingTask)
+              if (!leaseReturn.returned) {
+                const retainedTask = {
+                  ...leaseReturn.task,
+                  cleanupStatus: 'closing' as const,
+                  cleanupError: leaseReturn.error || 'Treehouse lease return failed after verified worker absence.',
+                  updatedAt: new Date().toISOString(),
+                }
+                await writeTaskState(retainedTask).catch(() => undefined)
+                return errorResult(retainedTask.cleanupError || 'Treehouse lease return failed; preserving durable state.', {
                   action: params.action,
-                  taskId: taskTeardownRecord.taskId,
-                  task: taskTeardownRecord,
-                  workspace: workspaceInspection,
-                  expectedWorkspaceId: taskTeardownRecord.workspaceId,
-                  expectedTabId: params.tabId,
+                  taskId: retainedTask.taskId,
+                  task: retainedTask,
+                  leaseReturned: false,
+                  tabClosed: true,
+                  inspection: tabCloseInspection,
+                  leaseReturn: leaseReturn.result,
                 })
               }
-              args = ['workspace', 'close', targetWorkspaceId]
-            } else {
-              args = ['tab', 'close', params.tabId!]
-            }
-            break
-          }
-          case 'pane_run': {
-            const paneError = validatePaneId(params.paneId)
-            if (paneError) return errorResult(paneError, { action: params.action })
-            if (!params.command) return errorResult('`command` is required for pane_run.', { action: params.action })
-            if (containsGitPush(params.command)) return errorResult('git push is blocked for Firstmate workers and their subagents.', { action: params.action, paneId: params.paneId })
-            args = ['pane', 'run', params.paneId!, params.command]
-            break
-          }
-          case 'agent_start': {
-            const nameError = validateAgentName(params.name)
-            if (nameError) return errorResult(nameError, { action: params.action })
-            const paneError = validatePaneId(params.paneId)
-            if (paneError) return errorResult(paneError, { action: params.action })
-            const kind = params.kind === undefined ? selectedWorkerKind : params.kind
-            const kindError = validateWorkerKind(kind)
-            if (kindError) return errorResult(kindError, { action: params.action, kind: params.kind })
-            const workerEnvResult = await runHerdr(
-              ['pane', 'run', params.paneId!, `export ${WORKER_ENV}=1 PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`],
-              signal,
-              10_000,
-            )
-            if (workerEnvResult.code !== 0) return errorResult(commandResultText('herdr pane run (worker environment)', workerEnvResult), { action: params.action, paneId: params.paneId })
-            args = ['agent', 'start', params.name!, '--kind', kind!, '--pane', params.paneId!]
-            if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
-            appendWorkerNativeArgs(args, kind!, params.args)
-            break
-          }
-          case 'agent_prompt': {
-            const targetError = validateTarget(params.target)
-            if (targetError) return errorResult(targetError, { action: params.action })
-            if (!params.prompt) return errorResult('`prompt` is required for agent_prompt.', { action: params.action })
-            args = ['agent', 'prompt', params.target!, params.prompt]
-            if (params.wait !== false) args.push('--wait')
-            appendUntilArgs(args, params.until)
-            if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
-            break
-          }
-          case 'agent_wait': {
-            const targetError = validateTarget(params.target)
-            if (targetError) return errorResult(targetError, { action: params.action })
-            args = ['agent', 'wait', params.target!]
-            appendUntilArgs(args, params.until)
-            if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
-            break
-          }
-          case 'agent_read': {
-            const targetError = validateTarget(params.target)
-            if (targetError) return errorResult(targetError, { action: params.action })
-            const linesError = validatePositiveInteger(params.lines, 'lines')
-            if (linesError) return errorResult(linesError, { action: params.action })
-            args = ['agent', 'read', params.target!]
-            if (params.source) args.push('--source', params.source)
-            if (params.lines !== undefined) args.push('--lines', String(params.lines))
-            if (params.format) args.push('--format', params.format)
-            break
-          }
-        }
+              taskTeardownRecord = leaseReturn.task
+              const returnedClosingTask = { ...leaseReturn.task, cleanupStatus: 'closing' as const, cleanupUpdatedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+              await writeTaskState(returnedClosingTask)
+              taskTeardownRecord = returnedClosingTask
 
-        if (taskTeardownRecord) {
-          if (
-            !taskTeardownTabAlreadyAbsent &&
-            (tabCloseTargetPaneId !== taskTeardownRecord.paneId || tabCloseAgentName !== taskTeardownRecord.workerName || tabCloseAgentKind !== taskTeardownRecord.workerKind)
-          ) {
-            return errorResult('live worker endpoint does not match the durable task identity.', {
-              action: params.action,
-              taskId: taskTeardownRecord.taskId,
-              task: taskTeardownRecord,
-              inspection: tabCloseInspection,
-            })
-          }
-          const closingTask: TaskRecord = { ...taskTeardownRecord, cleanupStatus: 'closing', cleanupUpdatedAt: new Date().toISOString(), cleanupError: undefined, updatedAt: new Date().toISOString() }
-          try {
-            await writeTaskState(closingTask)
-          } catch (error) {
-            return errorResult(`could not persist task teardown state before closing the tab: ${(error as Error).message}`, {
-              action: params.action,
-              taskId: closingTask.taskId,
-              taskPath: taskFilePath(closingTask.taskId),
-              task: closingTask,
-              tabClosed: false,
-              inspection: tabCloseInspection,
-            })
-          }
-          taskTeardownRecord = closingTask
-          if (taskTeardownTabAlreadyAbsent) {
-            const leaseReturn = await returnTaskLease(closingTask)
-            if (!leaseReturn.returned) {
-              const retainedTask = { ...leaseReturn.task, cleanupStatus: 'closing' as const, cleanupError: leaseReturn.error || 'Treehouse lease return failed after verified worker absence.', updatedAt: new Date().toISOString() }
-              await writeTaskState(retainedTask).catch(() => undefined)
-              return errorResult(retainedTask.cleanupError || 'Treehouse lease return failed; preserving durable state.', { action: params.action, taskId: retainedTask.taskId, task: retainedTask, leaseReturned: false, tabClosed: true, inspection: tabCloseInspection, leaseReturn: leaseReturn.result })
-            }
-            taskTeardownRecord = leaseReturn.task
-            const returnedClosingTask = { ...leaseReturn.task, cleanupStatus: 'closing' as const, cleanupUpdatedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
-            await writeTaskState(returnedClosingTask)
-            taskTeardownRecord = returnedClosingTask
-
-            const closedTask: TaskRecord = { ...taskTeardownRecord, cleanupStatus: 'tab_closed', cleanupUpdatedAt: new Date().toISOString(), cleanupError: undefined, updatedAt: new Date().toISOString() }
-            try {
-              await writeTaskState(closedTask)
-            } catch (error) {
-              return errorResult(`worker tab is already absent but durable tab-closed status could not be persisted: ${(error as Error).message}`, {
+              const closedTask: TaskRecord = {
+                ...taskTeardownRecord,
+                cleanupStatus: 'tab_closed',
+                cleanupUpdatedAt: new Date().toISOString(),
+                cleanupError: undefined,
+                updatedAt: new Date().toISOString(),
+              }
+              try {
+                await writeTaskState(closedTask)
+              } catch (error) {
+                return errorResult(`worker tab is already absent but durable tab-closed status could not be persisted: ${(error as Error).message}`, {
+                  action: params.action,
+                  taskId: closedTask.taskId,
+                  taskPath: taskFilePath(closedTask.taskId),
+                  task: closedTask,
+                  tabClosed: true,
+                  cleanupRecorded: false,
+                  inspection: tabCloseInspection,
+                })
+              }
+              const artifactCleanup = await removeTaskArtifacts(closedTask.taskId, true)
+              if (!artifactCleanup.success) {
+                const retainedTask = { ...closedTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
+                await writeTaskState(retainedTask).catch(() => undefined)
+                return errorResult('worker tab was absent and lease was handled, but artifact cleanup is incomplete; durable state is retained.', {
+                  action: params.action,
+                  taskId: closedTask.taskId,
+                  task: retainedTask,
+                  tabClosed: true,
+                  leaseReturned: true,
+                  artifactCleanup,
+                  inspection: tabCloseInspection,
+                })
+              }
+              const teardownDetails = {
                 action: params.action,
                 taskId: closedTask.taskId,
                 taskPath: taskFilePath(closedTask.taskId),
+                reportPath: reportFilePath(closedTask.taskId),
+                reconciled: true,
+                complete: true,
+                idempotent: false,
+                tabClosed: true,
+                cleanupRecorded: true,
+                workerTabAbsent: true,
+                worktreePreserved: true,
+                leaseReturned: true,
+                artifactsRemoved: artifactCleanup.removed,
+                artifactsMissing: artifactCleanup.missing,
+                task: closedTask,
+                report: taskTeardownReport,
+                inspection: tabCloseInspection,
+              }
+              return { content: [{ type: 'text' as const, text: JSON.stringify(teardownDetails, null, 2) }], details: teardownDetails }
+            }
+          }
+
+          const result = await runHerdr(args, signal, timeout)
+          const parsed = parseJsonMaybe(result.stdout)
+          const details = {
+            action: params.action,
+            argv: ['herdr', ...args],
+            exitCode: result.code,
+            killed: result.killed,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            parsed,
+            ...(tabCloseInspection ? { inspection: tabCloseInspection } : {}),
+          }
+          if (taskTeardownRecord) {
+            if (result.code !== 0) {
+              const retryTask: TaskRecord = {
+                ...taskTeardownRecord,
+                cleanupStatus: 'pending',
+                cleanupUpdatedAt: new Date().toISOString(),
+                cleanupError: commandResultText(`herdr ${args.join(' ')}`, result),
+                updatedAt: new Date().toISOString(),
+              }
+              await writeTaskState(retryTask).catch(() => undefined)
+              return errorResult(commandResultText(`herdr ${args.join(' ')}`, result), { ...details, task: retryTask, tabClosed: false })
+            }
+            const [verifyTabs, verifyPanes] = await Promise.all([
+              runHerdr(['tab', 'list', '--workspace', taskTeardownRecord.workspaceId!], signal, 10_000),
+              runHerdr(['pane', 'list', '--workspace', taskTeardownRecord.workspaceId!], signal, 10_000),
+            ])
+            const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+            const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+            const endpointAbsent = endpointListsConfirmAbsence({
+              tabListSucceeded: verifyTabs.code === 0,
+              paneListSucceeded: verifyPanes.code === 0,
+              tabs: verifiedTabs,
+              panes: verifiedPanes,
+              tabId: taskTeardownRecord.tabId!,
+              paneId: taskTeardownRecord.paneId!,
+            })
+            if (!endpointAbsent) {
+              const retainedTask: TaskRecord = {
+                ...taskTeardownRecord,
+                cleanupStatus: 'closing',
+                cleanupError: 'worker tab close was acknowledged but recorded tab/pane absence was not verified.',
+                updatedAt: new Date().toISOString(),
+              }
+              await writeTaskState(retainedTask).catch(() => undefined)
+              return errorResult('worker tab close was acknowledged, but recorded worker tab and pane absence was not verified; preserving durable state and lease.', {
+                ...details,
+                task: retainedTask,
+                tabClosed: false,
+                endpointVerification: { tabs: verifyTabs, panes: verifyPanes },
+              })
+            }
+            const leaseReturn = await returnTaskLease({ ...taskTeardownRecord, endpointStatus: 'absent_verified' })
+            if (!leaseReturn.returned) {
+              const retainedTask = {
+                ...leaseReturn.task,
+                cleanupStatus: 'closing' as const,
+                cleanupError: leaseReturn.error || 'Treehouse lease return failed after worker tab close.',
+                updatedAt: new Date().toISOString(),
+              }
+              await writeTaskState(retainedTask).catch(() => undefined)
+              return errorResult(retainedTask.cleanupError || 'Treehouse lease return failed; preserving durable state.', {
+                ...details,
+                task: retainedTask,
+                tabClosed: true,
+                leaseReturned: false,
+                leaseReturn: leaseReturn.result,
+              })
+            }
+            taskTeardownRecord = leaseReturn.task
+            const closedTask: TaskRecord = {
+              ...taskTeardownRecord,
+              cleanupStatus: 'tab_closed',
+              leaseStatus: taskTeardownRecord.worktreeProvider === 'treehouse' ? 'returned' : taskTeardownRecord.leaseStatus,
+              cleanupUpdatedAt: new Date().toISOString(),
+              cleanupError: undefined,
+              updatedAt: new Date().toISOString(),
+            }
+            try {
+              await writeTaskState(closedTask)
+            } catch (error) {
+              return errorResult(`tab closed but durable tab-closed status could not be persisted: ${(error as Error).message}`, {
+                ...details,
                 task: closedTask,
                 tabClosed: true,
                 cleanupRecorded: false,
-                inspection: tabCloseInspection,
+                worktreePreserved: true,
               })
             }
             const artifactCleanup = await removeTaskArtifacts(closedTask.taskId, true)
             if (!artifactCleanup.success) {
               const retainedTask = { ...closedTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
               await writeTaskState(retainedTask).catch(() => undefined)
-              return errorResult('worker tab was absent and lease was handled, but artifact cleanup is incomplete; durable state is retained.', { action: params.action, taskId: closedTask.taskId, task: retainedTask, tabClosed: true, leaseReturned: true, artifactCleanup, inspection: tabCloseInspection })
+              return errorResult('worker tab and lease cleanup succeeded, but artifact cleanup is incomplete; durable state is retained.', {
+                ...details,
+                task: retainedTask,
+                tabClosed: true,
+                leaseReturned: true,
+                artifactCleanup,
+              })
             }
             const teardownDetails = {
-              action: params.action,
-              taskId: closedTask.taskId,
-              taskPath: taskFilePath(closedTask.taskId),
-              reportPath: reportFilePath(closedTask.taskId),
-              reconciled: true,
-              complete: true,
-              idempotent: false,
-              tabClosed: true,
-              cleanupRecorded: true,
-              workerTabAbsent: true,
-              worktreePreserved: true,
-              leaseReturned: true,
-              artifactsRemoved: artifactCleanup.removed,
-              artifactsMissing: artifactCleanup.missing,
-              task: closedTask,
-              report: taskTeardownReport,
-              inspection: tabCloseInspection,
-            }
-            return { content: [{ type: 'text' as const, text: JSON.stringify(teardownDetails, null, 2) }], details: teardownDetails }
-          }
-        }
-
-        const result = await runHerdr(args, signal, timeout)
-        const parsed = parseJsonMaybe(result.stdout)
-        const details = {
-          action: params.action,
-          argv: ['herdr', ...args],
-          exitCode: result.code,
-          killed: result.killed,
-          stdout: result.stdout,
-          stderr: result.stderr,
-          parsed,
-          ...(tabCloseInspection ? { inspection: tabCloseInspection } : {}),
-        }
-        if (taskTeardownRecord) {
-          if (result.code !== 0) {
-            const retryTask: TaskRecord = {
-              ...taskTeardownRecord,
-              cleanupStatus: 'pending',
-              cleanupUpdatedAt: new Date().toISOString(),
-              cleanupError: commandResultText(`herdr ${args.join(' ')}`, result),
-              updatedAt: new Date().toISOString(),
-            }
-            await writeTaskState(retryTask).catch(() => undefined)
-            return errorResult(commandResultText(`herdr ${args.join(' ')}`, result), { ...details, task: retryTask, tabClosed: false })
-          }
-          const [verifyTabs, verifyPanes] = await Promise.all([
-            runHerdr(['tab', 'list', '--workspace', taskTeardownRecord.workspaceId!], signal, 10_000),
-            runHerdr(['pane', 'list', '--workspace', taskTeardownRecord.workspaceId!], signal, 10_000),
-          ])
-          const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-          const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-          const endpointAbsent = endpointListsConfirmAbsence({
-            tabListSucceeded: verifyTabs.code === 0,
-            paneListSucceeded: verifyPanes.code === 0,
-            tabs: verifiedTabs,
-            panes: verifiedPanes,
-            tabId: taskTeardownRecord.tabId!,
-            paneId: taskTeardownRecord.paneId!,
-          })
-          if (!endpointAbsent) {
-            const retainedTask: TaskRecord = { ...taskTeardownRecord, cleanupStatus: 'closing', cleanupError: 'worker tab close was acknowledged but recorded tab/pane absence was not verified.', updatedAt: new Date().toISOString() }
-            await writeTaskState(retainedTask).catch(() => undefined)
-            return errorResult('worker tab close was acknowledged, but recorded worker tab and pane absence was not verified; preserving durable state and lease.', { ...details, task: retainedTask, tabClosed: false, endpointVerification: { tabs: verifyTabs, panes: verifyPanes } })
-          }
-          const leaseReturn = await returnTaskLease({ ...taskTeardownRecord, endpointStatus: 'absent_verified' })
-          if (!leaseReturn.returned) {
-            const retainedTask = { ...leaseReturn.task, cleanupStatus: 'closing' as const, cleanupError: leaseReturn.error || 'Treehouse lease return failed after worker tab close.', updatedAt: new Date().toISOString() }
-            await writeTaskState(retainedTask).catch(() => undefined)
-            return errorResult(retainedTask.cleanupError || 'Treehouse lease return failed; preserving durable state.', { ...details, task: retainedTask, tabClosed: true, leaseReturned: false, leaseReturn: leaseReturn.result })
-          }
-          taskTeardownRecord = leaseReturn.task
-          const closedTask: TaskRecord = {
-            ...taskTeardownRecord,
-            cleanupStatus: 'tab_closed',
-            leaseStatus: taskTeardownRecord.worktreeProvider === 'treehouse' ? 'returned' : taskTeardownRecord.leaseStatus,
-            cleanupUpdatedAt: new Date().toISOString(),
-            cleanupError: undefined,
-            updatedAt: new Date().toISOString(),
-          }
-          try {
-            await writeTaskState(closedTask)
-          } catch (error) {
-            return errorResult(`tab closed but durable tab-closed status could not be persisted: ${(error as Error).message}`, {
               ...details,
               task: closedTask,
               tabClosed: true,
-              cleanupRecorded: false,
+              cleanupRecorded: true,
+              idempotent: false,
               worktreePreserved: true,
-            })
+              leaseReturned: closedTask.worktreeProvider === 'treehouse' ? closedTask.leaseStatus === 'returned' : undefined,
+              leaseNotRequired: closedTask.worktreeProvider === 'herdr',
+              artifactsRemoved: artifactCleanup.removed,
+              artifactsMissing: artifactCleanup.missing,
+            }
+            return { content: [{ type: 'text' as const, text: JSON.stringify(teardownDetails, null, 2) }], details: teardownDetails }
           }
-          const artifactCleanup = await removeTaskArtifacts(closedTask.taskId, true)
-          if (!artifactCleanup.success) {
-            const retainedTask = { ...closedTask, cleanupError: `artifact cleanup failed: ${JSON.stringify(artifactCleanup.errors)}`, updatedAt: new Date().toISOString() }
-            await writeTaskState(retainedTask).catch(() => undefined)
-            return errorResult('worker tab and lease cleanup succeeded, but artifact cleanup is incomplete; durable state is retained.', { ...details, task: retainedTask, tabClosed: true, leaseReturned: true, artifactCleanup })
+          if (result.code !== 0) return errorResult(commandResultText(`herdr ${args.join(' ')}`, result), details)
+          return {
+            content: [{ type: 'text' as const, text: parsed ? JSON.stringify(parsed, null, 2) : commandResultText(`herdr ${args.join(' ')}`, result) }],
+            details,
           }
-          const teardownDetails = {
-            ...details,
-            task: closedTask,
-            tabClosed: true,
-            cleanupRecorded: true,
-            idempotent: false,
-            worktreePreserved: true,
-            leaseReturned: closedTask.worktreeProvider === 'treehouse' ? closedTask.leaseStatus === 'returned' : undefined,
-            leaseNotRequired: closedTask.worktreeProvider === 'herdr',
-            artifactsRemoved: artifactCleanup.removed,
-            artifactsMissing: artifactCleanup.missing,
-          }
-          return { content: [{ type: 'text' as const, text: JSON.stringify(teardownDetails, null, 2) }], details: teardownDetails }
-        }
-        if (result.code !== 0) return errorResult(commandResultText(`herdr ${args.join(' ')}`, result), details)
-        return {
-          content: [{ type: 'text' as const, text: parsed ? JSON.stringify(parsed, null, 2) : commandResultText(`herdr ${args.join(' ')}`, result) }],
-          details,
-        }
         } finally {
           await releaseSharedAdmission?.()
           releaseLifecycle?.()
