@@ -5,6 +5,7 @@ import type { TUI } from "@earendil-works/pi-tui";
 
 import type { SegmentContext, StatusLineSegmentId, UsageStats, SessionEvent, ThinkingLevelEvent, AssistantMessageEvent, ToolResultEvent, UserBashEvent } from "./types.js";
 import { renderSegment } from "./segments/index.js";
+import { collapseSegmentSeparators } from "./segments/layout.js";
 import { getGitStatus, invalidateGitStatus, invalidateGitBranch } from "./git-status.js";
 import { getEffectiveConfig } from "./config.js";
 import { getIcons } from "./icons.js";
@@ -31,6 +32,14 @@ function renderSegmentWithWidth(
   return { content: rendered.content, width: visibleWidth(rendered.content), visible: true };
 }
 
+/** Render visible segments, collapsing separators around hidden segments. */
+export function renderSegmentList(
+  ctx: SegmentContext,
+  segmentIds: StatusLineSegmentId[],
+): Array<{ content: string; width: number }> {
+  return collapseSegmentSeparators(segmentIds.map(id => ({ id, ...renderSegmentWithWidth(id, ctx) })));
+}
+
 /**
  * Build footer content from left and right segments.
  * Left segments are left-aligned, right segments are right-aligned.
@@ -44,23 +53,14 @@ function buildFooterContent(
   const maxContentWidth = Math.max(0, availableWidth - 2);
 
   // Render left segments
-  const leftParts: string[] = [];
-  for (const segId of leftSegments) {
-    const { content, visible } = renderSegmentWithWidth(segId, ctx);
-    if (visible) {
-      leftParts.push(content);
-    }
-  }
+  const leftParts = renderSegmentList(ctx, leftSegments).map(part => part.content);
 
   // Render right segments
-  const rightParts: string[] = [];
+  const rightRendered = renderSegmentList(ctx, rightSegments);
+  const rightParts = rightRendered.map(part => part.content);
   let rightWidth = 0;
-  for (const segId of rightSegments) {
-    const { content, width, visible } = renderSegmentWithWidth(segId, ctx);
-    if (visible) {
-      rightParts.push(content);
-      rightWidth += width + 1; // +1 for space between
-    }
+  for (const part of rightRendered) {
+    rightWidth += part.width + 1; // +1 for space between
   }
   if (rightParts.length > 0) {
     rightWidth -= 1; // Remove trailing space
