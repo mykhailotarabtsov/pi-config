@@ -319,6 +319,17 @@ export default function (pi: ExtensionAPI) {
   const trustedMcpTools = new Set<string>();
   const trustedAllMutatingTools = new Set<string>();
   let allowSafeOperationsForSession = false;
+  const permissionGateGlobal = globalThis as Record<string, unknown>;
+  const publishPermissionState = (safeOperationsEnabled: boolean) => {
+    const previousState = permissionGateGlobal.__permissionGate as { safeOperationsEnabled?: unknown } | undefined;
+    permissionGateGlobal.__permissionGate = { safeOperationsEnabled };
+    if (previousState?.safeOperationsEnabled !== safeOperationsEnabled) {
+      const requestRender = permissionGateGlobal.__footerRequestRender;
+      if (typeof requestRender === "function") requestRender();
+    }
+  };
+  publishPermissionState(false);
+
   const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
   const isFirstmateExecution = process.env.PI_FIRSTMATE_WORKER === "1";
   const isFirstmateWorker = isFirstmateExecution && !isSubagentChild;
@@ -330,6 +341,11 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("herdr:blocked", { active: false });
     }
   };
+
+  pi.on("session_start", async () => {
+    allowSafeOperationsForSession = false;
+    publishPermissionState(false);
+  });
 
   const checkBashPermission = async (command: string, cwd: string, ctx: ExtensionContext) => {
     if (isFirstmateExecution && containsGitPush(command)) {
@@ -378,6 +394,7 @@ export default function (pi: ExtensionAPI) {
 
     if (choice === "Allow safe operations for this session" && !dangerous && !sensitive && !symlinkEscape && outsideProject) {
       allowSafeOperationsForSession = true;
+      publishPermissionState(true);
       return { allowed: true as const };
     }
     if (choice === "Trust exact command for this session") {
@@ -398,6 +415,7 @@ export default function (pi: ExtensionAPI) {
         trustedMcpTools.clear();
         trustedAllMutatingTools.clear();
         allowSafeOperationsForSession = false;
+        publishPermissionState(false);
         ctx.ui.notify("Permission trust rules cleared", "info");
         return;
       }
@@ -505,6 +523,7 @@ export default function (pi: ExtensionAPI) {
 
       if (choice === "Allow safe operations for this session" && canEnableSafeOperations) {
         allowSafeOperationsForSession = true;
+        publishPermissionState(true);
         return undefined;
       }
       if (choice === "Trust this file for this session") {
@@ -563,5 +582,6 @@ export default function (pi: ExtensionAPI) {
     trustedMcpTools.clear();
     trustedAllMutatingTools.clear();
     allowSafeOperationsForSession = false;
+    publishPermissionState(false);
   });
 }

@@ -9,7 +9,9 @@
     "separator",
     "plan_mode",
     "separator",
-    "chat_mode"
+    "chat_mode",
+    "separator",
+    "permissions"
   ],
   "row2RightSegments": ["token_total", "separator", "cost"],
   "icons": {

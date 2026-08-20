@@ -50,6 +50,7 @@ export type StatusLineSegmentId =
   | "caveman"
   | "plan_mode"
   | "chat_mode"
+  | "permissions"
   | "separator"
   | `text:${string}`;
 

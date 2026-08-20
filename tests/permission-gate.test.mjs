@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import permissionGate from '../extensions/permission-gate.ts'
+import { permissionsSegment } from '../extensions/footer/segments/permissions.ts'
 
 const ENV_KEYS = ['HOME', 'PI_PERMISSION_ROOT', 'PI_SUBAGENT_CHILD', 'PI_FIRSTMATE_WORKER']
 
@@ -74,6 +75,9 @@ function createHarness() {
     },
     async permissions(args = '', context = {}) {
       return commandHandler(args, contextFor({ ...context, hasUI: true }))
+    },
+    async startSession() {
+      return handlers.get('session_start')({}, contextFor())
     },
     async shutdown() {
       return handlers.get('session_shutdown')({}, {})
@@ -277,5 +281,63 @@ test('blocks symlink escapes and global ~/.pi reads from headless subagents', as
     const headless = await headlessCall('read', path.join(globalPi, 'settings.json'), { cwd: project })
     assert.equal(headless?.block, true)
     assert.match(headless.reason, /headless subagent/)
+  })
+})
+
+test('renders permission status as guarded by default and safe when enabled', () => {
+  const previousState = globalThis.__permissionGate
+  const theme = { fg: (name, text) => `<${name}>${text}</${name}>` }
+  const context = { theme, colors: { modeIndicator: 'warning' } }
+
+  try {
+    delete globalThis.__permissionGate
+    const guarded = permissionsSegment.render(context)
+    assert.equal(guarded.visible, true)
+    assert.match(guarded.content, /Permissions:/)
+    assert.match(guarded.content, /GUARDED/)
+    assert.doesNotMatch(guarded.content, /\.env|secret|token|command|path/i)
+
+    globalThis.__permissionGate = { safeOperationsEnabled: true }
+    const safe = permissionsSegment.render(context)
+    assert.match(safe.content, /Permissions:/)
+    assert.match(safe.content, /SAFE/)
+  } finally {
+    if (previousState === undefined) delete globalThis.__permissionGate
+    else globalThis.__permissionGate = previousState
+  }
+})
+
+test('publishes permission state and rerenders on session-safe transitions', async () => {
+  await withFixture(async ({ home, project }) => {
+    const previousState = globalThis.__permissionGate
+    const previousRenderHook = globalThis.__footerRequestRender
+    let renderRequests = 0
+    globalThis.__footerRequestRender = () => { renderRequests += 1 }
+
+    try {
+      const harness = createHarness()
+      assert.deepEqual(globalThis.__permissionGate, { safeOperationsEnabled: false })
+      await harness.startSession()
+      assert.deepEqual(globalThis.__permissionGate, { safeOperationsEnabled: false })
+
+      const choice = 'Allow safe operations for this session'
+      await harness.callTool('read', { path: path.join(home, 'safe.txt') }, { cwd: project, hasUI: true, choice })
+      assert.deepEqual(globalThis.__permissionGate, { safeOperationsEnabled: true })
+      assert.equal(renderRequests, 1)
+
+      await harness.permissions('clear', { cwd: project })
+      assert.deepEqual(globalThis.__permissionGate, { safeOperationsEnabled: false })
+      assert.equal(renderRequests, 2)
+
+      await harness.callTool('read', { path: path.join(home, 'safe-again.txt') }, { cwd: project, hasUI: true, choice })
+      await harness.shutdown()
+      assert.deepEqual(globalThis.__permissionGate, { safeOperationsEnabled: false })
+      assert.equal(renderRequests, 4)
+    } finally {
+      if (previousState === undefined) delete globalThis.__permissionGate
+      else globalThis.__permissionGate = previousState
+      if (previousRenderHook === undefined) delete globalThis.__footerRequestRender
+      else globalThis.__footerRequestRender = previousRenderHook
+    }
   })
 })
