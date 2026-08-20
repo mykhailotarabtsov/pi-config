@@ -2,7 +2,8 @@ import * as path from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const PATH_TOOLS = new Set(["read", "write", "edit"]);
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+const PATH_TOOLS = new Set([...READ_ONLY_TOOLS, "write", "edit"]);
 const MUTATING_TOOLS = new Set(["write", "edit"]);
 
 // Shell operators make an otherwise harmless-looking command difficult to
@@ -42,6 +43,7 @@ const DANGEROUS_BASH = [
 // leaving ordinary project commands such as `npm test` uninterrupted.
 const COMMAND_PATH = /(?:^|\s)(~\/|\/|\.{1,2}\/)[^\s;&|`$()<>]+/g;
 const COMMAND_ASSIGNMENT_PATH = /(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=(~\/|\/|\.{1,2}\/)[^\s;&|`$()<>]+/g;
+const QUOTED_COMMAND_PATH = /(["'])((?:~\/|\/|\.{1,2}\/)[^"';&|`$()<>]+)\1/g;
 
 const SENSITIVE_FILE_NAMES = new Set([
   ".envrc",
@@ -103,7 +105,33 @@ const SENSITIVE_DIRECTORY_NAMES = new Set([
   ".docker",
   ".terraform.d",
   ".git",
+  ".env",
+  ".envs",
+  ".credentials",
+  ".keys",
+  ".secrets",
+  ".security",
+  "keychains",
 ]);
+
+const MACOS_SENSITIVE_PATH_PREFIXES = [
+  "/etc",
+  "/private/etc",
+  "/var/db",
+  "/private/var/db",
+  "/var/root",
+  "/private/var/root",
+  "/library/keychains",
+  "/system/library/keychains",
+  "/library/application support/com.apple.tcc",
+  "/private/library/application support/com.apple.tcc",
+  "/system/library/application support/com.apple.tcc",
+];
+
+const MACOS_SENSITIVE_PATH_PATTERNS = [
+  /(?:^|\/)library\/application support\/com\.apple\.tcc(?:\/|$)/,
+  /(?:^|\/)library\/keychains(?:\/|$)/,
+];
 
 const MUTATION_PROTECTED_DIRECTORY_NAMES = new Set(["node_modules"]);
 
@@ -129,6 +157,14 @@ function hasPathSegment(filePath: string, names: Set<string>): boolean {
   return filePath.replaceAll(path.sep, "/").toLowerCase().split("/").some((segment) => names.has(segment));
 }
 
+function normalizeComparisonPath(filePath: string): string {
+  return path.posix.normalize(filePath.replaceAll("\\", "/")).toLowerCase();
+}
+
+function isWithinPathPrefix(filePath: string, prefix: string): boolean {
+  return filePath === prefix || filePath.startsWith(`${prefix}/`);
+}
+
 function isSensitivePath(filePath: string): boolean {
   const candidates = [filePath];
   if (filePath !== "(unknown path)") {
@@ -136,7 +172,7 @@ function isSensitivePath(filePath: string): boolean {
     if (resolved) candidates.push(resolved);
   }
   return candidates.some((candidate) => {
-    const normalized = candidate.replaceAll(path.sep, "/").toLowerCase();
+    const normalized = normalizeComparisonPath(candidate);
     const segments = normalized.split("/");
     const basename = segments.at(-1) ?? "";
     const envFile = basename === ".env" || basename.startsWith(".env.");
@@ -150,7 +186,9 @@ function isSensitivePath(filePath: string): boolean {
       || basename.startsWith("pulumi.") && /\.(ya?ml|json)$/.test(basename)
       || SENSITIVE_FILE_SUFFIXES.some((suffix) => basename.endsWith(suffix))
       || segments.some((segment) => SENSITIVE_DIRECTORY_NAMES.has(segment))
-      || sensitiveConfigPath;
+      || sensitiveConfigPath
+      || MACOS_SENSITIVE_PATH_PREFIXES.some((prefix) => isWithinPathPrefix(normalized, prefix))
+      || MACOS_SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(normalized));
   });
 }
 
@@ -198,6 +236,16 @@ function isWithinProject(filePath: string, cwd: string): boolean {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+function isLexicallyWithin(filePath: string, root: string): boolean {
+  if (filePath === "(unknown path)") return false;
+  const relative = path.relative(path.resolve(root), path.resolve(filePath));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function isSymlinkEscape(filePath: string, boundaryRoot: string): boolean {
+  return isLexicallyWithin(filePath, boundaryRoot) && !isWithinProject(filePath, boundaryRoot);
+}
+
 function isWithinGlobalPi(filePath: string): boolean {
   const home = process.env.HOME;
   if (!home || filePath === "(unknown path)") return false;
@@ -215,30 +263,46 @@ function isWithinGlobalPi(filePath: string): boolean {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-function containsSensitivePath(command: string): boolean {
+function commandPathArguments(command: string): string[] {
+  const normalizedCommand = command.replaceAll(/["']/g, "");
+  const paths: string[] = [];
+  for (const match of command.matchAll(QUOTED_COMMAND_PATH)) paths.push(match[2]);
+  for (const match of normalizedCommand.matchAll(COMMAND_PATH)) paths.push(match[0].trim());
+  for (const match of normalizedCommand.matchAll(COMMAND_ASSIGNMENT_PATH)) {
+    paths.push(match[0].slice(match[0].indexOf("=") + 1).trim());
+  }
+  return paths;
+}
+
+function containsSensitivePath(command: string, cwd: string): boolean {
   const normalized = command.replaceAll("\\", "/").replaceAll(/["']/g, "").toLowerCase();
   const directoryPath = /(?:^|[\s/])(?:\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.terraform\.d|\.git)(?:[\s/]|$)/;
   const configPath = /(?:^|[\s/])\.config\/(?:gcloud|gh)(?:[\s/]|$)/;
   const namedSecretFile = /(?:^|[\s/])(?:credentials|secret|token|client_secret|service-account|firebase-adminsdk-)[^\s/]*(?:\.(?:json|ya?ml|txt|env|cfg|ini))(?=$|[\s/])/;
   const pulumiConfig = /(?:^|[\s/])pulumi\.[^\s/]+\.(?:ya?ml|json)(?=$|[\s/])/;
+  const sensitiveDirectory = normalized.split(/[\s/]+/).some((segment) => SENSITIVE_DIRECTORY_NAMES.has(segment));
+  const sensitivePathArgument = commandPathArguments(command).some((rawPath) =>
+    isSensitivePath(normalizePath(rawPath, cwd)),
+  );
   return SENSITIVE_COMMAND_MARKERS.some((marker) => normalized.includes(marker.toLowerCase()))
     || directoryPath.test(normalized)
+    || sensitiveDirectory
     || configPath.test(normalized)
     || namedSecretFile.test(normalized)
-    || pulumiConfig.test(normalized);
+    || pulumiConfig.test(normalized)
+    || sensitivePathArgument;
 }
 
 function containsOutOfProjectPath(command: string, cwd: string, boundaryRoot: string): boolean {
-  const normalizedCommand = command.replaceAll(/["']/g, "");
-  for (const match of normalizedCommand.matchAll(COMMAND_PATH)) {
-    const rawPath = match[0].trim();
-    if (!isWithinProject(normalizePath(rawPath, cwd), boundaryRoot)) return true;
-  }
-  for (const match of normalizedCommand.matchAll(COMMAND_ASSIGNMENT_PATH)) {
-    const rawPath = match[0].slice(match[0].indexOf("=") + 1).trim();
-    if (!isWithinProject(normalizePath(rawPath, cwd), boundaryRoot)) return true;
-  }
-  return false;
+  return commandPathArguments(command).some((rawPath) =>
+    !isWithinProject(normalizePath(rawPath, cwd), boundaryRoot),
+  );
+}
+
+function containsSymlinkEscape(command: string, cwd: string, boundaryRoot: string): boolean {
+  return commandPathArguments(command).some((rawPath) =>
+    isSymlinkEscape(normalizePath(rawPath, cwd), boundaryRoot),
+  );
 }
 
 function isDangerousBash(command: string): boolean {
@@ -254,6 +318,7 @@ export default function (pi: ExtensionAPI) {
   const trustedToolPaths = new Set<string>();
   const trustedMcpTools = new Set<string>();
   const trustedAllMutatingTools = new Set<string>();
+  let allowSafeOperationsForSession = false;
   const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
   const isFirstmateExecution = process.env.PI_FIRSTMATE_WORKER === "1";
   const isFirstmateWorker = isFirstmateExecution && !isSubagentChild;
@@ -273,11 +338,15 @@ export default function (pi: ExtensionAPI) {
     if (isFirstmateWorker) return { allowed: true as const };
 
     const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
-    const sensitive = containsSensitivePath(command);
+    const sensitive = containsSensitivePath(command, cwd);
     const dangerous = isDangerousBash(command);
     const outsideProject = containsOutOfProjectPath(command, cwd, boundaryRoot);
+    const symlinkEscape = containsSymlinkEscape(command, cwd, boundaryRoot);
     const subagentOutsideRoot = isSubagentChild && !isWithinProject(cwd, boundaryRoot);
     if (!command || (!dangerous && !sensitive && !outsideProject && !subagentOutsideRoot) || trustedExactCommands.has(command)) {
+      return { allowed: true as const };
+    }
+    if (allowSafeOperationsForSession && !dangerous && !sensitive && !symlinkEscape && !subagentOutsideRoot) {
       return { allowed: true as const };
     }
 
@@ -301,11 +370,16 @@ export default function (pi: ExtensionAPI) {
       "Unsafe Bash",
       () => ctx.ui.select(`${sensitive ? "🚨 Sensitive-path Bash command" : "⚠️ Allow unsafe Bash command"}?\n\n${command}`, [
         "Allow once",
+        ...(!dangerous && !sensitive && !symlinkEscape && outsideProject ? ["Allow safe operations for this session"] : []),
         "Trust exact command for this session",
         "Block",
       ]),
     );
 
+    if (choice === "Allow safe operations for this session" && !dangerous && !sensitive && !symlinkEscape && outsideProject) {
+      allowSafeOperationsForSession = true;
+      return { allowed: true as const };
+    }
     if (choice === "Trust exact command for this session") {
       trustedExactCommands.add(command);
       return { allowed: true as const };
@@ -323,6 +397,7 @@ export default function (pi: ExtensionAPI) {
         trustedToolPaths.clear();
         trustedMcpTools.clear();
         trustedAllMutatingTools.clear();
+        allowSafeOperationsForSession = false;
         ctx.ui.notify("Permission trust rules cleared", "info");
         return;
       }
@@ -334,8 +409,9 @@ export default function (pi: ExtensionAPI) {
         `- Trusted file tool/path pairs: ${trustedToolPaths.size}`,
         `- Trusted MCP tools: ${trustedMcpTools.size}`,
         `- Trusted all-tool entries: ${trustedAllMutatingTools.size}`,
+        `- Safe operations for this session: ${allowSafeOperationsForSession ? "enabled" : "disabled"}`,
         "",
-        "Run `/permissions clear` to clear all session trust rules.",
+        "Run `/permissions clear` to clear all session trust rules and disable safe operations.",
       ];
 
       pi.sendMessage({ customType: "permission-gate", content: lines.join("\n"), display: true });
@@ -370,29 +446,40 @@ export default function (pi: ExtensionAPI) {
 
     if (PATH_TOOLS.has(event.toolName) && !isFirstmateWorker) {
       const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
-      const filePath = normalizePath(event.input.path, ctx.cwd);
+      const rawPath = READ_ONLY_TOOLS.has(event.toolName) && event.toolName !== "read"
+        ? event.input.path ?? ctx.cwd
+        : event.input.path;
+      const filePath = normalizePath(rawPath, ctx.cwd);
       const key = `${event.toolName}:${filePath}`;
       const sensitive = isSensitivePath(filePath);
       const protectedMutation = MUTATING_TOOLS.has(event.toolName)
         && hasPathSegment(filePath, MUTATION_PROTECTED_DIRECTORY_NAMES);
       const inProject = isWithinProject(filePath, boundaryRoot);
-      const globalPiRead = event.toolName === "read"
+      const symlinkEscape = isSymlinkEscape(filePath, boundaryRoot);
+      const globalPiRead = READ_ONLY_TOOLS.has(event.toolName)
         && !isSubagentChild
         && !sensitive
         && isWithinGlobalPi(filePath);
-      const needsApproval = sensitive || protectedMutation || (!inProject && !globalPiRead);
+      const needsApproval = sensitive || protectedMutation || symlinkEscape || (!inProject && !globalPiRead);
 
-      // Ordinary project reads and edits are allowed without interruption.
+      // Ordinary project reads, searches, listings, and edits are allowed without interruption.
       // Non-sensitive global ~/.pi reads are also allowed for interactive users;
       // sensitive paths, mutations, symlink escapes, and headless access remain guarded.
       if (!needsApproval) return undefined;
+      const canEnableSafeOperations = filePath !== "(unknown path)"
+        && !sensitive
+        && !protectedMutation
+        && !symlinkEscape
+        && !inProject
+        && !globalPiRead;
+      if (allowSafeOperationsForSession && canEnableSafeOperations) return undefined;
       if (!sensitive && MUTATING_TOOLS.has(event.toolName) && trustedAllMutatingTools.has(event.toolName)) return undefined;
       if (trustedToolPaths.has(key)) return undefined;
 
       if (isSubagentChild) {
         return {
           block: true,
-          reason: sensitive || protectedMutation
+          reason: sensitive || protectedMutation || symlinkEscape
             ? `Protected path blocked for headless subagent: ${displayPath(filePath)}`
             : `Project boundary blocked for headless subagent: ${displayPath(filePath)}`,
         };
@@ -405,9 +492,10 @@ export default function (pi: ExtensionAPI) {
       const choice = await withPermissionDialog(
         "Protected path",
         () => ctx.ui.select(
-          `${sensitive || protectedMutation ? "🚨 Protected path" : "📁 Outside project"}\n\nTool: ${event.toolName}\nPath: ${displayPath(filePath)}\n\nAllow?`,
+          `${sensitive || protectedMutation || symlinkEscape ? "🚨 Protected path" : "📁 Outside project"}\n\nTool: ${event.toolName}\nPath: ${displayPath(filePath)}\n\nAllow?`,
           [
             "Allow once",
+            ...(canEnableSafeOperations ? ["Allow safe operations for this session"] : []),
             "Trust this file for this session",
             ...(MUTATING_TOOLS.has(event.toolName) ? [`Trust all ${event.toolName} calls for this session`] : []),
             "Block",
@@ -415,6 +503,10 @@ export default function (pi: ExtensionAPI) {
         ),
       );
 
+      if (choice === "Allow safe operations for this session" && canEnableSafeOperations) {
+        allowSafeOperationsForSession = true;
+        return undefined;
+      }
       if (choice === "Trust this file for this session") {
         trustedToolPaths.add(key);
         return undefined;
@@ -470,5 +562,6 @@ export default function (pi: ExtensionAPI) {
     trustedToolPaths.clear();
     trustedMcpTools.clear();
     trustedAllMutatingTools.clear();
+    allowSafeOperationsForSession = false;
   });
 }

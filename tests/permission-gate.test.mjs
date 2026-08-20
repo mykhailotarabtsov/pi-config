@@ -32,25 +32,60 @@ async function withFixture(run) {
   }
 }
 
-function createToolCall() {
-  let handler
+function createHarness() {
+  const handlers = new Map()
+  let commandHandler
+  const selections = []
+  const messages = []
   const pi = {
     events: { emit() {} },
     on(event, callback) {
-      if (event === 'tool_call') handler = callback
+      handlers.set(event, callback)
     },
-    registerCommand() {},
-    sendMessage() {},
+    registerCommand(name, command) {
+      if (name === 'permissions') commandHandler = command.handler
+    },
+    sendMessage(message) {
+      messages.push(message)
+    },
   }
   permissionGate(pi)
-  return async (toolName, filePath, context = {}) => handler(
-    { toolName, input: { path: filePath } },
-    {
+
+  function contextFor(context = {}) {
+    return {
       cwd: context.cwd,
       hasUI: context.hasUI ?? false,
-      ui: { select: async () => context.choice ?? 'Block' },
+      ui: {
+        select: async (prompt, options) => {
+          selections.push({ prompt, options })
+          return context.choice ?? 'Block'
+        },
+        notify() {},
+      },
+    }
+  }
+
+  return {
+    async callTool(toolName, input, context = {}) {
+      return handlers.get('tool_call')({ toolName, input }, contextFor(context))
     },
-  )
+    async callBash(command, context = {}) {
+      return handlers.get('user_bash')({ command, cwd: context.cwd }, contextFor(context))
+    },
+    async permissions(args = '', context = {}) {
+      return commandHandler(args, contextFor({ ...context, hasUI: true }))
+    },
+    async shutdown() {
+      return handlers.get('session_shutdown')({}, {})
+    },
+    selections,
+    messages,
+  }
+}
+
+function createToolCall() {
+  const harness = createHarness()
+  return async (toolName, filePath, context = {}) => harness.callTool(toolName, { path: filePath }, context)
 }
 
 test('allows an interactive non-sensitive read under the real global ~/.pi boundary', async () => {
@@ -71,6 +106,148 @@ test('keeps sensitive global ~/.pi reads behind the existing permission gate', a
 
     const result = await call('read', filePath, { cwd: project, hasUI: true, choice: 'Block' })
     assert.equal(result?.block, true)
+  })
+})
+
+test('allows selected safe file operations for the rest of the session', async () => {
+  await withFixture(async ({ home, project }) => {
+    const harness = createHarness()
+    const outsideFile = path.join(home, 'notes.txt')
+    const choice = 'Allow safe operations for this session'
+
+    assert.equal(await harness.callTool('read', { path: outsideFile }, { cwd: project, hasUI: true, choice }), undefined)
+    assert.ok(harness.selections[0].options.includes(choice))
+    assert.equal(await harness.callTool('write', { path: path.join(home, 'write.txt') }, { cwd: project }), undefined)
+    assert.equal(await harness.callTool('edit', { path: path.join(home, 'edit.txt') }, { cwd: project }), undefined)
+    for (const toolName of ['grep', 'find', 'ls']) {
+      assert.equal(await harness.callTool(toolName, { path: outsideFile }, { cwd: project }), undefined)
+    }
+
+    await harness.permissions('', { cwd: project })
+    assert.match(harness.messages.at(-1).content, /Safe operations for this session: enabled/)
+  })
+})
+
+test('allows selected safe Bash outside the project but keeps sensitive and dangerous requests guarded', async () => {
+  await withFixture(async ({ home, project }) => {
+    const harness = createHarness()
+    const choice = 'Allow safe operations for this session'
+    const outsideCommand = `cat ${path.join(home, 'notes.txt')}`
+
+    assert.equal(await harness.callBash(outsideCommand, { cwd: project, hasUI: true, choice }), undefined)
+    assert.ok(harness.selections[0].options.includes(choice))
+    assert.equal(await harness.callBash(`cat ${path.join(home, 'other.txt')}`, { cwd: project }), undefined)
+
+    const sensitive = await harness.callBash(`cat ${path.join(home, 'Library', 'Keychains', 'login.keychain-db')}`, { cwd: project })
+    assert.ok(sensitive?.result)
+    assert.match(sensitive.result.output, /sensitive/)
+
+    const dangerous = await harness.callBash(`rm -rf ${path.join(home, 'destroy-me')}`, { cwd: project, hasUI: true, choice })
+    assert.ok(dangerous?.result)
+    assert.ok(!harness.selections.at(-1).options.includes(choice))
+  })
+})
+
+test('safe mode keeps system-security file reads guarded without offering safe mode', async () => {
+  await withFixture(async ({ home, project }) => {
+    const harness = createHarness()
+    const choice = 'Allow safe operations for this session'
+    await harness.callTool('read', { path: path.join(home, 'notes.txt') }, { cwd: project, hasUI: true, choice })
+
+    const directPaths = [
+      '/etc/passwd',
+      '/private/etc/sudoers',
+      '/private/var/db/dslocal/nodes/Default/users/root.plist',
+      '/var/root/.ssh/authorized_keys',
+      '/Library/Keychains/System.keychain',
+      path.join(home, 'Library', 'Application Support', 'com.apple.TCC', 'TCC.db'),
+    ]
+    for (const filePath of directPaths) {
+      const result = await harness.callTool('read', { path: filePath }, { cwd: project, hasUI: true, choice })
+      assert.equal(result?.block, true, `${filePath} should remain guarded`)
+      assert.ok(!harness.selections.at(-1).options.includes(choice), `${filePath} must not offer safe mode`)
+    }
+
+    for (const toolName of ['grep', 'find', 'ls']) {
+      for (const filePath of directPaths) {
+        const result = await harness.callTool(toolName, { path: filePath }, { cwd: project, hasUI: true, choice })
+        assert.equal(result?.block, true, `${toolName} ${filePath} should remain guarded`)
+        assert.ok(!harness.selections.at(-1).options.includes(choice), `${toolName} ${filePath} must not offer safe mode`)
+      }
+    }
+
+    const bashPaths = [
+      '/etc/passwd',
+      '/private/etc/ssh/ssh_config',
+      '/private/var/db/dslocal/nodes/Default/users/root.plist',
+      '/var/root/.ssh/authorized_keys',
+      '/Library/Keychains/System.keychain',
+      path.join(home, 'Library', 'Application Support', 'com.apple.TCC', 'TCC.db'),
+    ]
+    for (const filePath of bashPaths) {
+      const result = await harness.callBash(`cat '${filePath}'`, { cwd: project, hasUI: true, choice })
+      assert.ok(result?.result, `${filePath} should remain guarded in Bash`)
+      assert.match(harness.selections.at(-1).prompt, /Sensitive-path Bash command/)
+      assert.ok(!harness.selections.at(-1).options.includes(choice), `${filePath} must not offer safe mode in Bash`)
+    }
+
+    for (const command of [
+      "grep passwd '/etc/passwd'",
+      "find '/private/etc' -name passwd",
+      "ls '/private/var/db'",
+    ]) {
+      const result = await harness.callBash(command, { cwd: project, hasUI: true, choice })
+      assert.ok(result?.result, `${command} should remain guarded in Bash`)
+      assert.match(harness.selections.at(-1).prompt, /Sensitive-path Bash command/)
+      assert.ok(!harness.selections.at(-1).options.includes(choice), `${command} must not offer safe mode`)
+    }
+  })
+})
+
+test('defaults omitted grep/find/ls paths to the current project directory', async () => {
+  await withFixture(async ({ project }) => {
+    const harness = createHarness()
+    for (const toolName of ['grep', 'find', 'ls']) {
+      assert.equal(await harness.callTool(toolName, {}, { cwd: project }), undefined)
+    }
+  })
+})
+
+test('safe mode does not allow node_modules mutations or symlink escapes', async () => {
+  await withFixture(async ({ home, project }) => {
+    const outside = path.join(home, 'outside')
+    await mkdir(outside)
+    await writeFile(path.join(outside, 'outside.txt'), 'outside')
+    await symlink(outside, path.join(project, 'escape'))
+    const harness = createHarness()
+    const choice = 'Allow safe operations for this session'
+
+    assert.equal(await harness.callTool('read', { path: path.join(home, 'seed.txt') }, { cwd: project, hasUI: true, choice }), undefined)
+    const nodeModules = await harness.callTool('write', { path: path.join(home, 'node_modules', 'package', 'index.js') }, { cwd: project })
+    assert.equal(nodeModules?.block, true)
+    const escaped = await harness.callTool('read', { path: path.join(project, 'escape', 'outside.txt') }, { cwd: project })
+    assert.equal(escaped?.block, true)
+    const escapedBash = await harness.callBash(`cat ${path.join(project, 'escape', 'outside.txt')}`, { cwd: project })
+    assert.ok(escapedBash?.result)
+  })
+})
+
+test('permissions clear and session shutdown reset safe operations', async () => {
+  await withFixture(async ({ home, project }) => {
+    const choice = 'Allow safe operations for this session'
+    const harness = createHarness()
+    await harness.callTool('read', { path: path.join(home, 'seed.txt') }, { cwd: project, hasUI: true, choice })
+    await harness.permissions('clear', { cwd: project })
+    const afterClear = await harness.callTool('read', { path: path.join(home, 'after-clear.txt') }, { cwd: project })
+    assert.equal(afterClear?.block, true)
+    await harness.callTool('read', { path: path.join(home, 're-enable.txt') }, { cwd: project, hasUI: true, choice })
+    await harness.shutdown()
+    const afterShutdown = await harness.callTool('read', { path: path.join(home, 'after-shutdown.txt') }, { cwd: project })
+    assert.equal(afterShutdown?.block, true)
+
+    const statusHarness = createHarness()
+    await statusHarness.permissions('', { cwd: project })
+    assert.match(statusHarness.messages.at(-1).content, /Safe operations for this session: disabled/)
   })
 })
 

@@ -52,6 +52,12 @@ For multi-step tasks, state a brief plan:
 3. [Step] → verify: [check]
 ```
 
+## Commit titles and change summaries
+
+- When a user asks for a commit message or title, use Conventional Commits format: `<type>(<optional scope>): <imperative summary>`. Keep the subject concise and do not end it with a period.
+- A title-only request does not require a body and must not be treated as a request to create a commit. Create a full commit only when the user explicitly asks for one, following the applicable commit workflow.
+- After making actual changes in a normal session, include a clearly labeled `Proposed Conventional Commit title:` in the final summary.
+
 ## 5. Visual Output → Artifacts
 
 Keep visual or long output clear and concise. When output is inherently visual or

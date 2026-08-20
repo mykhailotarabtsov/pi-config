@@ -191,7 +191,7 @@ mcp-cache.json / mcp-npx-cache.json  # Caches
 | `extensions/chat-input/` | Boxed, theme-aware chat editor with native history, autocomplete, and paste support. |
 | `extensions/spinners/` | Animated working verbs with elapsed-time and token status. |
 | `extensions/startup/` | Startup dashboard showing loaded resources and keyboard shortcuts. |
-| `extensions/permission-gate.ts` | Allows ordinary in-project work and non-sensitive reads under the current user’s global `~/.pi` while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Use `/permissions clear` to reset session trust. |
+| `extensions/permission-gate.ts` | Allows ordinary in-project work and non-sensitive reads under the current user’s global `~/.pi` while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Outside-project non-sensitive file operations and Bash can opt into `Allow safe operations for this session`; `/permissions` shows the status and `/permissions clear` resets it. |
 | `extensions/subagent/` | Registers the `subagent` tool for single, parallel, and chained delegation to `agents/*.md`. |
 | `extensions/fun-working-message.ts.disabled` | Disabled because the Pikit spinners extension provides the working status without competing timers. |
 

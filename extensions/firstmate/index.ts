@@ -65,7 +65,7 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 - \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
 - Inspect enough context before delegation, ask focused clarification for ambiguity, create one visible tab per worker without taking focus, and reconcile the structured worker report before claiming completion.
 - Shared tasks stay in the requested checkout and never use task_deliver. Worktree tasks use Treehouse leases, require task_deliver before task_teardown, and are never auto-closed or auto-merged. Herdr 0.7.5 has no native agent stop command; task_abort/task_recover use explicit pane close only with force and verify endpoint absence before lease recovery.
-- Keep the captain's focus here and report only verified outcomes, files, tests, validation, reconciliation evidence, and blockers.
+- Keep the captain's focus here and report only verified outcomes, files, tests, validation, reconciliation evidence, and blockers. Failed/blocked shared reports may close only an exact idle/done worker tab after absence verification; never force-close an active/hung worker. Treehouse leases and worker changes are never auto-returned or discarded.
 `.trim()
 
 const HerdrControlParams = Type.Object({
@@ -402,7 +402,7 @@ async function acquireSharedAdmissionLock(project: string): Promise<{ release: (
     try {
       await fs.promises.mkdir(lockPath, 0o700)
       try {
-        await fs.promises.writeFile(ownerPath, `${JSON.stringify(record, null, 2)}\\n`, { encoding: 'utf8', mode: 0o600 })
+        await fs.promises.writeFile(ownerPath, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
       } catch (error) {
         await fs.promises.rm(lockPath, { recursive: true, force: true }).catch(() => undefined)
         throw error
@@ -766,8 +766,22 @@ export default function firstmate(pi: ExtensionAPI) {
       workerKind: task.workerKind,
       visibility: watcherMissingEndpoints.has(task.taskId) ? 'missing' : task.cleanupStatus === 'tab_closed' ? 'closed' : 'recorded',
     }))
-    const active = records.filter((record) => record.status !== 'failed' && record.cleanupStatus !== 'tab_closed' && record.reportStatus !== 'completed' && record.reportStatus !== 'failed')
-    const stale = records.filter((record) => record.status === 'failed' || record.cleanupStatus === 'closing' || (record.reportStatus === 'completed' && record.cleanupStatus !== 'tab_closed'))
+    const active = records.filter(
+      (record) =>
+        record.status !== 'failed' &&
+        record.cleanupStatus !== 'tab_closed' &&
+        record.reportStatus !== 'completed' &&
+        record.reportStatus !== 'blocked' &&
+        record.reportStatus !== 'failed',
+    )
+    const stale = records.filter(
+      (record) =>
+        record.status === 'failed' ||
+        record.cleanupStatus === 'pending' ||
+        record.cleanupStatus === 'closing' ||
+        ((record.reportStatus === 'failed' || record.reportStatus === 'blocked') && record.cleanupStatus !== 'tab_closed') ||
+        (record.reportStatus === 'completed' && record.cleanupStatus !== 'tab_closed'),
+    )
     const missing = records.filter((record) => record.visibility === 'missing')
     return { total: records.length, active, stale, missing, records }
   }
@@ -907,7 +921,7 @@ export default function firstmate(pi: ExtensionAPI) {
   function notifyWatcher(message: string): boolean {
     if (!watcherRunning) return false
     try {
-      pi.sendUserMessage(message, { deliverAs: 'followUp' })
+      pi.sendUserMessage(message, { deliverAs: 'steer' })
       return true
     } catch (error) {
       watcherLastError = `notification failed: ${(error as Error).message}`
@@ -1136,14 +1150,14 @@ export default function firstmate(pi: ExtensionAPI) {
       name: 'herdr_control',
       label: 'Herdr Control',
       description:
-        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
-      promptSnippet: 'Coordinate visible Herdr worker tabs and agents: create/start/prompt/wait/read, explicitly close reconciled workers',
+        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded failed/blocked shared cleanup, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
+      promptSnippet: 'Coordinate visible Herdr worker tabs and agents: create/start/prompt/wait/read, safely reconcile reports, and explicitly recover unsafe workers',
       promptGuidelines: [
         'Use herdr_control as the only coordination tool in this firstmate pane; use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, write, or subagent. Delegate mutations and required commands through worker panes.',
         'Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. One visible worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Inspect narrow one-file questions directly when that is simpler.',
         'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion.',
         'Use task_create with the current session isolation mode, one visible tab per worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
-        'Workers and their subagents must not push, publish, use MCP, or commit without explicit captain authorization. Do not auto-close or auto-merge; report only verified outcomes and preserve unrelated changes.',
+        'Workers and their subagents must not push, publish, use MCP, or commit without explicit captain authorization. Failed/blocked shared reports may use only the guarded exact idle/done tab cleanup; never force-close active/hung workers. Never auto-return or discard Treehouse leases; report only verified outcomes and preserve unrelated changes.',
       ],
       parameters: HerdrControlParams,
       renderCall(_args, theme, context) {
@@ -1321,6 +1335,162 @@ export default function firstmate(pi: ExtensionAPI) {
             }
             return { removed, missing, errors, success: errors.length === 0 }
           }
+          const reconcileFailedSharedTask = async (
+            task: TaskRecord,
+            outcome: 'blocked' | 'failed',
+          ): Promise<{ task: TaskRecord; cleaned: boolean; artifacts?: { removed: string[]; missing: string[]; errors: Array<{ path: string; error: string }>; success: boolean }; guidance: string }> => {
+            const preserve = async (message: string, endpointStatus: EndpointAbsenceStatus = task.endpointStatus || 'unverified') => {
+              const pendingTask: TaskRecord = {
+                ...task,
+                status: task.worktreeProvider === 'herdr' ? 'failed' : task.status,
+                cleanupStatus: 'pending',
+                cleanupUpdatedAt: new Date().toISOString(),
+                cleanupError: message,
+                endpointStatus,
+                error: message,
+                updatedAt: new Date().toISOString(),
+              }
+              await writeTaskState(pendingTask).catch(() => undefined)
+              return {
+                task: pendingTask,
+                cleaned: false,
+                guidance:
+                  task.worktreeProvider === 'treehouse'
+                    ? 'Treehouse lease and worker changes were preserved. Resolve the worker or explicitly run task_abort/task_recover with force:true and discard:true to destructively return the lease.'
+                    : 'Worker tab was not closed automatically. Inspect the durable record, then explicitly run task_abort/task_recover; use force:true only for intentional active/hung-worker recovery.',
+              }
+            }
+
+            if (task.worktreeProvider !== 'herdr') {
+              return await preserve(
+                `reconciled ${outcome} report; automatic cleanup does not return Treehouse leases or discard worker changes.`,
+                task.endpointStatus || 'recorded',
+              )
+            }
+            if (
+              typeof task.workspaceId !== 'string' ||
+              !WORKSPACE_ID_RE.test(task.workspaceId) ||
+              typeof task.tabId !== 'string' ||
+              !TAB_ID_RE.test(task.tabId) ||
+              typeof task.paneId !== 'string' ||
+              !PANE_ID_RE.test(task.paneId) ||
+              typeof task.workerName !== 'string' ||
+              !AGENT_NAME_RE.test(task.workerName) ||
+              task.workerName === FIRSTMATE_NAME ||
+              typeof task.workerKind !== 'string' ||
+              !AGENT_KIND_RE.test(task.workerKind)
+            ) {
+              return await preserve('automatic shared-task cleanup requires a complete exact recorded worker endpoint.', 'unverified')
+            }
+
+            const currentPaneId = process.env.HERDR_PANE_ID
+            if (!currentPaneId || !PANE_ID_RE.test(currentPaneId)) return await preserve('automatic shared-task cleanup could not verify the current firstmate pane.', 'unverified')
+            const currentPaneResult = await runHerdr(['pane', 'get', currentPaneId], signal, 10_000)
+            const currentPane = (parseJsonMaybe(currentPaneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+            if (
+              currentPaneResult.code !== 0 ||
+              !currentPane ||
+              currentPane.pane_id !== currentPaneId ||
+              currentPane.workspace_id !== task.workspaceId ||
+              currentPane.tab_id === task.tabId
+            ) {
+              return await preserve('automatic shared-task cleanup could not establish a distinct current firstmate pane.', 'unverified')
+            }
+
+            const [tabResult, paneResult, agentResult] = await Promise.all([
+              runHerdr(['tab', 'get', task.tabId], signal, 10_000),
+              runHerdr(['pane', 'get', task.paneId], signal, 10_000),
+              runHerdr(['agent', 'get', task.paneId], signal, 10_000),
+            ])
+            const tab = (parseJsonMaybe(tabResult.stdout) as { result?: { tab?: Record<string, unknown> } } | undefined)?.result?.tab
+            const pane = (parseJsonMaybe(paneResult.stdout) as { result?: { pane?: Record<string, unknown> } } | undefined)?.result?.pane
+            const agent = (parseJsonMaybe(agentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+            const exactEndpoint =
+              tabResult.code === 0 &&
+              !!tab &&
+              tab.tab_id === task.tabId &&
+              tab.workspace_id === task.workspaceId &&
+              tab.pane_count === 1 &&
+              paneResult.code === 0 &&
+              !!pane &&
+              pane.pane_id === task.paneId &&
+              pane.tab_id === task.tabId &&
+              pane.workspace_id === task.workspaceId &&
+              agentResult.code === 0 &&
+              hasExactWorkerIdentity(
+                { workspaceId: task.workspaceId, tabId: task.tabId, paneId: task.paneId, workerName: task.workerName, workerKind: task.workerKind },
+                agent,
+              )
+            if (!exactEndpoint) return await preserve('automatic shared-task cleanup could not verify the exact recorded worker endpoint.', 'unverified')
+
+            const statuses = {
+              tab: typeof tab.agent_status === 'string' ? tab.agent_status : 'unknown',
+              pane: typeof pane.agent_status === 'string' ? pane.agent_status : 'unknown',
+              agent: typeof agent?.agent_status === 'string' ? agent.agent_status : 'unknown',
+            }
+            const unsafeStatus = Object.entries(statuses).find(([, status]) => status !== 'idle' && status !== 'done')
+            if (unsafeStatus) {
+              return await preserve(
+                `automatic shared-task cleanup refused because ${unsafeStatus[0]} worker status is ${unsafeStatus[1]}; no force close was attempted.`,
+                'recorded',
+              )
+            }
+
+            const closeResult = await runHerdr(['tab', 'close', task.tabId], signal, 10_000)
+            if (closeResult.code !== 0) return await preserve(commandResultText('herdr tab close (failed-report cleanup)', closeResult), 'recorded')
+            const [verifyTabs, verifyPanes] = await Promise.all([
+              runHerdr(['tab', 'list', '--workspace', task.workspaceId], signal, 10_000),
+              runHerdr(['pane', 'list', '--workspace', task.workspaceId], signal, 10_000),
+            ])
+            const verifiedTabs = (parseJsonMaybe(verifyTabs.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+            const verifiedPanes = (parseJsonMaybe(verifyPanes.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+            if (
+              !endpointListsConfirmAbsence({
+                tabListSucceeded: verifyTabs.code === 0,
+                paneListSucceeded: verifyPanes.code === 0,
+                tabs: verifiedTabs,
+                panes: verifiedPanes,
+                tabId: task.tabId,
+                paneId: task.paneId,
+              })
+            ) {
+              return await preserve('worker tab close was acknowledged, but exact tab and pane absence was not verified.', 'recorded')
+            }
+
+            const terminalTask: TaskRecord = {
+              ...task,
+              status: 'failed',
+              cleanupStatus: 'tab_closed',
+              endpointStatus: 'absent_verified',
+              cleanupUpdatedAt: new Date().toISOString(),
+              cleanupError: undefined,
+              error: `reconciled ${outcome} report; exact idle/done worker tab was safely closed.`,
+              updatedAt: new Date().toISOString(),
+            }
+            try {
+              await writeTaskState(terminalTask)
+            } catch (error) {
+              return await preserve(`worker tab was absent after cleanup, but terminal state could not be persisted: ${(error as Error).message}`, 'absent_verified')
+            }
+            const artifacts = await removeTaskArtifacts(task.taskId, false)
+            if (!artifacts.success) {
+              const retainedTask = { ...terminalTask, cleanupError: `task artifact cleanup failed: ${JSON.stringify(artifacts.errors)}`, updatedAt: new Date().toISOString() }
+              await writeTaskState(retainedTask).catch(() => undefined)
+              return {
+                task: retainedTask,
+                cleaned: false,
+                artifacts,
+                guidance: 'Worker tab cleanup was verified, but exact task artifact cleanup is incomplete; retry explicit recovery/cleanup while preserving the durable task record.',
+              }
+            }
+            return {
+              task: terminalTask,
+              cleaned: true,
+              artifacts,
+              guidance: 'Exact idle/done worker tab closure and endpoint absence were verified; the durable terminal task record was retained and only exact task artifacts were removed.',
+            }
+          }
+
           const returnTaskLease = async (task: TaskRecord): Promise<{ returned: boolean; idempotent?: boolean; task: TaskRecord; error?: string; result?: Record<string, unknown> }> => {
             if (task.worktreeProvider !== 'treehouse') return { returned: true, idempotent: true, task }
             if (isPendingLeaseNoop(task.leaseStatus)) return { returned: true, idempotent: true, task }
@@ -1518,10 +1688,20 @@ export default function firstmate(pi: ExtensionAPI) {
                   (record) =>
                     record.project === project &&
                     record.worktreeProvider === 'herdr' &&
-                    record.cleanupStatus !== 'tab_closed' &&
-                    (record.status !== 'failed' || record.endpointStatus === 'unverified'),
+                    record.cleanupStatus !== 'tab_closed',
                 )
                 for (const sharedTask of sharedTasks) {
+                  if (
+                    sharedTask.cleanupStatus === 'pending' &&
+                    (sharedTask.reportStatus === 'failed' || sharedTask.reportStatus === 'blocked')
+                  ) {
+                    return errorResult('a failed or blocked shared task still requires explicit task_abort/task_recover; automatic cleanup was unsafe or incomplete and the durable record is preserved.', {
+                      action: params.action,
+                      project,
+                      activeTaskId: sharedTask.taskId,
+                      task: sharedTask,
+                    })
+                  }
                   if (sharedTask.status === 'provisioning' && !sharedTask.tabId && !sharedTask.paneId) {
                     if (!canDeleteWithoutRecordedEndpoint(sharedTask.endpointStatus)) {
                       return errorResult('unstarted shared task has no verified endpoint absence; preserving the durable record for explicit recovery.', {
@@ -2037,6 +2217,11 @@ export default function firstmate(pi: ExtensionAPI) {
               if (task.reportPath !== reportPath) {
                 return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath: taskFilePath(taskId), expectedReportPath: reportPath, task })
               }
+              if (task.status === 'failed' && task.cleanupStatus === 'tab_closed' && (task.reportStatus === 'failed' || task.reportStatus === 'blocked')) {
+                const guidance = 'This failed/blocked task already has verified terminal worker cleanup. Use task_abort/task_recover only to finish any retained exact artifacts; no task_teardown is required.'
+                const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: true, task, nextAction: guidance }
+                return errorResult(`worker report outcome is ${task.reportOutcome || task.reportStatus}; task is not complete. ${guidance}`, details)
+              }
 
               let reportText: string
               try {
@@ -2115,8 +2300,28 @@ export default function firstmate(pi: ExtensionAPI) {
                 })
               }
 
-              const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: report.outcome === 'completed', reconciled: true, task: reconciledTask, report }
-              if (report.outcome !== 'completed') return errorResult(`worker report outcome is ${report.outcome}; task is not complete.`, details)
+              if (report.outcome !== 'completed') {
+                const cleanup = await reconcileFailedSharedTask(reconciledTask, report.outcome)
+                const failedDetails = {
+                  action: params.action,
+                  taskId,
+                  taskPath: taskFilePath(taskId),
+                  reportPath,
+                  complete: false,
+                  reconciled: true,
+                  task: cleanup.task,
+                  report,
+                  cleanup: {
+                    attempted: cleanup.task.worktreeProvider === 'herdr',
+                    cleaned: cleanup.cleaned,
+                    artifacts: cleanup.artifacts,
+                    guidance: cleanup.guidance,
+                  },
+                  nextAction: cleanup.guidance,
+                }
+                return errorResult(`worker report outcome is ${report.outcome}; task is not complete. ${cleanup.guidance}`, failedDetails)
+              }
+              const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: true, reconciled: true, task: reconciledTask, report }
               return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
             }
             case 'task_deliver': {
