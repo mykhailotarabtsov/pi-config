@@ -32,7 +32,7 @@ const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
-const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'mcp', 'herdr_control', 'artifact']
+const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact']
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID_RE = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
@@ -59,8 +59,8 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 
 ## Runtime safety delta
 
-- This pane is coordination-only: use read, grep, find, and ls for read-only inspection, mcp for approved external coordination lookups, and herdr_control for coordination; artifact is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, write, delete, or subagent; delegate mutations and required commands through worker panes.
-- Preserve unrelated changes and keep worker changes surgical. Workers and their subagents must never push, publish, use MCP, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies.
+- This pane is coordination-only: use read, grep, find, and ls for read-only inspection, use subagent for specialized delegated work, and use herdr_control for implementation-worker coordination; never call mcp directly. The artifact tool is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, or write; delegate mutations through worker panes.
+- Preserve unrelated changes and keep worker changes surgical. Workers must never push, publish, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies. The browser-tester subagent is the sole MCP-capable delegate and may use MCP only for browser QA; it must never automate sign-in or handle credentials.
 - Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Narrow one-file questions may be inspected directly.
 - \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
 - Inspect enough context before delegation, ask focused clarification for ambiguity, create one visible tab per worker without taking focus, and reconcile the structured worker report before claiming completion.
@@ -70,6 +70,7 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 ## Captain-facing output discipline
 
 - Do not narrate internal inspection, commands, tool arguments, endpoint checks, or durable paths.
+- Use \`subagent\` with \`agent: "browser-tester"\` for browser QA; Firstmate itself must never call \`mcp\`.
 - After \`task_create\`, give only a concise confirmation that the worker started and is working.
 - Do not poll or read worker scrollback for routine progress; watcher notifications and the structured report are the source of truth.
 - After \`task_reconcile\`, show only the worker report: summary, changed files, tests, validation, and blockers. Keep errors and blockers concise.
@@ -1190,14 +1191,15 @@ export default function firstmate(pi: ExtensionAPI) {
       name: 'herdr_control',
       label: 'Herdr Control',
       description:
-        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded failed/blocked shared cleanup, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
+        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded failed/blocked shared cleanup, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Use subagent for specialized delegated work such as browser-tester; Firstmate itself never calls MCP. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
       promptSnippet: 'Coordinate visible Herdr worker tabs and agents: create/start/prompt/wait/read, safely reconcile reports, and explicitly recover unsafe workers',
       promptGuidelines: [
-        'Use herdr_control as the only coordination tool in this firstmate pane; use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, write, or subagent. Delegate mutations and required commands through worker panes.',
-        'Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. One visible worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Inspect narrow one-file questions directly when that is simpler.',
+        'Use herdr_control for implementation-worker coordination and subagent for specialized delegated work; Firstmate must never call mcp. Use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, or write. Delegate mutations through worker panes.',
+        'Use subagent with agent: "browser-tester" for browser QA. That delegate may use MCP for browser interaction, but sign-in must always be performed manually by the captain; never automate credentials or authentication.',
+        'Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. One visible implementation worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Inspect narrow one-file questions directly when that is simpler.',
         'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion.',
-        'Use task_create with the current session isolation mode, one visible tab per worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
-        'Workers and their subagents must not push, publish, use MCP, or commit without explicit captain authorization. Failed/blocked shared reports may use only the guarded exact idle/done tab cleanup; never force-close active/hung workers. Never auto-return or discard Treehouse leases; report only verified outcomes and preserve unrelated changes.',
+        'Use task_create with the current session isolation mode, one visible tab per implementation worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
+        'Implementation workers and their subagents must not push, publish, or commit without explicit captain authorization. The browser-tester delegate may use MCP only for browser QA and must report when manual sign-in is required. Failed/blocked shared reports may use only the guarded exact idle/done tab cleanup; never force-close active/hung workers. Never auto-return or discard Treehouse leases; report only verified outcomes and preserve unrelated changes.',
       ],
       parameters: HerdrControlParams,
       renderCall(_args, theme, context) {
@@ -3740,7 +3742,7 @@ export default function firstmate(pi: ExtensionAPI) {
         block: true,
         terminate: true,
         reason:
-          'Firstmate is coordination-only: only read, grep, find, ls, mcp, herdr_control, and artifact are active; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.',
+          'Firstmate is coordination-only: only read, grep, find, ls, subagent, herdr_control, and artifact are active; Firstmate never calls mcp. The browser-tester delegate may use MCP for browser QA; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.'
       }
     }
   })

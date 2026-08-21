@@ -107,8 +107,9 @@ new spinners extension.
 ## Herdr Firstmate workflow
 
 The `extensions/firstmate/` extension is auto-discovered by Pi. It is active only
-inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane coordinates work,
-while each worker runs as a visible worker tab.
+inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane acts as the staff
+engineer, communicates with the captain, and delegates implementation work to
+visible workers. It delegates browser QA to the `browser-tester` agent.
 
 Firstmate uses a session-scoped worker isolation mode. The default is `shared`,
 which starts the worker in the requested project checkout. For broad codebase
@@ -145,9 +146,11 @@ be repeated. `task_teardown` verifies the exact task identity, closes the exact
 worker tab, and returns the Treehouse lease when applicable. Do not manually close
 worker tabs before cleanup.
 
-Firstmate workers and their subagents cannot push or publish remote changes. The
-permission gate hard-blocks `git push`, blocks MCP calls that could bypass this
-rule, and Firstmate rejects push commands sent through `pane_run`.
+Firstmate itself never calls MCP. The `browser-tester` agent may use the configured
+browser MCP server for QA, but sign-in is always performed manually by the captain;
+the agent must never automate credentials. Implementation workers and their
+subagents cannot push or publish remote changes. The permission gate hard-blocks
+`git push`, and Firstmate rejects push commands sent through `pane_run`.
 
 Firstmate is inspired by [firstmate](https://github.com/kunchenguid/firstmate),
 but this configuration ports only local-only delivery and teardown behavior,

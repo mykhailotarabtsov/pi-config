@@ -331,6 +331,7 @@ export default function (pi: ExtensionAPI) {
   publishPermissionState(false);
 
   const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
+  const isBrowserTesterSubagent = isSubagentChild && process.env.PI_SUBAGENT_AGENT === "browser-tester";
   const isFirstmateExecution = process.env.PI_FIRSTMATE_WORKER === "1";
   const isFirstmateWorker = isFirstmateExecution && !isSubagentChild;
   const withPermissionDialog = async <T>(label: string, dialog: () => Promise<T>): Promise<T> => {
@@ -450,10 +451,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (process.env.PI_FIRSTMATE_ACTIVE === "1" && event.toolName === "subagent") {
-      return { block: true, terminate: true, reason: "Firstmate delegates implementation work through visible Herdr worker tabs via herdr_control" };
-    }
-
     // Subagents run in headless `pi --mode json -p --no-session` child processes.
     // They cannot answer UI permission prompts, so allow normal work only inside
     // the parent project and block sensitive or out-of-boundary operations.
@@ -538,9 +535,15 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: "Blocked by permission gate" };
     }
 
-    if (isFirstmateExecution && event.toolName === "mcp") {
-      return { block: true, reason: "MCP calls are blocked for Firstmate workers and their subagents" };
+    if (process.env.PI_FIRSTMATE_ACTIVE === "1" && event.toolName === "mcp") {
+      return { block: true, reason: "Firstmate delegates MCP browser work to the browser-tester agent" };
     }
+
+    if (isFirstmateExecution && event.toolName === "mcp") {
+      return { block: true, reason: "MCP calls are blocked for Firstmate implementation workers" };
+    }
+
+    if (isBrowserTesterSubagent && event.toolName === "mcp") return undefined;
 
     if (!isFirstmateWorker && event.toolName === "mcp" && event.input.tool) {
       const server = String(event.input.server ?? "");

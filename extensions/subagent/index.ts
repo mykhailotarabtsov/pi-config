@@ -206,12 +206,13 @@ export function truncateChainHandoff(output: string): string {
 	return `${output.slice(0, headLength)}${CHAIN_HANDOFF_TRUNCATION_MARKER}${output.slice(-tailLength)}`;
 }
 
-export function createSubagentEnvironment(defaultCwd: string): NodeJS.ProcessEnv {
+export function createSubagentEnvironment(defaultCwd: string, agentName?: string): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	for (const key of Object.keys(env)) {
 		if (key.startsWith("HERDR_") || key.startsWith("PI_FIRSTMATE_")) delete env[key];
 	}
 	env.PI_SUBAGENT_CHILD = "1";
+	if (agentName) env.PI_SUBAGENT_AGENT = agentName;
 	env.PI_PERMISSION_ROOT = process.env.PI_PERMISSION_ROOT ?? path.resolve(defaultCwd);
 	return env;
 }
@@ -366,7 +367,7 @@ async function runSingleAgent(
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
-				env: createSubagentEnvironment(defaultCwd),
+				env: createSubagentEnvironment(defaultCwd, agent.name),
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -542,14 +543,6 @@ export default function (pi: ExtensionAPI) {
 					projectAgentsDir: discovery.projectAgentsDir,
 					results,
 				});
-
-			if (process.env.PI_FIRSTMATE_ACTIVE === "1") {
-				return {
-					content: [{ type: "text", text: "Blocked: Firstmate delegates implementation work through visible Herdr worker tabs via herdr_control." }],
-					details: makeDetails("single")([]),
-					isError: true,
-				};
-			}
 
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
@@ -762,7 +755,15 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		renderCall(args, theme, _context) {
+		renderCall(args, theme, context) {
+			if (process.env.PI_FIRSTMATE_ACTIVE === "1") {
+				const delegatedAgents = args.agent
+					?? args.tasks?.map((task) => task.agent).join(", ")
+					?? args.chain?.map((step) => step.agent).join(", ")
+					?? "specialist";
+				const marker = context.isPartial ? theme.fg("warning", "⏳") : theme.fg("accent", "▶");
+				return new Text(`${marker} ${delegatedAgents} working`, 0, 0);
+			}
 			const scope: AgentScope = args.agentScope ?? "user";
 			if (args.chain && args.chain.length > 0) {
 				let text =
@@ -807,6 +808,16 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { expanded }, theme, _context) {
+			if (process.env.PI_FIRSTMATE_ACTIVE === "1") {
+				const details = result.details as SubagentDetails | undefined;
+				const failed = details?.results.some(isFailedResult) ?? false;
+				const contentText = result.content.find((entry) => entry.type === "text");
+				const output = details?.results.map(getResultOutput).filter(Boolean).join("\n\n")
+					|| (contentText?.type === "text" ? contentText.text : undefined)
+					|| "(no output)";
+				const marker = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				return new Text(`${marker} delegated report\n${truncateParallelOutput(output)}`, 0, 0);
+			}
 			const details = result.details as SubagentDetails | undefined;
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];

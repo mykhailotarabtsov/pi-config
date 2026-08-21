@@ -223,7 +223,7 @@ test('Firstmate delegates broad read-heavy work asynchronously with bounded visi
   const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
   assert.match(taskCreate, /const promptArgs = \['agent', 'prompt'/)
   assert.doesNotMatch(taskCreate, /promptArgs\.push\('--wait'/)
-  assert.match(source, /promptGuidelines: \[[\s\S]*one visible worker by default/i)
+  assert.match(source, /promptGuidelines: \[[\s\S]*one visible (?:implementation )?worker by default/i)
 })
 
 test('watcher reports and latches unverified endpoints while status exposes durable task visibility', async () => {
@@ -399,7 +399,8 @@ test('Firstmate workers and subagents have a hard no-push guard', async () => {
   assert.match(firstmate, /export \$\{WORKER_ENV\}=1/)
   assert.match(permissionGate, /const isFirstmateExecution = process\.env\.PI_FIRSTMATE_WORKER === "1"/)
   assert.match(permissionGate, /if \(isFirstmateExecution && containsGitPush\(command\)\)/)
-  assert.match(permissionGate, /MCP calls are blocked for Firstmate workers and their subagents/)
+  assert.match(permissionGate, /MCP calls are blocked for Firstmate implementation workers/)
+  assert.match(permissionGate, /isBrowserTesterSubagent/)
   assert.match(firstmate, /FIRSTMATE_WORKER_BIN_DIR/)
   assert.match(firstmate, /PI_FIRSTMATE_REAL_GIT/)
   assert.match(gitWrapper, /\[ "\$argument" = "push" \]/)
@@ -416,7 +417,8 @@ test('Firstmate activation gates the headless path while task_create starts visi
   assert.match(sessionStart, /process\.env\[ACTIVE_ENV\] = '1'/)
   assert.match(source, /delete process\.env\[ACTIVE_ENV\]/)
   assert.match(sessionStart, /ctx\.ui\.setToolsExpanded\(false\)/)
-  assert.match(source, /ALLOWED_TOOLS = \['read', 'grep', 'find', 'ls', 'mcp', 'herdr_control', 'artifact'\]/)
+  assert.match(source, /ALLOWED_TOOLS = \['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact'\]/)
+  assert.doesNotMatch(source, /ALLOWED_TOOLS = \[[^\]]*mcp/)
   assert.match(taskCreate, /const startArgs = \['agent', 'start'/)
   assert.match(taskCreate, /const promptArgs = \['agent', 'prompt'/)
   assert.doesNotMatch(taskCreate, /subagent/)
