@@ -32,7 +32,7 @@ const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
-const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'herdr_control', 'artifact']
+const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'mcp', 'herdr_control', 'artifact']
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID_RE = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
@@ -59,13 +59,20 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 
 ## Runtime safety delta
 
-- This pane is coordination-only: use read, grep, find, and ls for read-only inspection and herdr_control for coordination; artifact is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, write, delete, or subagent; delegate mutations and required commands through worker panes.
+- This pane is coordination-only: use read, grep, find, and ls for read-only inspection, mcp for approved external coordination lookups, and herdr_control for coordination; artifact is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, write, delete, or subagent; delegate mutations and required commands through worker panes.
 - Preserve unrelated changes and keep worker changes surgical. Workers and their subagents must never push, publish, use MCP, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies.
 - Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Narrow one-file questions may be inspected directly.
 - \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
 - Inspect enough context before delegation, ask focused clarification for ambiguity, create one visible tab per worker without taking focus, and reconcile the structured worker report before claiming completion.
 - Shared tasks stay in the requested checkout and never use task_deliver. Worktree tasks use Treehouse leases, require task_deliver before task_teardown, and are never auto-closed or auto-merged. Herdr 0.7.5 has no native agent stop command; task_abort/task_recover use explicit pane close only with force and verify endpoint absence before lease recovery.
 - Keep the captain's focus here and report only verified outcomes, files, tests, validation, reconciliation evidence, and blockers. Failed/blocked shared reports may close only an exact idle/done worker tab after absence verification; never force-close an active/hung worker. Treehouse leases and worker changes are never auto-returned or discarded.
+
+## Captain-facing output discipline
+
+- Do not narrate internal inspection, commands, tool arguments, endpoint checks, or durable paths.
+- After \`task_create\`, give only a concise confirmation that the worker started and is working.
+- Do not poll or read worker scrollback for routine progress; watcher notifications and the structured report are the source of truth.
+- After \`task_reconcile\`, show only the worker report: summary, changed files, tests, validation, and blockers. Keep errors and blockers concise.
 `.trim()
 
 const HerdrControlParams = Type.Object({
@@ -679,6 +686,38 @@ function boundedFirstmateRenderText(value: unknown): string {
   return bounded
 }
 
+const FIRSTMATE_ACTION_LABELS: Record<string, string> = {
+  task_create: 'worker started · working',
+  task_reconcile: 'worker report',
+  task_deliver: 'worker changes delivered',
+  task_teardown: 'worker cleanup complete',
+  task_abort: 'worker recovery complete',
+  task_recover: 'worker recovery complete',
+}
+
+function firstmateActionLabel(action: string): string {
+  return FIRSTMATE_ACTION_LABELS[action] || action.replaceAll('_', ' ')
+}
+
+function workerReportRenderText(value: unknown): string | undefined {
+  if (!isRecord(value) || typeof value.summary !== 'string') return undefined
+  const outcome = typeof value.outcome === 'string' ? ` (${value.outcome})` : ''
+  const lines = [`report${outcome}: ${value.summary}`]
+  const sections: Array<[string, string]> = [
+    ['changedFiles', 'changed files'],
+    ['tests', 'tests'],
+    ['validation', 'validation'],
+    ['blockers', 'blockers'],
+  ]
+  for (const [key, label] of sections) {
+    const entries = value[key]
+    if (!Array.isArray(entries) || entries.length === 0) continue
+    lines.push(`${label}:`)
+    for (const entry of entries) lines.push(`- ${typeof entry === 'string' ? entry : (JSON.stringify(entry) ?? String(entry))}`)
+  }
+  return boundedFirstmateRenderText(lines.join('\n'))
+}
+
 export default function firstmate(pi: ExtensionAPI) {
   if (!inHerdr()) return
 
@@ -702,6 +741,7 @@ export default function firstmate(pi: ExtensionAPI) {
   let turnEndGuardFollowUpStarted = false
   let turnEndGuardCheckInFlight = false
   let turnEndGuardRegistered = false
+  let restoreToolsExpanded: (() => void) | undefined
   const lifecycleLock = new LifecycleOperationLock()
   const watcherObservations = new Map<string, WatcherObservation>()
   const watcherMissingEndpoints = new Map<string, WatcherMissingEndpoint>()
@@ -1161,19 +1201,20 @@ export default function firstmate(pi: ExtensionAPI) {
       ],
       parameters: HerdrControlParams,
       renderCall(_args, theme, context) {
-        if (context.isPartial) return new Text(theme.fg('warning', '⏳ working'), 0, 0)
-        const status = context.isError ? theme.fg('error', '✗ failed') : theme.fg('success', '✓ done')
+        const action = typeof context.args.action === 'string' ? context.args.action : 'unknown'
+        const label = firstmateActionLabel(action)
+        if (context.isPartial) return new Text(theme.fg('warning', `⏳ ${label}`), 0, 0)
+        const status = context.isError ? theme.fg('error', `✗ ${label}`) : theme.fg('success', `✓ ${label}`)
         return new Text(status, 0, 0)
       },
-      renderResult(result, { expanded, isPartial }, theme, context) {
-        if (isPartial || !expanded) return new Text('', 0, 0)
+      renderResult(result, { isPartial }, theme, context) {
+        if (isPartial) return new Text('', 0, 0)
         const action = typeof context.args.action === 'string' ? context.args.action : 'unknown'
+        if (action !== 'task_reconcile') return new Text('', 0, 0)
+        const report = isRecord(result.details) ? workerReportRenderText(result.details.report) : undefined
+        if (report) return new Text(report, 0, 0)
         const resultText = boundedFirstmateRenderText(result.content.map((entry) => (entry.type === 'text' ? entry.text : `[${entry.type}]`)).join('\n'))
-        const detailsText = result.details === undefined ? '' : boundedFirstmateRenderText(result.details)
-        let text = theme.fg('muted', `action: ${action}`)
-        if (resultText) text += `\n${theme.fg('dim', `result: ${resultText}`)}`
-        if (detailsText) text += `\n${theme.fg('dim', `details: ${detailsText}`)}`
-        return new Text(text, 0, 0)
+        return new Text(theme.fg(context.isError ? 'error' : 'muted', resultText), 0, 0)
       },
       async execute(_toolCallId, params: ControlParams, signal, _onUpdate, ctx) {
         if (!active) return errorResult('herdr_control is only available in the active Herdr firstmate pane.')
@@ -2203,7 +2244,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 },
                 stateWriteError,
               }
-              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              return { content: [{ type: 'text' as const, text: `Worker started and working. Task ID: ${taskId}.` }], details }
             }
             case 'task_reconcile': {
               const taskIdError = validateTaskId(params.taskId)
@@ -2322,7 +2363,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 return errorResult(`worker report outcome is ${report.outcome}; task is not complete. ${cleanup.guidance}`, failedDetails)
               }
               const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: true, reconciled: true, task: reconciledTask, report }
-              return { content: [{ type: 'text' as const, text: JSON.stringify(details, null, 2) }], details }
+              return { content: [{ type: 'text' as const, text: JSON.stringify(report, null, 2) }], details }
             }
             case 'task_deliver': {
               const taskIdError = validateTaskId(params.taskId)
@@ -3650,6 +3691,10 @@ export default function firstmate(pi: ExtensionAPI) {
     }
     process.env[ACTIVE_ENV] = '1'
 
+    const toolsExpanded = ctx.ui.getToolsExpanded()
+    ctx.ui.setToolsExpanded(false)
+    restoreToolsExpanded = () => ctx.ui.setToolsExpanded(toolsExpanded)
+
     restoreIsolationMode(ctx)
     restoreWorkerKind(ctx)
     registerIsolationCommand()
@@ -3672,6 +3717,8 @@ export default function firstmate(pi: ExtensionAPI) {
   pi.on('session_shutdown', async () => {
     delete process.env[ACTIVE_ENV]
     stopWatcher()
+    restoreToolsExpanded?.()
+    restoreToolsExpanded = undefined
   })
 
   pi.on('resources_discover', () => {
@@ -3693,7 +3740,7 @@ export default function firstmate(pi: ExtensionAPI) {
         block: true,
         terminate: true,
         reason:
-          'Firstmate is coordination-only: only read, grep, find, ls, herdr_control, and artifact are active; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.',
+          'Firstmate is coordination-only: only read, grep, find, ls, mcp, herdr_control, and artifact are active; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.',
       }
     }
   })
