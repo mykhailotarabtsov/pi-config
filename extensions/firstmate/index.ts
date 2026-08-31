@@ -5,7 +5,7 @@ import * as path from 'node:path'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Text } from '@earendil-works/pi-tui'
 import { assessLocalDelivery, canCleanupAfterDelivery } from './delivery.ts'
-import { FIRSTMATE_CONTROL_ACTIONS, type FirstmateControlAction } from './control.ts'
+import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, type FirstmateControlAction } from './control.ts'
 import {
   canDeleteWithoutRecordedEndpoint,
   canMarkLeaseReturned,
@@ -42,7 +42,6 @@ const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
-const ALLOWED_TOOLS = ['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact']
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID_RE = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
@@ -892,7 +891,7 @@ export default function firstmate(pi: ExtensionAPI) {
 
   function applyFirstmateTools(): void {
     const available = new Set(pi.getAllTools().map((tool) => tool.name))
-    pi.setActiveTools(ALLOWED_TOOLS.filter((name) => available.has(name)))
+    pi.setActiveTools(FIRSTMATE_ALLOWED_TOOLS.filter((name) => available.has(name)))
   }
 
   function restoreIsolationMode(ctx: { sessionManager: { getBranch: () => Array<{ type: string; customType?: string; data?: unknown }> } }): void {
@@ -3448,12 +3447,12 @@ export default function firstmate(pi: ExtensionAPI) {
 
   pi.on('tool_call', (event) => {
     if (!active) return
-    if (!ALLOWED_TOOLS.includes(event.toolName)) {
+    if (!isFirstmateAllowedTool(event.toolName)) {
       return {
         block: true,
         terminate: true,
         reason:
-          'Firstmate is coordination-only: only read, grep, find, ls, the browser-tester-only subagent exception, herdr_control, and artifact are active; Firstmate never calls mcp. All implementation and code mutations must use herdr_control.task_create and visible worker tabs. The browser-tester delegate may use MCP for browser QA; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.'
+          'Firstmate is coordination-only: direct file mutation and shell tools are blocked. All implementation and code mutations must use herdr_control.task_create and visible worker tabs. Only read, grep, find, ls, the browser-tester-only subagent exception, herdr_control, and artifact are allowed; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory.'
       }
     }
     if (event.toolName === 'subagent' && !isAllowedFirstmateSubagentRequest(event.input)) {

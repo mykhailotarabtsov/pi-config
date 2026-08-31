@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import test from 'node:test'
-import { FIRSTMATE_CONTROL_ACTIONS, isFirstmateControlAction } from '../extensions/firstmate/control.ts'
+import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction } from '../extensions/firstmate/control.ts'
 import { assessLocalDelivery, canCleanupAfterDelivery } from '../extensions/firstmate/delivery.ts'
 import { validateWorkerReport, REPORT_VERSION } from '../extensions/firstmate/worker-report.ts'
 import {
@@ -17,6 +19,7 @@ import {
 } from '../extensions/firstmate/lifecycle.ts'
 import { readFile } from 'node:fs/promises'
 
+const execFileAsync = promisify(execFile)
 const fastForward = { targetBranch: 'feature/current', dirtyPathCheckSucceeded: true, dirtyPathsOverlap: false, branchExists: true, fastForward: true }
 
 test('pending Treehouse leases are an idempotent no-op', () => {
@@ -148,11 +151,20 @@ test('delivery permits a feature-branch fast-forward and cleanup only after land
   assert.equal(canCleanupAfterDelivery({ reportCompleted: true, deliveryStatus: 'landed', leaseStatus: 'returned' }), true)
 })
 
-test('Firstmate exposes only high-level task actions', () => {
+test('Firstmate exposes only high-level task actions and non-mutating tools', () => {
   assert.deepEqual(FIRSTMATE_CONTROL_ACTIONS, ['status', 'task_create', 'task_reconcile', 'task_deliver', 'task_teardown', 'task_abort', 'task_recover'])
+  assert.deepEqual(FIRSTMATE_ALLOWED_TOOLS, ['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact'])
   assert.equal(isFirstmateControlAction('task_reconcile'), true)
   assert.equal(isFirstmateControlAction('agent_read'), false)
   assert.equal(isFirstmateControlAction('pane_run'), false)
+  assert.equal(isFirstmateAllowedTool('read'), true)
+  assert.equal(isFirstmateAllowedTool('edit'), false)
+  assert.equal(isFirstmateAllowedTool('write'), false)
+  assert.equal(isFirstmateAllowedTool('bash'), false)
+})
+
+test('Firstmate entrypoint parses before it can be loaded into a captain pane', async () => {
+  await execFileAsync(process.execPath, ['--check', new URL('../extensions/firstmate/index.ts', import.meta.url).pathname])
 })
 
 test('worker reports are validated independently of worker lifecycle operations', () => {
@@ -187,7 +199,7 @@ test('Firstmate injects visible-worker-only implementation instructions and guar
   assert.match(source, /herdr_control\.task_create \/ visible worker tabs for all implementation and code mutations/)
   assert.match(source, /only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance/)
   assert.match(source, /event\.toolName === 'subagent' && !isAllowedFirstmateSubagentRequest\(event\.input\)/)
-  assert.match(source, /ALLOWED_TOOLS = \['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact'\]/)
+  assert.match(source, /isFirstmateAllowedTool\(event\.toolName\)/)
 })
 
 test('extension source keeps delivery and cleanup identity/return guards', async () => {
@@ -501,8 +513,8 @@ test('Firstmate activation gates the headless path while task_create starts visi
   assert.match(sessionStart, /process\.env\[ACTIVE_ENV\] = '1'/)
   assert.match(source, /delete process\.env\[ACTIVE_ENV\]/)
   assert.match(sessionStart, /ctx\.ui\.setToolsExpanded\(false\)/)
-  assert.match(source, /ALLOWED_TOOLS = \['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact'\]/)
-  assert.doesNotMatch(source, /ALLOWED_TOOLS = \[[^\]]*mcp/)
+  assert.match(source, /FIRSTMATE_ALLOWED_TOOLS/)
+  assert.doesNotMatch(source, /FIRSTMATE_ALLOWED_TOOLS = \[[^\]]*mcp/)
   assert.match(taskCreate, /const startArgs = \['agent', 'start'/)
   assert.match(taskCreate, /const promptArgs = \['agent', 'prompt'/)
   assert.doesNotMatch(taskCreate, /subagent/)
