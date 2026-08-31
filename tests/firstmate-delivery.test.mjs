@@ -229,6 +229,27 @@ test('failed and blocked reconciliation uses guarded shared cleanup without tear
   assert.match(source, /a failed or blocked shared task still requires explicit task_abort\/task_recover/)
 })
 
+test('completed shared reconciliation reuses guarded teardown while exclusions stay explicit', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const reconcileStart = source.indexOf("case 'task_reconcile'")
+  const reconcileEnd = source.indexOf("case 'task_deliver'", reconcileStart)
+  const reconcile = source.slice(reconcileStart, reconcileEnd)
+  const autoTeardownStart = reconcile.indexOf("if (reconciledTask.worktreeProvider === 'herdr')")
+  const autoTeardown = reconcile.slice(autoTeardownStart)
+
+  assert.ok(autoTeardownStart >= 0)
+  assert.match(source, /let action = params\.action/)
+  assert.match(source, /for \(;;\) \{\s+switch \(action\)/)
+  assert.match(autoTeardown, /params\.tabId = reconciledTask\.tabId \?\? undefined/)
+  assert.match(autoTeardown, /action = 'task_teardown'/)
+  assert.match(autoTeardown, /continue/)
+  assert.ok(reconcile.indexOf("if (report.outcome !== 'completed')") < autoTeardownStart)
+  assert.doesNotMatch(autoTeardown, /treehouse/)
+  assert.match(source, /shared-checkout tasks are already local and must not use task_deliver; reconcile, then use task_teardown/)
+  assert.match(source, /task teardown requires successful explicit local delivery before cleanup/)
+  assert.match(source, /status !== 'idle' && status !== 'done'/)
+})
+
 test('Firstmate delegates broad read-heavy work asynchronously with bounded visible fan-out', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const agents = `${source}\n${await readFile(new URL('../AGENTS.md', import.meta.url), 'utf8')}`

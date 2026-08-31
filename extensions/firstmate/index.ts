@@ -1657,7 +1657,9 @@ export default function firstmate(pi: ExtensionAPI) {
           let taskTeardownRecord: TaskRecord | undefined
           let taskTeardownReport: WorkerReport | undefined
           let taskTeardownTabAlreadyAbsent = false
-          switch (params.action) {
+          let action = params.action
+          for (;;) {
+            switch (action) {
             case 'status': {
               const workspaceId = process.env.HERDR_WORKSPACE_ID
               if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.')
@@ -2364,6 +2366,11 @@ export default function firstmate(pi: ExtensionAPI) {
                   nextAction: cleanup.guidance,
                 }
                 return errorResult(`worker report outcome is ${report.outcome}; task is not complete. ${cleanup.guidance}`, failedDetails)
+              }
+              if (reconciledTask.worktreeProvider === 'herdr') {
+                params.tabId = reconciledTask.tabId ?? undefined
+                action = 'task_teardown'
+                continue
               }
               const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: true, reconciled: true, task: reconciledTask, report }
               return { content: [{ type: 'text' as const, text: JSON.stringify(report, null, 2) }], details }
@@ -3430,6 +3437,7 @@ export default function firstmate(pi: ExtensionAPI) {
               if (params.lines !== undefined) args.push('--lines', String(params.lines))
               if (params.format) args.push('--format', params.format)
               break
+            }
             }
           }
 
