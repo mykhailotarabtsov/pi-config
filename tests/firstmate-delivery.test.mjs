@@ -63,6 +63,31 @@ test('lifecycle operations serialize and release idempotently', async () => {
   releaseFirst()
 })
 
+test('shared-admission cleanup failures cannot strand the lifecycle lock', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  assert.match(source, /finally \{\s+try \{\s+await releaseSharedAdmission\?\.\(\)\s+\} finally \{\s+releaseLifecycle\?\.\(\)\s+\}\s+\}/)
+
+  const lock = new LifecycleOperationLock()
+  const releaseLifecycle = await lock.acquire()
+  let nextAcquired = false
+  const next = lock.acquire().then((release) => {
+    nextAcquired = true
+    release()
+  })
+  await assert.rejects(
+    (async () => {
+      try {
+        await Promise.reject(new Error('simulated admission cleanup failure'))
+      } finally {
+        releaseLifecycle()
+      }
+    })(),
+    /simulated admission cleanup failure/,
+  )
+  await next
+  assert.equal(nextAcquired, true)
+})
+
 test('until accepts legacy scalars and emits the exact repeated Herdr argument list', () => {
   assert.deepEqual(normalizeUntil('blocked'), ['blocked'])
   assert.deepEqual(normalizeUntil(['idle', 'done']), ['idle', 'done'])

@@ -3677,8 +3677,11 @@ export default function firstmate(pi: ExtensionAPI) {
             details,
           }
         } finally {
-          await releaseSharedAdmission?.()
-          releaseLifecycle?.()
+          try {
+            await releaseSharedAdmission?.()
+          } finally {
+            releaseLifecycle?.()
+          }
         }
       },
     })
