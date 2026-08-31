@@ -5,8 +5,8 @@ import * as path from 'node:path'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Text } from '@earendil-works/pi-tui'
 import { assessLocalDelivery, canCleanupAfterDelivery } from './delivery.ts'
+import { FIRSTMATE_CONTROL_ACTIONS, type FirstmateControlAction } from './control.ts'
 import {
-  appendUntilArgs,
   canDeleteWithoutRecordedEndpoint,
   canMarkLeaseReturned,
   endpointListsConfirmAbsence,
@@ -16,18 +16,27 @@ import {
   LifecycleOperationLock,
   taskArtifactPaths,
   type EndpointAbsenceStatus,
-  type WaitStatus,
 } from './lifecycle.ts'
+import {
+  newTaskId,
+  readTaskState,
+  reportFilePath,
+  TASK_STATE_DIR,
+  taskFilePath,
+  TASK_VERSION,
+  writeTaskState,
+  type TaskRecord,
+  type WorkerKind,
+  type WorkerReport,
+} from './task-state.ts'
+import { validateWorkerReport, workerReportContract } from './worker-report.ts'
 import { StringEnum } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 
 const MARKER_DIR = path.join(os.tmpdir(), 'pi-herdr-firstmate')
 const MARKER_VERSION = 1
-const TASK_STATE_DIR = path.join(os.homedir(), '.pi', 'firstmate', 'tasks')
 const SHARED_ADMISSION_LOCK_PREFIX = '.shared-admission-'
 const FIRSTMATE_WORKER_BIN_DIR = path.join(os.homedir(), '.pi', 'agent', 'extensions', 'firstmate', 'worker-git')
-const TASK_VERSION = 1
-const REPORT_VERSION = 1
 const WORKER_ENV = 'PI_FIRSTMATE_WORKER'
 const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
@@ -41,7 +50,6 @@ const WORKSPACE_ID_RE = /^w[0-9A-Za-z]+$/
 const AGENT_KIND_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const ALLOWED_WORKER_KINDS = ['pi', 'claude'] as const
 const DEFAULT_WORKER_KIND = 'pi' as const
-const TARGET_RE = /^(?:w[0-9A-Za-z]+:p[0-9A-Za-z]+|[a-z][a-z0-9_-]{0,31})$/
 const TASK_ID_RE = /^task-[a-z0-9]+-[0-9a-f]{8}-[0-9a-f]{3}$/
 const WATCHER_INTERVAL_MS = 5_000
 const WATCHER_RECENCY_WINDOW_MS = 2 * WATCHER_INTERVAL_MS
@@ -49,9 +57,7 @@ const TREEHOUSE_RETURN_SUCCESS_MARKER = 'Worktree returned to pool.'
 const PI_WORKER_NATIVE_ARGS = ['--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'high']
 const ISOLATION_STATE_ENTRY = 'firstmate-isolation'
 const WORKER_STATE_ENTRY = 'firstmate-worker'
-const LIFECYCLE_ACTIONS = new Set(['task_create', 'task_reconcile', 'task_abort', 'task_recover', 'task_deliver', 'task_teardown'])
-
-type WorkerKind = (typeof ALLOWED_WORKER_KINDS)[number]
+const LIFECYCLE_ACTIONS = new Set<FirstmateControlAction>(['task_create', 'task_reconcile', 'task_abort', 'task_recover', 'task_deliver', 'task_teardown'])
 
 const FIRSTMATE_SYSTEM_PROMPT = `
 # Herdr Firstmate Runtime Role
@@ -62,7 +68,7 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 
 - This pane is coordination-only: use read, grep, find, and ls for read-only inspection, use the browser-tester subagent only for browser QA, and use herdr_control.task_create / visible worker tabs for all implementation and code mutations; never call mcp directly. The artifact tool is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, or write; delegate mutations through worker panes.
 - Preserve unrelated changes and keep worker changes surgical. Workers must never push, publish, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies. The browser-tester subagent is the sole MCP-capable delegate and may use MCP only for browser QA; it must never automate sign-in or handle credentials.
-- Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Narrow one-file questions may be inspected directly.
+- Decide the number of workers yourself; do not ask the captain to choose it. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. Narrow one-file questions may be inspected directly.
 - \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
 - Inspect enough context before delegation, ask focused clarification for ambiguity, create one visible tab per worker without taking focus, and reconcile the structured worker report before claiming completion.
 - Shared tasks stay in the requested checkout and never use task_deliver. Worktree tasks use Treehouse leases, require task_deliver before task_teardown, and are never auto-closed or auto-merged. Herdr 0.7.5 has no native agent stop command; task_abort/task_recover use explicit pane close only with force and verify endpoint absence before lease recovery.
@@ -78,88 +84,31 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 `.trim()
 
 const HerdrControlParams = Type.Object({
-  action: StringEnum([
-    'status',
-    'task_create',
-    'task_reconcile',
-    'task_deliver',
-    'task_teardown',
-    'task_abort',
-    'task_recover',
-    'tab_create',
-    'tab_close',
-    'pane_run',
-    'agent_start',
-    'agent_prompt',
-    'agent_wait',
-    'agent_read',
-  ] as const),
+  action: StringEnum(FIRSTMATE_CONTROL_ACTIONS),
   project: Type.Optional(Type.String({ description: 'Requested primary project checkout for task_create or task_deliver. Resolved relative to the firstmate cwd.' })),
-  taskId: Type.Optional(Type.String({ description: 'Durable firstmate task id for task_reconcile, task_deliver, or task_teardown.' })),
-  tabId: Type.Optional(Type.String({ description: 'Opaque Herdr tab id for tab_close, e.g. w1:t2.' })),
-  paneId: Type.Optional(Type.String({ description: 'Herdr pane id, e.g. w1:p2.' })),
-  label: Type.Optional(Type.String({ description: 'Optional label for a new worker tab.' })),
-  target: Type.Optional(Type.String({ description: 'Agent target: unique agent name or pane id hosting an agent.' })),
-  name: Type.Optional(Type.String({ description: 'Agent name for agent_start. Must match [a-z][a-z0-9_-]{0,31}.' })),
-  kind: Type.Optional(StringEnum(ALLOWED_WORKER_KINDS, { description: 'Allowlisted worker kind for task_create or agent_start: pi (default) or claude.' })),
-  cwd: Type.Optional(Type.String({ description: 'Working directory for tab_create. Defaults to current Pi cwd.' })),
-  command: Type.Optional(Type.String({ description: 'Command text for pane_run. Passed to herdr CLI as one argv, never interpolated by a shell in this extension.' })),
-  prompt: Type.Optional(Type.String({ description: 'Prompt text for agent_prompt.' })),
-  wait: Type.Optional(Type.Boolean({ description: 'For agent_prompt, wait for settled state. Defaults to true.' })),
-  until: Type.Optional(
-    Type.Union([StringEnum(['idle', 'done', 'blocked', 'working', 'unknown'] as const), Type.Array(StringEnum(['idle', 'done', 'blocked', 'working', 'unknown'] as const))], {
-      description: 'Optional agent wait status; legacy scalar and repeated array forms are accepted.',
-    }),
-  ),
-  timeoutMs: Type.Optional(Type.Number({ description: 'Timeout in milliseconds for Herdr wait/start/prompt/read commands.' })),
-  source: Type.Optional(StringEnum(['visible', 'recent', 'recent-unwrapped', 'detection'] as const, { description: 'Read source for agent_read.' })),
-  lines: Type.Optional(Type.Number({ description: 'Line count for agent_read.' })),
-  format: Type.Optional(StringEnum(['text', 'ansi'] as const, { description: 'Output format for agent_read.' })),
-  focus: Type.Optional(Type.Boolean({ description: 'For tab_create, focus the new tab. Defaults to false.' })),
+  taskId: Type.Optional(Type.String({ description: 'Durable firstmate task id for task reconciliation, delivery, cleanup, or recovery.' })),
+  label: Type.Optional(Type.String({ description: 'Optional label for a visible worker tab.' })),
+  kind: Type.Optional(StringEnum(ALLOWED_WORKER_KINDS, { description: 'Allowlisted worker kind for task_create: pi (default) or claude.' })),
+  prompt: Type.Optional(Type.String({ description: 'Precise worker brief for task_create.' })),
+  timeoutMs: Type.Optional(Type.Number({ description: 'Timeout in milliseconds for a high-level task operation.' })),
   force: Type.Optional(Type.Boolean({ description: 'For task_abort/task_recover, explicitly stop an active worker with pane close.' })),
   discard: Type.Optional(Type.Boolean({ description: 'For task_abort/task_recover, explicitly allow returning a leased worktree with --force.' })),
-  args: Type.Optional(Type.Array(Type.String(), { description: 'Native agent args for agent_start, appended after --.' })),
   reviewTarget: Type.Optional(Type.String({ description: 'Optional existing local or remote-tracking ref to inspect for a review task; implementation tasks omit it.' })),
 })
 
 type ExecResult = { stdout: string; stderr: string; code: number | null; killed?: boolean }
 type ControlParams = {
-  action:
-    | 'status'
-    | 'task_create'
-    | 'task_reconcile'
-    | 'task_deliver'
-    | 'task_teardown'
-    | 'task_abort'
-    | 'task_recover'
-    | 'tab_create'
-    | 'tab_close'
-    | 'pane_run'
-    | 'agent_start'
-    | 'agent_prompt'
-    | 'agent_wait'
-    | 'agent_read'
+  action: FirstmateControlAction | 'tab_close'
   project?: string
   taskId?: string
+  // Internal only: task_teardown passes the exact recorded tab into the private close path.
   tabId?: string
-  paneId?: string
   label?: string
-  target?: string
-  name?: string
   kind?: WorkerKind
-  cwd?: string
-  command?: string
   prompt?: string
-  wait?: boolean
-  until?: WaitStatus | WaitStatus[]
   timeoutMs?: number
-  source?: 'visible' | 'recent' | 'recent-unwrapped' | 'detection'
-  lines?: number
-  format?: 'text' | 'ansi'
-  focus?: boolean
   force?: boolean
   discard?: boolean
-  args?: string[]
   reviewTarget?: string
 }
 
@@ -171,78 +120,7 @@ type Marker = {
   createdAt: string
 }
 
-type WorktreeProvider = 'herdr' | 'treehouse'
 type IsolationMode = 'shared' | 'worktree'
-type LeaseStatus = 'pending' | 'leased' | 'retained' | 'returned'
-type TaskStatus = 'provisioning' | 'worktree_created' | 'worktree_leased' | 'starting' | 'started' | 'failed'
-type ReportOutcome = 'completed' | 'blocked' | 'failed'
-type ReportStatus = 'pending' | 'completed' | 'blocked' | 'failed' | 'missing' | 'malformed'
-type CleanupStatus = 'pending' | 'closing' | 'tab_closed'
-type DeliveryStatus = 'landing' | 'landed' | 'failed'
-// Version 1 report schema: version, taskId, outcome, changedFiles, tests, validation, blockers, summary.
-type WorkerReport = {
-  version: number
-  taskId: string
-  outcome: ReportOutcome
-  changedFiles: string[]
-  tests: Array<string | Record<string, unknown>>
-  validation: string[]
-  blockers: string[]
-  summary: string
-}
-
-type TaskRecord = {
-  version: number
-  taskId: string
-  project: string
-  worktree: string | null
-  worktreeProvider?: WorktreeProvider
-  leaseStatus?: LeaseStatus
-  leaseHolder?: string
-  leaseId?: string
-  leaseReturnStatus?: 'returned' | 'failed'
-  leaseReturnAt?: string
-  leaseReturnCode?: number | null
-  leaseReturnStdout?: string
-  leaseReturnStderr?: string
-  leaseReturnError?: string
-  deliveryStatus?: DeliveryStatus
-  deliveryTargetBranch?: string
-  // Legacy evidence written when delivery targeted the default branch.
-  deliveryDefaultBranch?: string
-  deliveryBeforeCommit?: string
-  deliveryCommit?: string
-  deliveryAt?: string
-  deliveryCode?: number | null
-  deliveryStdout?: string
-  deliveryStderr?: string
-  deliveryError?: string
-  deliveryHelperTabId?: string
-  deliveryHelperPaneId?: string
-  leaseReturnHelperTabId?: string
-  leaseReturnHelperPaneId?: string
-  workspaceId: string | null
-  tabId: string | null
-  paneId: string | null
-  branch: string
-  reviewTarget?: string
-  workerName?: string
-  workerKind?: WorkerKind
-  status: TaskStatus
-  reportPath: string
-  reportStatus: ReportStatus
-  reportOutcome?: ReportOutcome
-  reportUpdatedAt?: string
-  reportSummary?: string
-  reportError?: string
-  cleanupStatus?: CleanupStatus
-  cleanupUpdatedAt?: string
-  cleanupError?: string
-  endpointStatus?: EndpointAbsenceStatus
-  createdAt: string
-  updatedAt: string
-  error?: string
-}
 
 type NativeWorkerState = 'working' | 'blocked' | 'idle' | 'done'
 type WatcherObservation = { state?: NativeWorkerState; edgeLatched: boolean; endpointMissingLatched: boolean }
@@ -316,14 +194,6 @@ function hasWatcherEndpoint(task: TaskRecord, workspaceId: string): boolean {
   )
 }
 
-function taskFilePath(taskId: string): string {
-  return path.join(TASK_STATE_DIR, `${taskId}.json`)
-}
-
-function reportFilePath(taskId: string): string {
-  return path.join(TASK_STATE_DIR, `${taskId}.report.json`)
-}
-
 function validateTaskId(value: string | undefined): string | undefined {
   if (!value) return '`taskId` is required.'
   if (!TASK_ID_RE.test(value)) return '`taskId` must be a generated firstmate task id.'
@@ -336,65 +206,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isIsolationMode(value: unknown): value is IsolationMode {
   return value === 'shared' || value === 'worktree'
-}
-
-function validateWorkerReport(value: unknown, taskId: string): { report?: WorkerReport; error?: string } {
-  if (!isRecord(value)) return { error: 'report must be a JSON object.' }
-  const fields = ['version', 'taskId', 'outcome', 'changedFiles', 'tests', 'validation', 'blockers', 'summary']
-  const extraField = Object.keys(value).find((field) => !fields.includes(field))
-  if (extraField) return { error: `report contains unknown field \`${extraField}\`.` }
-  if (value.version !== REPORT_VERSION) return { error: `report version must be ${REPORT_VERSION}.` }
-  if (value.taskId !== taskId) return { error: 'report taskId does not match the durable task.' }
-  if (value.outcome !== 'completed' && value.outcome !== 'blocked' && value.outcome !== 'failed') return { error: 'report outcome must be completed, blocked, or failed.' }
-  if (!Array.isArray(value.changedFiles) || !value.changedFiles.every((entry) => typeof entry === 'string')) return { error: 'report changedFiles must be an array of strings.' }
-  if (!Array.isArray(value.tests) || !value.tests.every((entry) => typeof entry === 'string' || isRecord(entry))) return { error: 'report tests must be an array of strings or objects.' }
-  if (!Array.isArray(value.validation) || !value.validation.every((entry) => typeof entry === 'string')) return { error: 'report validation must be an array of strings.' }
-  if (!Array.isArray(value.blockers) || !value.blockers.every((entry) => typeof entry === 'string')) return { error: 'report blockers must be an array of strings.' }
-  if (typeof value.summary !== 'string') return { error: 'report summary must be a string.' }
-  return { report: value as WorkerReport }
-}
-
-async function readTaskState(taskId: string): Promise<TaskRecord | undefined> {
-  try {
-    return JSON.parse(await fs.promises.readFile(taskFilePath(taskId), 'utf8')) as TaskRecord
-  } catch {
-    return undefined
-  }
-}
-
-function workerReportContract(taskId: string, reportPath: string): string {
-  return `
-
-## Required structured worker report
-Before claiming this task is complete, blocked, or failed, write a UTF-8 JSON report to the exact outside-project path ${reportPath}. The pane environment also exports PI_FIRSTMATE_TASK_ID=${taskId} and PI_FIRSTMATE_REPORT_PATH=${reportPath}. Do not rely on scrollback or a final message as the report. The report schema is exactly:
-{
-  "version": ${REPORT_VERSION},
-  "taskId": "${taskId}",
-  "outcome": "completed",
-  "changedFiles": ["project-relative/path"],
-  "tests": ["command/result"],
-  "validation": ["validation result"],
-  "blockers": ["blocker"],
-  "summary": "concise summary"
-}
-The outcome must be exactly completed, blocked, or failed; tests entries may be strings or JSON objects; all other arrays contain strings. Write every required field, use empty arrays when applicable, and write the report before claiming completion. Preserve unrelated working-tree changes. Never push or publish changes. Do not commit unless the captain explicitly authorizes a local commit.`.trim()
-}
-
-async function writeTaskState(record: TaskRecord): Promise<string> {
-  await fs.promises.mkdir(TASK_STATE_DIR, { recursive: true, mode: 0o700 })
-  const destination = taskFilePath(record.taskId)
-  const temporary = path.join(TASK_STATE_DIR, `.${record.taskId}.${process.pid}.${randomUUID()}.tmp`)
-  try {
-    await fs.promises.writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-    await fs.promises.rename(temporary, destination)
-  } finally {
-    await fs.promises.unlink(temporary).catch(() => undefined)
-  }
-  return destination
-}
-
-function newTaskId(): string {
-  return `task-${Date.now().toString(36)}-${randomUUID().slice(0, 12)}`
 }
 
 function shellQuote(value: string): string {
@@ -460,12 +271,6 @@ async function acquireSharedAdmissionLock(project: string): Promise<{ release: (
       }
     }
   }
-}
-
-const GIT_PUSH_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+push(?:\s|$)/i
-
-function containsGitPush(command: string): boolean {
-  return GIT_PUSH_COMMAND.test(command.replaceAll(/["']/g, ''))
 }
 
 function treehouseWorkerBranchCommand(branch: string, reviewTarget?: string): string {
@@ -602,18 +407,6 @@ function validateTabId(value: string | undefined): string | undefined {
   return undefined
 }
 
-function validateTarget(value: string | undefined): string | undefined {
-  if (!value) return '`target` is required.'
-  if (!TARGET_RE.test(value)) return '`target` must be a pane id or valid Herdr agent name.'
-  return undefined
-}
-
-function validateAgentName(value: string | undefined): string | undefined {
-  if (!value) return '`name` is required.'
-  if (!AGENT_NAME_RE.test(value)) return '`name` must match [a-z][a-z0-9_-]{0,31}.'
-  return undefined
-}
-
 function isWorkerKind(value: unknown): value is WorkerKind {
   return ALLOWED_WORKER_KINDS.includes(value as WorkerKind)
 }
@@ -632,12 +425,6 @@ function validateOptionalCwd(value: string | undefined): string | undefined {
 function validateTimeout(value: number | undefined): string | undefined {
   if (value === undefined) return undefined
   if (!Number.isFinite(value) || value < 1 || value > 24 * 60 * 60 * 1000) return '`timeoutMs` must be between 1 and 86400000.'
-  return undefined
-}
-
-function validatePositiveInteger(value: number | undefined, field: string): string | undefined {
-  if (value === undefined) return undefined
-  if (!Number.isInteger(value) || value < 1) return `\`${field}\` must be a positive integer.`
   return undefined
 }
 
@@ -1192,12 +979,12 @@ export default function firstmate(pi: ExtensionAPI) {
       name: 'herdr_control',
       label: 'Herdr Control',
       description:
-        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded failed/blocked shared cleanup, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Use the browser-tester subagent only for browser QA; all implementation and code mutations must use herdr_control.task_create and visible worker tabs. Firstmate itself never calls MCP. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
-      promptSnippet: 'Coordinate visible Herdr worker tabs and agents: create/start/prompt/wait/read, safely reconcile reports, and explicitly recover unsafe workers',
+        'Coordinate this Herdr workspace through high-level task creation, report reconciliation, delivery, cleanup, and recovery. Worker tabs, panes, and agents are internal implementation details. Use the browser-tester subagent only for browser QA; all implementation and code mutations must use herdr_control.task_create and visible worker tabs. Firstmate itself never calls MCP. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence.',
+      promptSnippet: 'Delegate visible workers, reconcile their reports, then safely deliver, clean up, or recover their tasks',
       promptGuidelines: [
         'Use herdr_control.task_create and visible worker tabs for all implementation and code mutations; use the subagent tool only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance. Firstmate must never call mcp. Use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, or write. Delegate mutations through worker panes.',
         'Use the subagent tool only with agent: "browser-tester" for browser QA. That delegate may use MCP for browser interaction, but sign-in must always be performed manually by the captain; never automate credentials or authentication. Do not use subagent for implementation or reconnaissance.',
-        'Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. One visible implementation worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Inspect narrow one-file questions directly when that is simpler.',
+        'Choose the worker count yourself; do not ask the captain to choose it. Use one visible implementation worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. Inspect narrow one-file questions directly when that is simpler.',
         'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion.',
         'Use task_create with the current session isolation mode, one visible tab per implementation worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
         'Implementation workers and their subagents must not push, publish, or commit without explicit captain authorization. The browser-tester delegate may use MCP only for browser QA and must report when manual sign-in is required. Failed/blocked shared reports may use only the guarded exact idle/done tab cleanup; never force-close active/hung workers. Never auto-return or discard Treehouse leases; report only verified outcomes and preserve unrelated changes.',
@@ -1222,8 +1009,9 @@ export default function firstmate(pi: ExtensionAPI) {
       async execute(_toolCallId, params: ControlParams, signal, _onUpdate, ctx) {
         if (!active) return errorResult('herdr_control is only available in the active Herdr firstmate pane.')
         if (!inHerdr()) return errorResult('not running inside Herdr.')
+        if (!isFirstmateControlAction(params.action)) return errorResult('unsupported Firstmate task operation.', { action: params.action })
 
-        const releaseLifecycle = LIFECYCLE_ACTIONS.has(params.action) ? await lifecycleLock.acquire() : undefined
+        const releaseLifecycle = isFirstmateControlAction(params.action) && LIFECYCLE_ACTIONS.has(params.action) ? await lifecycleLock.acquire() : undefined
         let releaseSharedAdmission: (() => Promise<void>) | undefined
         try {
           const timeoutError = validateTimeout(params.timeoutMs)
@@ -3085,31 +2873,6 @@ export default function firstmate(pi: ExtensionAPI) {
               params.tabId = task.tabId
               // Fall through to the existing exact tab_close inspection and command.
             }
-            case 'tab_create': {
-              if (!taskTeardownRecord) {
-                const cwdError = validateOptionalCwd(params.cwd)
-                if (cwdError) return errorResult(cwdError, { action: params.action })
-                const workspaceId = process.env.HERDR_WORKSPACE_ID
-                if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) return errorResult('HERDR_WORKSPACE_ID is missing or invalid.', { action: params.action })
-                args = [
-                  'tab',
-                  'create',
-                  '--workspace',
-                  workspaceId,
-                  '--cwd',
-                  params.cwd || ctx.cwd,
-                  '--env',
-                  `${WORKER_ENV}=1`,
-                  '--env',
-                  `PATH=${workerPath()}`,
-                  '--env',
-                  `PI_FIRSTMATE_REAL_GIT=${firstmateGitPath()}`,
-                ]
-                if (params.label) args.push('--label', params.label)
-                args.push(params.focus ? '--focus' : '--no-focus')
-                break
-              }
-            }
             case 'tab_close': {
               const tabIdError = validateTabId(params.tabId)
               if (tabIdError) return errorResult(tabIdError, { action: params.action, tabId: params.tabId })
@@ -3373,62 +3136,6 @@ export default function firstmate(pi: ExtensionAPI) {
               } else {
                 args = ['tab', 'close', params.tabId!]
               }
-              break
-            }
-            case 'pane_run': {
-              const paneError = validatePaneId(params.paneId)
-              if (paneError) return errorResult(paneError, { action: params.action })
-              if (!params.command) return errorResult('`command` is required for pane_run.', { action: params.action })
-              if (containsGitPush(params.command)) return errorResult('git push is blocked for Firstmate workers and their subagents.', { action: params.action, paneId: params.paneId })
-              args = ['pane', 'run', params.paneId!, params.command]
-              break
-            }
-            case 'agent_start': {
-              const nameError = validateAgentName(params.name)
-              if (nameError) return errorResult(nameError, { action: params.action })
-              const paneError = validatePaneId(params.paneId)
-              if (paneError) return errorResult(paneError, { action: params.action })
-              const kind = params.kind === undefined ? selectedWorkerKind : params.kind
-              const kindError = validateWorkerKind(kind)
-              if (kindError) return errorResult(kindError, { action: params.action, kind: params.kind })
-              const workerEnvResult = await runHerdr(
-                ['pane', 'run', params.paneId!, `export ${WORKER_ENV}=1 PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`],
-                signal,
-                10_000,
-              )
-              if (workerEnvResult.code !== 0) return errorResult(commandResultText('herdr pane run (worker environment)', workerEnvResult), { action: params.action, paneId: params.paneId })
-              args = ['agent', 'start', params.name!, '--kind', kind!, '--pane', params.paneId!]
-              if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
-              appendWorkerNativeArgs(args, kind!, params.args)
-              break
-            }
-            case 'agent_prompt': {
-              const targetError = validateTarget(params.target)
-              if (targetError) return errorResult(targetError, { action: params.action })
-              if (!params.prompt) return errorResult('`prompt` is required for agent_prompt.', { action: params.action })
-              args = ['agent', 'prompt', params.target!, params.prompt]
-              if (params.wait !== false) args.push('--wait')
-              appendUntilArgs(args, params.until)
-              if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
-              break
-            }
-            case 'agent_wait': {
-              const targetError = validateTarget(params.target)
-              if (targetError) return errorResult(targetError, { action: params.action })
-              args = ['agent', 'wait', params.target!]
-              appendUntilArgs(args, params.until)
-              if (params.timeoutMs !== undefined) args.push('--timeout', String(params.timeoutMs))
-              break
-            }
-            case 'agent_read': {
-              const targetError = validateTarget(params.target)
-              if (targetError) return errorResult(targetError, { action: params.action })
-              const linesError = validatePositiveInteger(params.lines, 'lines')
-              if (linesError) return errorResult(linesError, { action: params.action })
-              args = ['agent', 'read', params.target!]
-              if (params.source) args.push('--source', params.source)
-              if (params.lines !== undefined) args.push('--lines', String(params.lines))
-              if (params.format) args.push('--format', params.format)
               break
             }
           }
@@ -3734,7 +3441,7 @@ export default function firstmate(pi: ExtensionAPI) {
   pi.on('before_agent_start', (event) => {
     if (!active) return
     applyFirstmateTools()
-    const kindLine = `\n\nCurrent firstmate agent kind: ${currentAgentKind || 'unknown'}. Current selected worker kind: ${selectedWorkerKind}; task_create and agent_start use this by default. Select the allowlisted worker kind with /firstmate-worker pi or /firstmate-worker claude.`
+    const kindLine = `\n\nCurrent firstmate agent kind: ${currentAgentKind || 'unknown'}. Current selected worker kind: ${selectedWorkerKind}; task_create uses this by default. Select the allowlisted worker kind with /firstmate-worker pi or /firstmate-worker claude.`
     const isolationLine = `\n\nCurrent session isolation mode: ${isolationMode}. task_create must use ${isolationMode === 'shared' ? 'the requested shared checkout; do not start concurrent shared tasks for that project' : 'an isolated Treehouse worktree and require task_deliver before teardown'}. The captain can switch it with /firstmate-isolation shared or /firstmate-isolation worktree.`
     return { systemPrompt: `${FIRSTMATE_SYSTEM_PROMPT}${kindLine}${isolationLine}\n\n${event.systemPrompt}` }
   })

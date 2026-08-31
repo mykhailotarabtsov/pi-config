@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { FIRSTMATE_CONTROL_ACTIONS, isFirstmateControlAction } from '../extensions/firstmate/control.ts'
 import { assessLocalDelivery, canCleanupAfterDelivery } from '../extensions/firstmate/delivery.ts'
+import { validateWorkerReport, REPORT_VERSION } from '../extensions/firstmate/worker-report.ts'
 import {
   appendUntilArgs,
   canDeleteWithoutRecordedEndpoint,
@@ -146,6 +148,28 @@ test('delivery permits a feature-branch fast-forward and cleanup only after land
   assert.equal(canCleanupAfterDelivery({ reportCompleted: true, deliveryStatus: 'landed', leaseStatus: 'returned' }), true)
 })
 
+test('Firstmate exposes only high-level task actions', () => {
+  assert.deepEqual(FIRSTMATE_CONTROL_ACTIONS, ['status', 'task_create', 'task_reconcile', 'task_deliver', 'task_teardown', 'task_abort', 'task_recover'])
+  assert.equal(isFirstmateControlAction('task_reconcile'), true)
+  assert.equal(isFirstmateControlAction('agent_read'), false)
+  assert.equal(isFirstmateControlAction('pane_run'), false)
+})
+
+test('worker reports are validated independently of worker lifecycle operations', () => {
+  const report = {
+    version: REPORT_VERSION,
+    taskId: 'task-abc-12345678-123',
+    outcome: 'completed',
+    changedFiles: ['extensions/firstmate/index.ts'],
+    tests: ['node --test tests/firstmate-delivery.test.mjs'],
+    validation: ['report is complete'],
+    blockers: [],
+    summary: 'Completed the task.',
+  }
+  assert.deepEqual(validateWorkerReport(report, report.taskId), { report })
+  assert.deepEqual(validateWorkerReport({ ...report, taskId: 'other-task' }, report.taskId), { error: 'report taskId does not match the durable task.' })
+})
+
 test('Firstmate permits only user-scoped browser QA subagent requests', () => {
   assert.equal(isAllowedFirstmateSubagentRequest({ agent: 'browser-tester', task: 'Run browser QA.' }), true)
   assert.equal(isAllowedFirstmateSubagentRequest({ tasks: [{ agent: 'browser-tester', task: 'Run browser QA.' }] }), true)
@@ -210,7 +234,7 @@ test('Firstmate exposes guarded recovery for stale, blocked, failed, and active 
   assert.match(source, /tempCleanupSucceeded/)
   assert.match(source, /deliveryTempCleanupSucceeded/)
   assert.match(source, /deliverySuccess = mergeSuccess && deliveryTempCleanupSucceeded && helperClose.closed/)
-  assert.match(source, /LIFECYCLE_ACTIONS = new Set\(\['task_create', 'task_reconcile'/)
+  assert.match(source, /LIFECYCLE_ACTIONS = new Set<FirstmateControlAction>\(\['task_create', 'task_reconcile'/)
   assert.match(source, /could not persist started worker state/)
   assert.match(source, /worker started but its prompt could not be delivered/)
   const abortStart = source.indexOf("case 'task_abort'")
@@ -431,7 +455,7 @@ test('Firstmate defaults to session-scoped shared isolation and can switch to wo
   const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
   const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
   const teardownStart = source.indexOf("case 'task_teardown'")
-  const teardownEnd = source.indexOf("case 'tab_create'", teardownStart)
+  const teardownEnd = source.indexOf("case 'tab_close'", teardownStart)
   const teardown = source.slice(teardownStart, teardownEnd)
 
   assert.match(source, /const ISOLATION_STATE_ENTRY = 'firstmate-isolation'/)
@@ -455,8 +479,7 @@ test('Firstmate workers and subagents have a hard no-push guard', async () => {
   const permissionGate = await readFile(new URL('../extensions/permission-gate.ts', import.meta.url), 'utf8')
   const gitWrapper = await readFile(new URL('../extensions/firstmate/worker-git/git', import.meta.url), 'utf8')
 
-  assert.ok(firstmate.includes('const GIT_PUSH_COMMAND = /\\bgit'))
-  assert.match(firstmate, /if \(containsGitPush\(params\.command\)\) return errorResult\('git push is blocked/)
+  assert.doesNotMatch(firstmate, /case 'pane_run'/)
   assert.match(firstmate, /export \$\{WORKER_ENV\}=1/)
   assert.match(permissionGate, /const isFirstmateExecution = process\.env\.PI_FIRSTMATE_WORKER === "1"/)
   assert.match(permissionGate, /if \(isFirstmateExecution && containsGitPush\(command\)\)/)
@@ -510,7 +533,7 @@ test('herdr_control renders worker status and reports without orchestration nois
   assert.match(source, /bounded\.length > FIRSTMATE_RENDER_MAX_CHARS/)
 })
 
-test('Pi worker starts append enforced Luna/high arguments after caller native arguments', async () => {
+test('Pi worker starts append enforced Luna/high arguments', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const helperStart = source.indexOf('function appendWorkerNativeArgs')
   const helperEnd = source.indexOf('\n\nexport default function firstmate', helperStart)
@@ -518,15 +541,12 @@ test('Pi worker starts append enforced Luna/high arguments after caller native a
   const taskCreateStart = source.indexOf("case 'task_create'")
   const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
   const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
-  const manualStart = source.indexOf("case 'agent_start'")
-  const manualEnd = source.indexOf("case 'agent_prompt'", manualStart)
-  const manual = source.slice(manualStart, manualEnd)
 
   assert.ok(source.includes("const PI_WORKER_NATIVE_ARGS = ['--model', 'openai-codex/gpt-5.6-luna', '--thinking', 'high']"))
   assert.ok(helper.indexOf("args.push('--', ...nativeArgs)") < helper.indexOf('args.push(...PI_WORKER_NATIVE_ARGS)'))
   assert.match(helper, /if \(kind === 'pi'\) args\.push\(\.\.\.PI_WORKER_NATIVE_ARGS\)/)
   assert.ok(taskCreate.includes('appendWorkerNativeArgs(startArgs, kind)'))
-  assert.ok(manual.includes('appendWorkerNativeArgs(args, kind!, params.args)'))
+  assert.doesNotMatch(source, /case 'agent_start'/)
 })
 
 test('Pi firstmate defaults to an allowlisted Pi worker and exposes a session selector', async () => {
@@ -535,26 +555,20 @@ test('Pi firstmate defaults to an allowlisted Pi worker and exposes a session se
   assert.match(source, /const DEFAULT_WORKER_KIND = 'pi' as const/)
   assert.match(source, /let selectedWorkerKind: WorkerKind = DEFAULT_WORKER_KIND/)
   assert.match(source, /pi\.registerCommand\('firstmate-worker'/)
-  assert.match(source, /const kind = params\.kind === undefined \? selectedWorkerKind : params\.kind/)
   assert.match(source, /const taskWorkerKind = params\.kind === undefined \? selectedWorkerKind : params\.kind/)
-  assert.match(source, /args = \['agent', 'start', params\.name!, '--kind', kind!, '--pane', params\.paneId!\]/)
+  assert.doesNotMatch(source, /case 'agent_start'/)
 })
 
-test('Pi firstmate can select Claude for task and manual workers without Pi native arguments', async () => {
+test('Pi firstmate can select Claude for task workers without Pi native arguments', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const taskCreateStart = source.indexOf("case 'task_create'")
   const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
   const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
-  const manualStart = source.indexOf("case 'agent_start'")
-  const manualEnd = source.indexOf("case 'agent_prompt'", manualStart)
-  const manual = source.slice(manualStart, manualEnd)
 
   assert.match(source, /StringEnum\(ALLOWED_WORKER_KINDS/)
   assert.match(source, /workerKind: taskWorkerKind/)
   assert.match(taskCreate, /const kind = taskWorkerKind/)
   assert.match(taskCreate, /appendWorkerNativeArgs\(startArgs, kind\)/)
-  assert.match(manual, /const kind = params\.kind === undefined \? selectedWorkerKind : params\.kind/)
-  assert.match(manual, /appendWorkerNativeArgs\(args, kind!, params\.args\)/)
   assert.match(source, /if \(kind === 'pi'\) args\.push\(\.\.\.PI_WORKER_NATIVE_ARGS\)/)
   assert.match(source, /workerReportContract\(taskId, reportPath\)/)
   assert.doesNotMatch(source, /workerReportContract[\s\S]{0,500}(?:Claude|Anthropic|provider)/i)

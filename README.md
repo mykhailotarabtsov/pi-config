@@ -129,8 +129,7 @@ The selection is persisted in the Pi session and applies to later `task_create`
 calls. Worker selection is explicitly allowlisted: Pi is the default, and Claude
 can be selected for later workers with `/firstmate-worker claude` (or overridden
 per task with `kind: "claude"`). Use `/firstmate-worker pi` to restore the default.
-The same `kind` override is supported by manual `agent_start`; invalid kinds are
-rejected. Shared-checkout tasks are already local, so they require only a structured
+Shared-checkout tasks are already local, so they require only a structured
 report and reconciliation before teardown. Worktree tasks use [Treehouse](https://github.com/kunchenguid/treehouse)
 for isolated leases and follow this lifecycle:
 
@@ -150,7 +149,7 @@ Firstmate itself never calls MCP. The `browser-tester` agent may use the configu
 browser MCP server for QA, but sign-in is always performed manually by the captain;
 the agent must never automate credentials. Implementation workers and their
 subagents cannot push or publish remote changes. The permission gate hard-blocks
-`git push`, and Firstmate rejects push commands sent through `pane_run`.
+`git push` through the worker Git wrapper and the permission gate.
 
 Firstmate is inspired by [firstmate](https://github.com/kunchenguid/firstmate),
 but this configuration ports only local-only delivery and teardown behavior,
