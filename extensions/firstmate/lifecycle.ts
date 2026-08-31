@@ -1,5 +1,32 @@
 export const WAIT_STATUSES = ['idle', 'done', 'blocked', 'working', 'unknown'] as const
 
+const ALLOWED_FIRSTMATE_SUBAGENT = 'browser-tester'
+
+export function isAllowedFirstmateSubagentRequest(input: unknown): boolean {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return false
+  const request = input as Record<string, unknown>
+  if (request.agentScope !== undefined && request.agentScope !== 'user') return false
+  const requestedAgents: unknown[] = []
+  let modeCount = 0
+  if (request.agent !== undefined || request.task !== undefined) {
+    if (typeof request.agent !== 'string' || typeof request.task !== 'string' || !request.task.trim()) return false
+    requestedAgents.push(request.agent)
+    modeCount++
+  }
+  for (const mode of ['tasks', 'chain']) {
+    if (request[mode] === undefined) continue
+    if (!Array.isArray(request[mode]) || request[mode].length === 0) return false
+    modeCount++
+    for (const entry of request[mode]) {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return false
+      const task = entry as Record<string, unknown>
+      if (typeof task.agent !== 'string' || typeof task.task !== 'string' || !task.task.trim()) return false
+      requestedAgents.push(task.agent)
+    }
+  }
+  return modeCount === 1 && requestedAgents.every((agent) => agent === ALLOWED_FIRSTMATE_SUBAGENT)
+}
+
 export class LifecycleOperationLock {
   private tail = Promise.resolve()
 

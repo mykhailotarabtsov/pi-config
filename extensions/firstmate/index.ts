@@ -12,6 +12,7 @@ import {
   endpointListsConfirmAbsence,
   hasExactWorkerIdentity,
   isPendingLeaseNoop,
+  isAllowedFirstmateSubagentRequest,
   LifecycleOperationLock,
   taskArtifactPaths,
   type EndpointAbsenceStatus,
@@ -59,7 +60,7 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 
 ## Runtime safety delta
 
-- This pane is coordination-only: use read, grep, find, and ls for read-only inspection, use subagent for specialized delegated work, and use herdr_control for implementation-worker coordination; never call mcp directly. The artifact tool is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, or write; delegate mutations through worker panes.
+- This pane is coordination-only: use read, grep, find, and ls for read-only inspection, use the browser-tester subagent only for browser QA, and use herdr_control.task_create / visible worker tabs for all implementation and code mutations; never call mcp directly. The artifact tool is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, or write; delegate mutations through worker panes.
 - Preserve unrelated changes and keep worker changes surgical. Workers must never push, publish, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies. The browser-tester subagent is the sole MCP-capable delegate and may use MCP only for browser QA; it must never automate sign-in or handle credentials.
 - Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Narrow one-file questions may be inspected directly.
 - \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
@@ -70,7 +71,7 @@ You are the Herdr firstmate for this workspace. The captain is your only user-fa
 ## Captain-facing output discipline
 
 - Do not narrate internal inspection, commands, tool arguments, endpoint checks, or durable paths.
-- Use \`subagent\` with \`agent: "browser-tester"\` for browser QA; Firstmate itself must never call \`mcp\`.
+- Use the \`subagent\` tool only with \`agent: "browser-tester"\` for browser QA; never use it for implementation or reconnaissance. Firstmate itself must never call \`mcp\`.
 - After \`task_create\`, give only a concise confirmation that the worker started and is working.
 - Do not poll or read worker scrollback for routine progress; watcher notifications and the structured report are the source of truth.
 - After \`task_reconcile\`, show only the worker report: summary, changed files, tests, validation, and blockers. Keep errors and blockers concise.
@@ -1191,11 +1192,11 @@ export default function firstmate(pi: ExtensionAPI) {
       name: 'herdr_control',
       label: 'Herdr Control',
       description:
-        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded failed/blocked shared cleanup, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Use subagent for specialized delegated work such as browser-tester; Firstmate itself never calls MCP. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
+        'Coordinate this Herdr workspace: durable Treehouse-leased task creation, report reconciliation, guarded failed/blocked shared cleanup, guarded task abort/recovery, worker-tab creation/explicit cleanup, pane commands, and agent start/prompt/wait/read. Use the browser-tester subagent only for browser QA; all implementation and code mutations must use herdr_control.task_create and visible worker tabs. Firstmate itself never calls MCP. Herdr has no native agent stop command; forced recovery uses pane close and verifies absence. Required commands run through Herdr worker panes with shell-quoted arguments.',
       promptSnippet: 'Coordinate visible Herdr worker tabs and agents: create/start/prompt/wait/read, safely reconcile reports, and explicitly recover unsafe workers',
       promptGuidelines: [
-        'Use herdr_control for implementation-worker coordination and subagent for specialized delegated work; Firstmate must never call mcp. Use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, or write. Delegate mutations through worker panes.',
-        'Use subagent with agent: "browser-tester" for browser QA. That delegate may use MCP for browser interaction, but sign-in must always be performed manually by the captain; never automate credentials or authentication.',
+        'Use herdr_control.task_create and visible worker tabs for all implementation and code mutations; use the subagent tool only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance. Firstmate must never call mcp. Use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, or write. Delegate mutations through worker panes.',
+        'Use the subagent tool only with agent: "browser-tester" for browser QA. That delegate may use MCP for browser interaction, but sign-in must always be performed manually by the captain; never automate credentials or authentication. Do not use subagent for implementation or reconnaissance.',
         'Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. One visible implementation worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Inspect narrow one-file questions directly when that is simpler.',
         'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion.',
         'Use task_create with the current session isolation mode, one visible tab per implementation worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
@@ -3742,7 +3743,14 @@ export default function firstmate(pi: ExtensionAPI) {
         block: true,
         terminate: true,
         reason:
-          'Firstmate is coordination-only: only read, grep, find, ls, subagent, herdr_control, and artifact are active; Firstmate never calls mcp. The browser-tester delegate may use MCP for browser QA; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.'
+          'Firstmate is coordination-only: only read, grep, find, ls, the browser-tester-only subagent exception, herdr_control, and artifact are active; Firstmate never calls mcp. All implementation and code mutations must use herdr_control.task_create and visible worker tabs. The browser-tester delegate may use MCP for browser QA; artifact is limited to generated browser artifacts, reports, or diagrams under the project .pi/artifacts/ directory and is not implementation work.'
+      }
+    }
+    if (event.toolName === 'subagent' && !isAllowedFirstmateSubagentRequest(event.input)) {
+      return {
+        block: true,
+        terminate: true,
+        reason: 'Firstmate may use subagent only for browser QA through the user-scoped browser-tester agent; all implementation and reconnaissance must use herdr_control.task_create and visible worker tabs.',
       }
     }
   })

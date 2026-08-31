@@ -4,6 +4,7 @@ import { assessLocalDelivery, canCleanupAfterDelivery } from '../extensions/firs
 import {
   appendUntilArgs,
   canDeleteWithoutRecordedEndpoint,
+  isAllowedFirstmateSubagentRequest,
   canMarkLeaseReturned,
   endpointListsConfirmAbsence,
   hasExactWorkerIdentity,
@@ -118,6 +119,26 @@ test('delivery permits a feature-branch fast-forward and cleanup only after land
   assert.equal(canCleanupAfterDelivery({ reportCompleted: false, deliveryStatus: 'landed', leaseStatus: 'leased' }), false)
   assert.equal(canCleanupAfterDelivery({ reportCompleted: true, deliveryStatus: 'landed', leaseStatus: 'leased' }), true)
   assert.equal(canCleanupAfterDelivery({ reportCompleted: true, deliveryStatus: 'landed', leaseStatus: 'returned' }), true)
+})
+
+test('Firstmate permits only user-scoped browser QA subagent requests', () => {
+  assert.equal(isAllowedFirstmateSubagentRequest({ agent: 'browser-tester', task: 'Run browser QA.' }), true)
+  assert.equal(isAllowedFirstmateSubagentRequest({ tasks: [{ agent: 'browser-tester', task: 'Run browser QA.' }] }), true)
+  assert.equal(isAllowedFirstmateSubagentRequest({ chain: [{ agent: 'browser-tester', task: 'Run browser QA.' }] }), true)
+  assert.equal(isAllowedFirstmateSubagentRequest({ agent: 'worker', task: 'Implement the change.' }), false)
+  assert.equal(isAllowedFirstmateSubagentRequest({ agent: 'browser-tester', task: 'Run browser QA.', agentScope: 'project' }), false)
+  assert.equal(isAllowedFirstmateSubagentRequest({ tasks: [{ agent: 'browser-tester', task: 'Run browser QA.' }, { agent: 'worker', task: 'Implement the change.' }] }), false)
+  assert.equal(isAllowedFirstmateSubagentRequest({ agent: 'browser-tester', task: 'Run browser QA.', tasks: [] }), false)
+  assert.equal(isAllowedFirstmateSubagentRequest({ agent: 'browser-tester' }), false)
+  assert.equal(isAllowedFirstmateSubagentRequest({}), false)
+})
+
+test('Firstmate injects visible-worker-only implementation instructions and guards subagent calls', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  assert.match(source, /herdr_control\.task_create \/ visible worker tabs for all implementation and code mutations/)
+  assert.match(source, /only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance/)
+  assert.match(source, /event\.toolName === 'subagent' && !isAllowedFirstmateSubagentRequest\(event\.input\)/)
+  assert.match(source, /ALLOWED_TOOLS = \['read', 'grep', 'find', 'ls', 'subagent', 'herdr_control', 'artifact'\]/)
 })
 
 test('extension source keeps delivery and cleanup identity/return guards', async () => {
