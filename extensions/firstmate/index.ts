@@ -817,6 +817,14 @@ export default function firstmate(pi: ExtensionAPI) {
           watcherObservations.set(task.taskId, { state, edgeLatched: false, endpointMissingLatched: false })
           continue
         }
+        if (state === 'idle') {
+          try {
+            await fs.promises.access(task.reportPath, fs.constants.R_OK)
+          } catch {
+            watcherObservations.set(task.taskId, { state: 'working', edgeLatched: false, endpointMissingLatched: false })
+            continue
+          }
+        }
 
         let edgeLatched = previous?.edgeLatched ?? false
         const actionable = task.reportStatus !== 'completed' && (state === 'blocked' || state === 'idle' || state === 'done')

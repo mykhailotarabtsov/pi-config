@@ -203,6 +203,13 @@ test('Firstmate injects visible-worker-only implementation instructions and guar
   assert.match(source, /import \{ FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction, type FirstmateControlAction \} from '\.\/control\.ts'/)
 })
 
+test('watcher does not reconcile a transient idle worker before its report exists', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const watcher = source.slice(source.indexOf('async function pollWatcher'), source.indexOf('function startWatcher'))
+  assert.match(watcher, /if \(state === 'idle'\) \{\s+try \{\s+await fs\.promises\.access\(task\.reportPath, fs\.constants\.R_OK\)/)
+  assert.match(watcher, /watcherObservations\.set\(task\.taskId, \{ state: 'working', edgeLatched: false, endpointMissingLatched: false \}\)\s+continue/)
+})
+
 test('extension source keeps delivery and cleanup identity/return guards', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   assert.match(source, /import \{ assessLocalDelivery, canCleanupAfterDelivery \} from '\.\/delivery\.ts'/)
