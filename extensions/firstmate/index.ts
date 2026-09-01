@@ -5,7 +5,7 @@ import * as path from 'node:path'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Text } from '@earendil-works/pi-tui'
 import { assessLocalDelivery, canCleanupAfterDelivery } from './delivery.ts'
-import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, type FirstmateControlAction } from './control.ts'
+import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction, type FirstmateControlAction } from './control.ts'
 import {
   canDeleteWithoutRecordedEndpoint,
   canMarkLeaseReturned,

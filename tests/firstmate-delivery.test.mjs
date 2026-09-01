@@ -200,6 +200,7 @@ test('Firstmate injects visible-worker-only implementation instructions and guar
   assert.match(source, /only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance/)
   assert.match(source, /event\.toolName === 'subagent' && !isAllowedFirstmateSubagentRequest\(event\.input\)/)
   assert.match(source, /isFirstmateAllowedTool\(event\.toolName\)/)
+  assert.match(source, /import \{ FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction, type FirstmateControlAction \} from '\.\/control\.ts'/)
 })
 
 test('extension source keeps delivery and cleanup identity/return guards', async () => {
