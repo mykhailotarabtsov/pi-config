@@ -457,6 +457,24 @@ function isRetryableAgentStartFailure(result: ExecResult): boolean {
   return result.code !== 0 && /agent_pane_busy/.test(output) && /not an available shell/i.test(output)
 }
 
+function isCurrentFirstmateOccupyingRecordedEndpoint(
+  recorded: { workspaceId: string; tabId: string; paneId: string; workerName: string; workerKind: string },
+  observed: Record<string, unknown> | undefined,
+  currentPaneId: string | undefined,
+): boolean {
+  return Boolean(
+    currentPaneId &&
+      PANE_ID_RE.test(currentPaneId) &&
+      observed &&
+      observed.workspace_id === recorded.workspaceId &&
+      observed.tab_id === recorded.tabId &&
+      observed.pane_id === recorded.paneId &&
+      observed.pane_id === currentPaneId &&
+      observed.name === FIRSTMATE_NAME &&
+      !hasExactWorkerIdentity(recorded, observed),
+  )
+}
+
 function appendWorkerNativeArgs(args: string[], kind: string, nativeArgs: string[] = []): void {
   if (nativeArgs.length || kind === 'pi') args.push('--', ...nativeArgs)
   if (kind === 'pi') args.push(...PI_WORKER_NATIVE_ARGS)
@@ -1563,7 +1581,7 @@ export default function firstmate(pi: ExtensionAPI) {
                     }
                     continue
                   }
-                  const liveEndpoint =
+                  const completeRecordedEndpoint =
                     typeof sharedTask.workspaceId === 'string' &&
                     sharedTask.workspaceId === process.env.HERDR_WORKSPACE_ID &&
                     typeof sharedTask.paneId === 'string' &&
@@ -1572,19 +1590,40 @@ export default function firstmate(pi: ExtensionAPI) {
                     TAB_ID_RE.test(sharedTask.tabId) &&
                     typeof sharedTask.workerName === 'string' &&
                     AGENT_NAME_RE.test(sharedTask.workerName) &&
-                    (await runHerdr(['agent', 'get', sharedTask.paneId], signal, 5_000)
-                      .then((result) => {
-                        const agent = (parseJsonMaybe(result.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
-                        return (
-                          result.code === 0 &&
-                          !!agent &&
-                          agent.pane_id === sharedTask.paneId &&
-                          agent.tab_id === sharedTask.tabId &&
-                          agent.workspace_id === sharedTask.workspaceId &&
-                          agent.name === sharedTask.workerName
-                        )
-                      })
-                      .catch(() => false))
+                    sharedTask.workerName !== FIRSTMATE_NAME &&
+                    typeof sharedTask.workerKind === 'string' &&
+                    AGENT_KIND_RE.test(sharedTask.workerKind)
+                  const recordedAgentResult = completeRecordedEndpoint
+                    ? await runHerdr(['agent', 'get', sharedTask.paneId!], signal, 5_000).catch(() => ({ stdout: '', stderr: '', code: 1 }))
+                    : { stdout: '', stderr: '', code: 1 }
+                  const recordedAgent = (parseJsonMaybe(recordedAgentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+                  const currentFirstmateEndpoint =
+                    sharedTask.reportStatus === 'completed' &&
+                    completeRecordedEndpoint &&
+                    isCurrentFirstmateOccupyingRecordedEndpoint(
+                      {
+                        workspaceId: sharedTask.workspaceId!,
+                        tabId: sharedTask.tabId!,
+                        paneId: sharedTask.paneId!,
+                        workerName: sharedTask.workerName!,
+                        workerKind: sharedTask.workerKind!,
+                      },
+                      recordedAgentResult.code === 0 ? recordedAgent : undefined,
+                      process.env.HERDR_PANE_ID,
+                    )
+                  const liveEndpoint =
+                    completeRecordedEndpoint &&
+                    recordedAgentResult.code === 0 &&
+                    hasExactWorkerIdentity(
+                      {
+                        workspaceId: sharedTask.workspaceId!,
+                        tabId: sharedTask.tabId!,
+                        paneId: sharedTask.paneId!,
+                        workerName: sharedTask.workerName!,
+                        workerKind: sharedTask.workerKind!,
+                      },
+                      recordedAgent,
+                    )
                   if (liveEndpoint) {
                     return errorResult('a shared-checkout task is already active for this project; use task_abort/task_recover for stale or blocked work, or switch to worktree isolation.', {
                       action: params.action,
@@ -1592,21 +1631,24 @@ export default function firstmate(pi: ExtensionAPI) {
                       activeTaskId: sharedTask.taskId,
                     })
                   }
-                  const [tabListResult, paneListResult] = await Promise.all([
-                    typeof sharedTask.workspaceId === 'string' ? runHerdr(['tab', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
-                    typeof sharedTask.workspaceId === 'string'
-                      ? runHerdr(['pane', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000)
-                      : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
-                  ])
-                  const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
-                  const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
-                  const endpointAbsent =
-                    tabListResult.code === 0 &&
-                    paneListResult.code === 0 &&
-                    Array.isArray(tabs) &&
-                    Array.isArray(panes) &&
-                    !tabs.some((entry) => isRecord(entry) && entry.tab_id === sharedTask.tabId) &&
-                    !panes.some((entry) => isRecord(entry) && entry.pane_id === sharedTask.paneId)
+                  let endpointAbsent = currentFirstmateEndpoint
+                  if (!currentFirstmateEndpoint) {
+                    const [tabListResult, paneListResult] = await Promise.all([
+                      typeof sharedTask.workspaceId === 'string' ? runHerdr(['tab', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000) : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
+                      typeof sharedTask.workspaceId === 'string'
+                        ? runHerdr(['pane', 'list', '--workspace', sharedTask.workspaceId], signal, 5_000)
+                        : Promise.resolve({ stdout: '', stderr: '', code: 1 }),
+                    ])
+                    const tabs = (parseJsonMaybe(tabListResult.stdout) as { result?: { tabs?: unknown } } | undefined)?.result?.tabs
+                    const panes = (parseJsonMaybe(paneListResult.stdout) as { result?: { panes?: unknown } } | undefined)?.result?.panes
+                    endpointAbsent =
+                      tabListResult.code === 0 &&
+                      paneListResult.code === 0 &&
+                      Array.isArray(tabs) &&
+                      Array.isArray(panes) &&
+                      !tabs.some((entry) => isRecord(entry) && entry.tab_id === sharedTask.tabId) &&
+                      !panes.some((entry) => isRecord(entry) && entry.pane_id === sharedTask.paneId)
+                  }
                   if (!endpointAbsent) {
                     return errorResult('a stale shared-checkout task still has an unverified endpoint; run task_abort/task_recover and preserve the durable record until absence is verified.', {
                       action: params.action,
@@ -1620,7 +1662,9 @@ export default function firstmate(pi: ExtensionAPI) {
                     cleanupStatus: 'tab_closed' as const,
                     endpointStatus: 'absent_verified' as const,
                     cleanupError: undefined,
-                    error: 'recorded worker endpoint is absent; recovered during shared-task admission.',
+                    error: currentFirstmateEndpoint
+                      ? 'recorded worker endpoint is occupied by the current firstmate; recovered during shared-task admission.'
+                      : 'recorded worker endpoint is absent; recovered during shared-task admission.',
                     updatedAt: new Date().toISOString(),
                   }
                   await writeTaskState(staleTask)

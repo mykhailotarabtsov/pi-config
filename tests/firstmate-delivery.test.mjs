@@ -270,6 +270,39 @@ test('Firstmate exposes guarded recovery for stale, blocked, failed, and active 
   assert.match(source, /await fs\.promises\.rename\(lockPath, stalePath\)/)
 })
 
+test('shared admission terminalizes a completed record reused by the current firstmate pane', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const taskCreateStart = source.indexOf("case 'task_create'")
+  const taskCreateEnd = source.indexOf("const taskId = newTaskId()", taskCreateStart)
+  const admission = source.slice(taskCreateStart, taskCreateEnd)
+  const collisionStart = admission.indexOf('const currentFirstmateEndpoint =')
+  const collisionEnd = admission.indexOf('if (liveEndpoint)', collisionStart)
+  const collision = admission.slice(collisionStart, collisionEnd)
+
+  assert.ok(taskCreateStart >= 0 && taskCreateEnd > taskCreateStart)
+  assert.match(source, /function isCurrentFirstmateOccupyingRecordedEndpoint\(/)
+  assert.match(collision, /sharedTask\.reportStatus === 'completed'/)
+  assert.match(source, /observed\.name === FIRSTMATE_NAME/)
+  assert.match(source, /observed\.pane_id === currentPaneId/)
+  assert.doesNotMatch(collision, /tab', 'close|pane', 'close/)
+  assert.match(admission, /cleanupStatus: 'tab_closed'/)
+  assert.match(admission, /recorded worker endpoint is occupied by the current firstmate/)
+})
+
+test('shared admission still refuses a genuine live or mismatched worker endpoint', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const taskCreateStart = source.indexOf("case 'task_create'")
+  const taskCreateEnd = source.indexOf("const taskId = newTaskId()", taskCreateStart)
+  const admission = source.slice(taskCreateStart, taskCreateEnd)
+
+  assert.ok(taskCreateStart >= 0 && taskCreateEnd > taskCreateStart)
+  assert.match(admission, /const liveEndpoint =\s+completeRecordedEndpoint &&\s+recordedAgentResult\.code === 0 &&\s+hasExactWorkerIdentity\(/)
+  assert.match(admission, /if \(liveEndpoint\) \{[\s\S]*a shared-checkout task is already active/s)
+  assert.match(admission, /if \(!endpointAbsent\) \{[\s\S]*a stale shared-checkout task still has an unverified endpoint/s)
+  assert.match(source, /!hasExactWorkerIdentity\(recorded, observed\)/)
+  assert.doesNotMatch(admission.slice(admission.indexOf('const currentFirstmateEndpoint ='), admission.indexOf('if (liveEndpoint)')), /agent_status/)
+})
+
 test('failed and blocked reconciliation uses guarded shared cleanup without teardown or force', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const cleanupStart = source.indexOf('const reconcileFailedSharedTask = async')
