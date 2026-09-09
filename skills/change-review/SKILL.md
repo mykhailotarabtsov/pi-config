@@ -1,61 +1,44 @@
 ---
 name: change-review
-description: "Review code changes for bugs, risks, and missing tests"
+description: Review changes for bugs, risks, missing tests, and scope drift
 ---
 
-# Change Review
+# Change review
 
-Review code changes before calling work complete.
+Use after implementation and before calling work complete.
 
-## When to use
+## Role-aware review
 
-Use this skill when:
-- A feature/fix is implemented and needs a quick quality check
-- You want a focused review for regressions, risks, and missing tests
-- You want to validate that the change matches the original request
+- The `reviewer` agent is static and read-only: inspect diffs and relevant
+  files, but do not build or run tests. Cite test evidence supplied by the main
+  session or `unit-tester`, and mark tests `not run` when absent.
+- The normal main session may run the relevant tests after review. Delegate test
+  execution to `unit-tester` when that is clearer. A test failure or blocked
+  test is evidence, not completion.
 
-## Review checklist
+## Checklist
 
-1. Understand intent
-- Re-read the task/request in one sentence
-- Confirm scope is clear
-
-2. Inspect changed files
-- Read all modified files fully
-- Check for accidental extra changes
-
-3. Validate behavior and risk
-- Look for logic errors and edge-case misses
-- Look for security and data-exposure risks
-- Confirm error handling is explicit (fail fast over silent failures)
-
-4. Verify tests
-- Run the relevant test command(s)
-- If no tests exist, state that clearly and propose minimal test coverage
-
-5. Report findings by severity
-- P0: production-breaking/security-critical
-- P1: high-impact bug or reliability risk
-- P2: important improvement
-- P3: minor polish
-
-## Output format
-
-Use this structure:
+1. Restate the requested outcome, authority, scope/files, and acceptance
+   criteria.
+2. Read every changed file and inspect the diff for accidental extra changes.
+3. Check behavior, edge cases, security/data exposure, maintainability, and
+   missing tests. Distinguish verified defects from residual risk.
+4. Confirm unrelated working-tree changes were preserved.
+5. Report shared severity levels: P0 critical/security, P1 high impact, P2
+   important, P3 minor polish.
 
 ```markdown
 ## Change Review
-- **Intent:** <one sentence>
+- **Intent:** one sentence
 - **Verdict:** APPROVED | NEEDS CHANGES
 
 ### Findings
-- [P1] <issue> - <file/path> - <why it matters>
+- [P0-P3] path/location — issue, impact, and evidence.
+- None found in reviewed scope.
 
 ### Tests
-- `<command>`: pass/fail
+- `command` — pass/fail/blocked/not run, with source of evidence
 
 ### Residual Risks
-- <known gaps or "none">
+- Known gap or `None`
 ```
-
-If there are no findings, explicitly say: `No issues found in reviewed scope.`

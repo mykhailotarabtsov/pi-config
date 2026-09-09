@@ -1,28 +1,11 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
-import { join, relative } from "node:path";
+import { relative } from "node:path";
 import { CONFIG } from "./config.js";
-
-/** Parse human-readable file size strings ("1MB", "512KB") or raw byte numbers into bytes. Falls back to 1MB on invalid input. */
-export function parseFileSize(value: string | number, fallback: number = 1024 ** 2): number {
-  if (typeof value === "number") return value;
-  try {
-    const match = value.match(/^(\d+(?:\.\d+)?)\s*(KB|MB|GB)?$/i);
-    if (!match) return fallback;
-    const num = parseFloat(match[1]);
-    const unit = (match[2] ?? "").toUpperCase();
-    const multipliers: Record<string, number> = { KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 };
-    return Math.round(num * (multipliers[unit] ?? 1));
-  } catch {
-    return fallback;
-  }
-}
-
-export const PATCH_FLAG = Symbol.for("styled-outputs:patched");
 
 export let currentTheme: Theme | undefined;
 
-export function setCurrentTheme(theme: Theme): void {
+export function setCurrentTheme(theme: Theme | undefined): void {
   currentTheme = theme;
 }
 

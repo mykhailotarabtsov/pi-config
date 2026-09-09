@@ -1,10 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 import { artifactUrl, displayArtifactUrl, isRunning, markArtifactTrusted, notifyReload, runningPort, stopServer } from "./server.js";
 import { MAX_ARTIFACT_BYTES, MAX_INPUT_BYTES } from "./config.js";
 import { artifactExists, artifactPath, isSafeSlug, listArtifacts, openInBrowser, readInputFile, slugify, writeArtifact } from "./utils.js";
 import { renderHtmlDocument, renderMarkdownDocument } from "./templates.js";
+import { artifactErrorMessage } from "./errors.js";
 
 interface ArtifactDetails {
   action: string;
@@ -15,16 +17,38 @@ interface ArtifactDetails {
   absPath?: string;
 }
 
-function errorResult(message: string, details: ArtifactDetails = {}) {
-  return {
-    content: [{ type: "text" as const, text: `Error: ${message}` }],
-    isError: true,
-    details: { ...details } as Record<string, unknown>,
-  };
+class ArtifactToolError extends Error {
+  readonly details: Record<string, unknown>;
+
+  constructor(message: string, details: ArtifactDetails) {
+    super(message);
+    this.name = "ArtifactToolError";
+    this.details = { ...details };
+  }
 }
 
 export default function artifacts(pi: ExtensionAPI) {
-  pi.on("session_shutdown", () => stopServer());
+  const pendingErrorDetails = new Map<string, Record<string, unknown>>();
+
+  function fail(toolCallId: string, message: string, details: ArtifactDetails = {}): never {
+    const error = new ArtifactToolError(message, details);
+    pendingErrorDetails.set(toolCallId, error.details);
+    throw error;
+  }
+
+  // Pi marks thrown tool errors as isError. Preserve the structured artifact
+  // details for renderers and callers through the supported result middleware.
+  pi.on("tool_result", async (event: any) => {
+    if (event.toolName !== "artifact" || !event.isError) return;
+    const details = pendingErrorDetails.get(event.toolCallId);
+    pendingErrorDetails.delete(event.toolCallId);
+    return details ? { details } : undefined;
+  });
+
+  pi.on("session_shutdown", () => {
+    pendingErrorDetails.clear();
+    stopServer();
+  });
 
   pi.registerCommand("artifacts", {
     description: "Open the local artifacts index in a browser",
@@ -47,14 +71,14 @@ export default function artifacts(pi: ExtensionAPI) {
     description: "Create safe browser artifacts from Markdown or sanitized static HTML. Supports reports, tables, code, diffs, and optional Mermaid diagrams. Files are stored under .pi/artifacts and served through a token-protected localhost server.",
     promptSnippet: "Emit visual output (reports, diagrams, rendered diffs, tables) as a browser artifact instead of terminal text",
     parameters: Type.Object({
-      action: Type.Union([Type.Literal("create"), Type.Literal("update"), Type.Literal("open"), Type.Literal("list")]),
+      action: StringEnum(["create", "update", "open", "list"] as const),
       title: Type.Optional(Type.String({ description: "Artifact title; slug is derived from it." })),
-      kind: Type.Optional(Type.Union([Type.Literal("markdown"), Type.Literal("html")], { description: "markdown is preferred; html accepts only a sanitized static fragment (scripts, styles, event handlers, iframes, and full documents are removed/rejected)." })),
+      kind: Type.Optional(StringEnum(["markdown", "html"] as const)),
       content: Type.Optional(Type.String({ description: "Inline Markdown or static HTML fragment." })),
       path: Type.Optional(Type.String({ description: "Optional relative path to a regular, non-sensitive UTF-8 file inside the project. Absolute paths, symlinks, and traversal are rejected." })),
       open: Type.Optional(Type.Boolean({ description: "Open in the browser after create/update. Disabled automatically without interactive UI." })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
       const action = params.action;
       if (action === "list") {
         const entries = listArtifacts();
@@ -66,33 +90,38 @@ export default function artifacts(pi: ExtensionAPI) {
       }
 
       const title = params.title?.trim();
-      if (!title) return errorResult("`title` is required for create, update, and open.", { action });
-      if (title.length > 200) return errorResult("`title` must be 200 characters or fewer.", { action });
+      if (!title) fail(toolCallId, "`title` is required for create, update, and open.", { action });
+      if (title.length > 200) fail(toolCallId, "`title` must be 200 characters or fewer.", { action });
       const slug = slugify(title);
-      if (!isSafeSlug(slug)) return errorResult(`derived slug "${slug}" is invalid.`, { action, title, slug });
-      const absPath = artifactPath(slug);
+      if (!isSafeSlug(slug)) fail(toolCallId, `derived slug "${slug}" is invalid.`, { action, title, slug });
+      let absPath: string;
+      try {
+        absPath = artifactPath(slug);
+      } catch (error) {
+        fail(toolCallId, artifactErrorMessage(error, "could not access artifact storage"), { action, title, slug });
+      }
 
       if (action === "open") {
-        if (!artifactExists(slug)) return errorResult(`no artifact with slug "${slug}" — create it first.`, { action, title, slug, absPath });
+        if (!artifactExists(slug)) fail(toolCallId, `no artifact with slug "${slug}" — create it first.`, { action, title, slug, absPath });
         if (!ctx.hasUI) return { content: [{ type: "text" as const, text: `Artifact available at ${absPath}; browser opening requires interactive UI.` }], details: { action, title, slug, absPath } as Record<string, unknown> };
         const privateUrl = await artifactUrl(slug);
         const url = displayArtifactUrl(slug);
-        if (!url) return errorResult("artifact server is unavailable", { action, title, slug, absPath });
+        if (!url) fail(toolCallId, "artifact server is unavailable", { action, title, slug, absPath });
         openInBrowser(privateUrl);
         return { content: [{ type: "text" as const, text: `Opened ${title}\n${url} (session-local; browser cookie required)\n${absPath}` }], details: { action, title, slug, url, absPath } as Record<string, unknown> };
       }
 
       const exists = artifactExists(slug);
-      if (action === "create" && exists) return errorResult(`an artifact with slug "${slug}" already exists — use update instead.`, { action, title, slug, absPath });
-      if (action === "update" && !exists) return errorResult(`no artifact with slug "${slug}" — create it first.`, { action, title, slug, absPath });
-      if (!params.kind) return errorResult("`kind` (markdown or html) is required for create/update.", { action, title, slug, absPath });
+      if (action === "create" && exists) fail(toolCallId, `an artifact with slug "${slug}" already exists — use update instead.`, { action, title, slug, absPath });
+      if (action === "update" && !exists) fail(toolCallId, `no artifact with slug "${slug}" — create it first.`, { action, title, slug, absPath });
+      if (!params.kind) fail(toolCallId, "`kind` (markdown or html) is required for create/update.", { action, title, slug, absPath });
       const resolved = params.content != null
         ? { content: params.content }
         : params.path
           ? readInputFile(params.path, ctx.cwd)
           : { error: "provide `content` or `path` for create/update." };
-      if ("error" in resolved) return errorResult(resolved.error, { action, title, slug, kind: params.kind, absPath });
-      if (Buffer.byteLength(resolved.content, "utf8") > MAX_INPUT_BYTES) return errorResult("content exceeds the 2 MB limit.", { action, title, slug, kind: params.kind, absPath });
+      if ("error" in resolved) fail(toolCallId, resolved.error, { action, title, slug, kind: params.kind, absPath });
+      if (Buffer.byteLength(resolved.content, "utf8") > MAX_INPUT_BYTES) fail(toolCallId, "content exceeds the 2 MB limit.", { action, title, slug, kind: params.kind, absPath });
 
       let html: string;
       try {
@@ -103,7 +132,7 @@ export default function artifacts(pi: ExtensionAPI) {
         writeArtifact(slug, html);
         markArtifactTrusted(slug, html);
       } catch (error) {
-        return errorResult(error instanceof Error ? error.message : "could not render artifact", { action, title, slug, kind: params.kind, absPath });
+        fail(toolCallId, artifactErrorMessage(error, "could not render or write artifact"), { action, title, slug, kind: params.kind, absPath });
       }
 
       notifyReload(slug);

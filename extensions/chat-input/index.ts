@@ -2,7 +2,7 @@ import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent
 import type { TUI, EditorTheme } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { CONFIG, COMPANION_PADDING, MIN_WIDTH_FOR_COMPANION, DEFAULT_CONFIG } from "./config.js";
+import { CONFIG, COMPANION_PADDING, MIN_WIDTH_FOR_COMPANION } from "./config.js";
 import { applyColor, CompanionAnimator } from "./utils.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -61,11 +61,24 @@ class ChatInput extends CustomEditor {
 		this.chatModeAccent = chatModeAccentFn;
 		this.companionColor = companionColor;
 
-		// Animate companion even when idle — tick drives state machine
+	}
+
+	private startCompanionTimer(): void {
+		if (this.companionTimer || !CONFIG.COMPANION_ENABLED) return;
 		this.companionTimer = setInterval(() => {
 			this.animator.tick(Date.now());
 			this.tui.requestRender();
 		}, 100);
+	}
+
+	private stopCompanionTimer(): void {
+		if (!this.companionTimer) return;
+		clearInterval(this.companionTimer);
+		this.companionTimer = null;
+	}
+
+	dispose(): void {
+		this.stopCompanionTimer();
 	}
 
 	private isBashMode(): boolean {
@@ -74,6 +87,11 @@ class ChatInput extends CustomEditor {
 	}
 
 	render(width: number): string[] {
+		if (CONFIG.COMPANION_ENABLED && width >= MIN_WIDTH_FOR_COMPANION) {
+			this.startCompanionTimer();
+		} else {
+			this.stopCompanionTimer();
+		}
 		const padMultiplier = CONFIG.BOXED_VIEW ? 3 : 1;
 		if (width < 5 + CONFIG.BOX_PAD_X * padMultiplier) return super.render(width);
 
@@ -294,7 +312,10 @@ class ChatInput extends CustomEditor {
 
 // ─── Extension entry ──────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
+	let activeEditor: ChatInput | null = null;
+
 	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.mode !== "tui") return;
 		ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, kb: KeybindingsManager) => {
 			const colorFn = (s: string) => applyColor(ctx.ui.theme, CONFIG.BORDER_COLOR, s);
 			const accentFn = (s: string) => applyColor(ctx.ui.theme, CONFIG.PREFIX_COLOR, s);
@@ -305,7 +326,14 @@ export default function (pi: ExtensionAPI) {
 			const chatModeColorFn = (s: string) => applyColor(ctx.ui.theme, CONFIG.CHAT_MODE_BORDER_COLOR, s);
 			const chatModeAccentFn = (s: string) => applyColor(ctx.ui.theme, CONFIG.CHAT_MODE_PREFIX_COLOR, s);
 			const companionColorFn = (s: string) => applyColor(ctx.ui.theme, CONFIG.COMPANION_COLOR, s);
-			return new ChatInput(tui, theme, kb, colorFn, accentFn, bashColorFn, bashAccentFn, planModeColorFn, planModeAccentFn, chatModeColorFn, chatModeAccentFn, companionColorFn);
+			activeEditor?.dispose();
+			activeEditor = new ChatInput(tui, theme, kb, colorFn, accentFn, bashColorFn, bashAccentFn, planModeColorFn, planModeAccentFn, chatModeColorFn, chatModeAccentFn, companionColorFn);
+			return activeEditor;
 		});
+	});
+
+	pi.on("session_shutdown", async () => {
+		activeEditor?.dispose();
+		activeEditor = null;
 	});
 }

@@ -1,15 +1,15 @@
 import type { ExtensionAPI, ReadonlyFooterDataProvider, Theme, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 import type { TUI } from "@earendil-works/pi-tui";
 
-import type { SegmentContext, StatusLineSegmentId, UsageStats, SessionEvent, ThinkingLevelEvent, AssistantMessageEvent, ToolResultEvent, UserBashEvent } from "./types.js";
+import type { SegmentContext, StatusLineSegmentId, UsageStats, ToolResultEvent, UserBashEvent } from "./types.js";
 import { renderSegment } from "./segments/index.js";
 import { collapseSegmentSeparators } from "./segments/layout.js";
-import { getGitStatus, invalidateGitStatus, invalidateGitBranch } from "./git-status.js";
+import { getGitStatus, invalidateGitStatus, invalidateGitBranch, onGitBranchChange } from "./git-status.js";
 import { getEffectiveConfig } from "./config.js";
 import { getIcons } from "./icons.js";
 import { getDefaultColors, fg } from "./theme.js";
+import { resolveContextUsage } from "./context-usage.js";
 
 const GIT_BRANCH_PATTERNS: RegExp[] = [
   /\bgit\s+(checkout|switch|branch\s+-[dDmM]|merge|rebase|pull|reset|worktree)/,
@@ -99,18 +99,31 @@ export default function footer(pi: ExtensionAPI) {
   let sessionStartTime = Date.now();
   let currentCtx: ExtensionContext | null = null;
   let footerDataRef: ReadonlyFooterDataProvider | null = null;
-  let lastBranchLength = 0;
+  let lastBranchKey = "";
   let cachedUsageStats: UsageStats | null = null;
   let tuiRef: TUI | null = null;
+  let footerDispose: (() => void) | null = null;
+  let branchRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const removeBranchListener = onGitBranchChange(() => tuiRef?.requestRender());
+
+  function scheduleGitRefresh(): void {
+    if (branchRefreshTimer) clearTimeout(branchRefreshTimer);
+    branchRefreshTimer = setTimeout(() => {
+      branchRefreshTimer = null;
+      tuiRef?.requestRender();
+    }, 100);
+  }
 
   // Track session start
   pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
     sessionStartTime = Date.now();
     currentCtx = ctx;
-    lastBranchLength = 0;
+    lastBranchKey = "";
     cachedUsageStats = null;
+    footerDispose?.();
+    footerDispose = null;
 
-    if (ctx.hasUI) {
+    if (ctx.mode === "tui") {
       setupFooter(ctx);
     }
   });
@@ -119,13 +132,15 @@ export default function footer(pi: ExtensionAPI) {
   pi.on("tool_result", async (event: ToolResultEvent, _ctx: ExtensionContext) => {
     if (event.toolName === "write" || event.toolName === "edit") {
       invalidateGitStatus();
+      tuiRef?.requestRender();
+      scheduleGitRefresh();
     }
     if (event.toolName === "bash" && event.input?.command) {
       const cmd = String(event.input.command);
       if (GIT_BRANCH_PATTERNS.some(p => p.test(cmd))) {
         invalidateGitStatus();
         invalidateGitBranch();
-        setTimeout(() => tuiRef?.requestRender(), 100);
+        scheduleGitRefresh();
       }
     }
   });
@@ -135,58 +150,78 @@ export default function footer(pi: ExtensionAPI) {
     if (GIT_BRANCH_PATTERNS.some(p => p.test(event.command))) {
       invalidateGitStatus();
       invalidateGitBranch();
+      // This render starts the async branch lookup; the listener above also
+      // requests a render when that lookup actually completes.
       tuiRef?.requestRender();
+      scheduleGitRefresh();
     }
+  });
+
+  pi.on("session_shutdown", async () => {
+    footerDispose?.();
+    footerDispose = null;
+    if (branchRefreshTimer) clearTimeout(branchRefreshTimer);
+    branchRefreshTimer = null;
+    removeBranchListener();
+    currentCtx = null;
+    footerDataRef = null;
+    tuiRef = null;
+    cachedUsageStats = null;
+    lastBranchKey = "";
   });
 
   function buildSegmentContext(ctx: ExtensionContext, width: number, theme: Theme): SegmentContext {
     const effectiveConfig = getEffectiveConfig();
     const colors = effectiveConfig.colors ?? getDefaultColors();
 
-    const branch = (ctx.sessionManager?.getBranch?.() ?? []) as SessionEvent[];
-    const branchLen = branch.length;
+    const branch = (ctx.sessionManager?.getBranch?.() ?? []) as any[];
+    const usageOf = (value: any): UsageStats | null => {
+      if (!value || typeof value !== "object") return null;
+      const input = Number(value.input) || 0;
+      const output = Number(value.output) || 0;
+      const cacheRead = Number(value.cacheRead) || 0;
+      const cacheWrite = Number(value.cacheWrite) || 0;
+      const cost = Number(value.cost?.total) || 0;
+      if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0 && cost === 0) return null;
+      return { input, output, cacheRead, cacheWrite, cost };
+    };
+    const usageKey = (value: any): string => {
+      const usage = usageOf(value);
+      return usage ? Object.values(usage).join(",") : "";
+    };
+    const branchKey = branch.map((entry: any) => {
+      const message = entry.type === "message" ? entry.message : undefined;
+      return [entry.id ?? "", entry.type, message?.role ?? "", message?.stopReason ?? "", entry.thinkingLevel ?? "", usageKey(message?.usage ?? entry.usage)].join(":");
+    }).join("|");
 
-    const isAssistantMessageEvent = (e: SessionEvent): e is AssistantMessageEvent =>
-      e.type === "message" && (e as AssistantMessageEvent).message.role === "assistant";
-    const completedMessages = branch
-      .filter(isAssistantMessageEvent)
-      .map(e => e.message as AssistantMessage)
-      .filter(m => m.stopReason !== "error" && m.stopReason !== "aborted");
-
-    // Cache usageStats — only recompute when branch grows
+    // Cache by branch content, not length: streamed/finalized entries can change
+    // without adding a new entry, and tool/compaction usage lives on other types.
     let usageStats: UsageStats;
-    if (cachedUsageStats && branchLen === lastBranchLength) {
+    if (cachedUsageStats && branchKey === lastBranchKey) {
       usageStats = cachedUsageStats;
     } else {
-      usageStats = completedMessages.reduce<UsageStats>(
-        (acc, m) => ({
-          input: acc.input + m.usage.input,
-          output: acc.output + m.usage.output,
-          cacheRead: acc.cacheRead + m.usage.cacheRead,
-          cacheWrite: acc.cacheWrite + m.usage.cacheWrite,
-          cost: acc.cost + m.usage.cost.total,
-        }),
-        { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-      );
+      usageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+      for (const entry of branch as any[]) {
+        const message = entry.type === "message" ? entry.message : undefined;
+        const usage = usageOf(message?.usage ?? entry.usage);
+        if (!usage) continue;
+        usageStats.input += usage.input;
+        usageStats.output += usage.output;
+        usageStats.cacheRead += usage.cacheRead;
+        usageStats.cacheWrite += usage.cacheWrite;
+        usageStats.cost += usage.cost;
+      }
       cachedUsageStats = usageStats;
-      lastBranchLength = branchLen;
+      lastBranchKey = branchKey;
     }
 
-    const isThinkingEvent = (e: SessionEvent): e is ThinkingLevelEvent =>
-      e.type === "thinking_level_change";
-    const thinkingLevelFromSession = branch
-      .filter(isThinkingEvent)
-      .reduce((_, e) => e.thinkingLevel ?? "off", "off");
-
-    const lastAssistant = completedMessages.at(-1);
-
-    // Calculate context percentage
-    const contextTokens = lastAssistant
-      ? lastAssistant.usage.input + lastAssistant.usage.output +
-        lastAssistant.usage.cacheRead + lastAssistant.usage.cacheWrite
-      : 0;
-    const contextWindow = ctx.model?.contextWindow || 0;
-    const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+    // Pi's live context usage includes the current turn and is more accurate
+    // than deriving context size from the last completed assistant message.
+    const contextUsage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+    const { percent: contextPercent, contextWindow } = resolveContextUsage(
+      contextUsage,
+      ctx.model?.contextWindow,
+    );
 
     // Get git status (cached)
     const gitBranch = footerDataRef?.getGitBranch() ?? null;
@@ -202,7 +237,7 @@ export default function footer(pi: ExtensionAPI) {
     return {
       model: ctx.model,
       isLocalModel,
-      thinkingLevel: thinkingLevelFromSession || pi.getThinkingLevel(),
+      thinkingLevel: ctx.thinkingLevel || pi.getThinkingLevel(),
       sessionId: ctx.sessionManager?.getSessionId?.(),
       usageStats,
       contextPercent,
@@ -223,14 +258,32 @@ export default function footer(pi: ExtensionAPI) {
       footerDataRef = footerData;
       tuiRef = tui;
 
-      // Expose a re-render trigger for out-of-turn state changes (e.g. /caveman toggle).
-      (globalThis as Record<string, unknown>).__footerRequestRender = () => tui.requestRender();
-
-      // Subscribe to branch changes for re-render
-      const unsub = footerData.onBranchChange(() => tui.requestRender());
+      const globals = globalThis as Record<string, unknown>;
+      const previousRenderHook = globals.__footerRequestRender;
+      const requestRender = () => tui.requestRender();
+      globals.__footerRequestRender = requestRender;
+      const unsub = footerData.onBranchChange(() => {
+        cachedUsageStats = null;
+        lastBranchKey = "";
+        requestRender();
+      });
+      let disposed = false;
+      const dispose = () => {
+        if (disposed) return;
+        disposed = true;
+        unsub?.();
+        if (globals.__footerRequestRender === requestRender) {
+          if (previousRenderHook === undefined) delete globals.__footerRequestRender;
+          else globals.__footerRequestRender = previousRenderHook;
+        }
+        if (footerDataRef === footerData) footerDataRef = null;
+        if (tuiRef === tui) tuiRef = null;
+        if (footerDispose === dispose) footerDispose = null;
+      };
+      footerDispose = dispose;
 
       return {
-        dispose: unsub,
+        dispose,
         invalidate() {},
         render(width: number): string[] {
           if (!currentCtx) return [];

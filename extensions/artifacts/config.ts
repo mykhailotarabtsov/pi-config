@@ -1,5 +1,5 @@
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 
 export const ARTIFACT_DIR = ".pi/artifacts";
@@ -24,7 +24,7 @@ const DEFAULTS: ArtifactsConfig = {
   mermaid: true,
 };
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "configs", "artifacts.json");
+const CONFIG_PATH = join(getAgentDir(), "configs", "artifacts.json");
 
 function safeColor(value: unknown, fallback: string): string {
   return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
@@ -40,7 +40,11 @@ function loadConfig(): ArtifactsConfig {
       maxWidth: typeof raw.maxWidth === "number" && raw.maxWidth >= 400 && raw.maxWidth <= 1400 ? raw.maxWidth : DEFAULTS.maxWidth,
       mermaid: raw.mermaid === true ? true : raw.mermaid === false ? false : DEFAULTS.mermaid,
     };
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      // Do not print parser errors: they can include private config values.
+      console.warn(`[artifacts] Unable to load ${CONFIG_PATH}; using defaults.`);
+    }
     return DEFAULTS;
   }
 }

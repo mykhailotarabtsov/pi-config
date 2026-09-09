@@ -21,6 +21,7 @@ let pendingFetch: Promise<void> | null = null;
 let pendingBranchFetch: Promise<void> | null = null;
 let invalidationCounter = 0;
 let branchInvalidationCounter = 0;
+const branchReadyListeners = new Set<() => void>();
 
 function parseGitStatusOutput(output: string): { staged: number; unstaged: number; untracked: number } {
   let staged = 0;
@@ -93,6 +94,17 @@ async function fetchGitBranch(): Promise<string | null> {
   return sha ? `${sha} (detached)` : "detached";
 }
 
+export function onGitBranchChange(listener: () => void): () => void {
+  branchReadyListeners.add(listener);
+  return () => branchReadyListeners.delete(listener);
+}
+
+export function notifyGitBranchChange(): void {
+  for (const listener of branchReadyListeners) {
+    try { listener(); } catch { /* UI refresh listeners must not break git caching. */ }
+  }
+}
+
 async function fetchGitStatus(): Promise<{ staged: number; unstaged: number; untracked: number } | null> {
   const output = await runGit(["status", "--porcelain"], 500);
   if (output === null) return null;
@@ -114,6 +126,7 @@ export function getCurrentBranch(providerBranch: string | null): string | null {
           branch: result,
           timestamp: Date.now(),
         };
+        notifyGitBranchChange();
       }
       pendingBranchFetch = null;
     });

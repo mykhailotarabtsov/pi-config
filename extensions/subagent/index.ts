@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -23,11 +24,19 @@ import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@ear
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { readSubagentTimeoutSeconds, trustedSubagentResourceRoots } from "./config.ts";
+import { BoundedJsonlReader, getLatestAssistantText, messageUsesTools, RollingMessageBuffer } from "./stream.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const MAX_STDERR_LINES = 2_000;
+const MAX_MESSAGES = 400;
+const MAX_MESSAGE_BYTES = 128 * 1024;
+const MAX_MESSAGE_BYTES_TOTAL = 2 * 1024 * 1024;
+const MAX_STREAM_BUFFER_BYTES = 256 * 1024;
+const MAX_CHAIN_STEPS = 8;
 // Chain handoffs are prompt input to the next child; keep them bounded without losing context at either edge.
 export const CHAIN_HANDOFF_MAX_CHARS = 12_000;
 const CHAIN_HANDOFF_TRUNCATION_MARKER = "\n\n[Previous output truncated: beginning and end preserved.]\n\n";
@@ -155,6 +164,10 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	attempts?: SingleResult[];
+	privateLogPath?: string;
+	usedTools: boolean;
+	protocolIncomplete?: boolean;
 }
 
 interface SubagentDetails {
@@ -162,22 +175,52 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	collisions: string[];
 }
 
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
+function truncateUtf8(value: string, maxBytes: number, preserveEdges = false): string {
+	if (maxBytes <= 0) return "";
+	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	const marker = "\n\n[Output truncated: content omitted.]\n\n";
+	const markerBytes = Buffer.byteLength(marker, "utf8");
+	if (maxBytes <= markerBytes) {
+		let prefix = value.slice(0, maxBytes);
+		while (Buffer.byteLength(prefix, "utf8") > maxBytes) prefix = prefix.slice(0, -1);
+		return prefix;
 	}
-	return "";
+	const available = maxBytes - markerBytes;
+	if (!preserveEdges) {
+		let head = value.slice(0, available);
+		while (Buffer.byteLength(head, "utf8") > available) head = head.slice(0, -1);
+		return `${head}${marker}`;
+	}
+	const headBytes = Math.ceil(available / 2);
+	const tailBytes = Math.floor(available / 2);
+	let head = value.slice(0, headBytes);
+	let tail = value.slice(-tailBytes);
+	while (Buffer.byteLength(head, "utf8") > headBytes) head = head.slice(0, -1);
+	while (Buffer.byteLength(tail, "utf8") > tailBytes) tail = tail.slice(1);
+	return `${head}${marker}${tail}`;
+}
+
+function boundMessage(message: Message): Message {
+	const content = Array.isArray(message.content)
+		? message.content.map((part: any) => {
+			if (part?.type === "text" && typeof part.text === "string") {
+				return { ...part, text: truncateUtf8(part.text, MAX_MESSAGE_BYTES, true) };
+			}
+			return part;
+		})
+		: message.content;
+	return { ...message, content } as Message;
+}
+
+export function getFinalOutput(messages: Message[]): string {
+	return truncateUtf8(getLatestAssistantText(messages), PER_TASK_OUTPUT_CAP, true);
 }
 
 function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted" || result.stopReason === "timeout";
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -188,14 +231,7 @@ function getResultOutput(result: SingleResult): string {
 }
 
 function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
+	return truncateUtf8(output, PER_TASK_OUTPUT_CAP, true);
 }
 
 export function truncateChainHandoff(output: string): string {
@@ -206,13 +242,27 @@ export function truncateChainHandoff(output: string): string {
 	return `${output.slice(0, headLength)}${CHAIN_HANDOFF_TRUNCATION_MARKER}${output.slice(-tailLength)}`;
 }
 
-export function createSubagentEnvironment(defaultCwd: string, agentName?: string): NodeJS.ProcessEnv {
+export function createSubagentEnvironment(
+  defaultCwd: string,
+  agentName?: string,
+  agentSource?: "user" | "project",
+  agentDefinition?: string,
+): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	for (const key of Object.keys(env)) {
 		if (key.startsWith("HERDR_") || key.startsWith("PI_FIRSTMATE_")) delete env[key];
 	}
 	env.PI_SUBAGENT_CHILD = "1";
+	delete env.PI_SUBAGENT_AGENT;
+	delete env.PI_SUBAGENT_AGENT_SOURCE;
+	delete env.PI_SUBAGENT_AGENT_DEFINITION;
 	if (agentName) env.PI_SUBAGENT_AGENT = agentName;
+	if (agentSource) env.PI_SUBAGENT_AGENT_SOURCE = agentSource;
+	if (agentDefinition) env.PI_SUBAGENT_AGENT_DEFINITION = path.resolve(agentDefinition);
+	// Keep this identity separate from coordinator variables so it survives the
+	// PI_FIRSTMATE_* scrub and protects children from obvious publishing commands.
+	env.PI_PERMISSION_NO_PUBLISH = "1";
+	env.PI_PERMISSION_RESOURCE_ROOTS = trustedSubagentResourceRoots().join(path.delimiter);
 	env.PI_PERMISSION_ROOT = process.env.PI_PERMISSION_ROOT ?? path.resolve(defaultCwd);
 	return env;
 }
@@ -262,6 +312,46 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
+export function createChildGroupTerminator(
+	proc: { pid?: number; kill: (signal?: NodeJS.Signals) => void },
+	killDelayMs = 5_000,
+): { requestStop: () => void; finish: () => void } {
+	let stopRequested = false;
+	let killTimer: NodeJS.Timeout | undefined;
+	const killGroup = (signal: NodeJS.Signals) => {
+		try {
+			if (process.platform !== "win32" && typeof proc.pid === "number" && proc.pid > 0) process.kill(-proc.pid, signal);
+			else proc.kill(signal);
+		} catch {
+			try { proc.kill(signal); } catch { /* already exited */ }
+		}
+	};
+	return {
+		requestStop: () => {
+			if (stopRequested) return;
+			stopRequested = true;
+			killGroup("SIGTERM");
+			killTimer = setTimeout(() => {
+				// The leader may have exited while descendants keep the pipes open.
+				// Always signal the process group after the grace period.
+				killGroup("SIGKILL");
+				killTimer = undefined;
+			}, killDelayMs);
+		},
+		finish: () => {
+			if (!stopRequested && killTimer) {
+				clearTimeout(killTimer);
+				killTimer = undefined;
+			}
+		},
+	};
+}
+
+export function decodeUtf8Chunks(chunks: Uint8Array[]): string {
+	const decoder = new StringDecoder("utf8");
+	return chunks.map((chunk) => decoder.write(Buffer.from(chunk))).join("") + decoder.end();
+}
+
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -280,13 +370,55 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 const DEFAULT_SUBAGENT_MODEL = "openai-codex/gpt-5.6-luna:high";
 
+function emptyUsage(): UsageStats {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+}
+
+function addUsage(left: UsageStats, right: UsageStats): UsageStats {
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		cost: left.cost + right.cost,
+		contextTokens: right.contextTokens || left.contextTokens,
+		turns: left.turns + right.turns,
+	};
+}
+
+function nestedUsage(usage: UsageStats): Record<string, unknown> {
+	return {
+		input: usage.input,
+		output: usage.output,
+		cacheRead: usage.cacheRead,
+		cacheWrite: usage.cacheWrite,
+		totalTokens: usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: usage.cost },
+	};
+}
+
+type ToolFailurePayload = { details: unknown; usage?: Record<string, unknown> };
+
+function throwToolFailure(
+	message: string,
+	details: unknown,
+	recordFailure?: (payload: ToolFailurePayload) => void,
+): never {
+	const usage = details && typeof details === "object" && "results" in details
+		? nestedUsage((details as SubagentDetails).results.reduce((total, result) => addUsage(total, result.usage), emptyUsage()))
+		: undefined;
+	// Keep the thrown value native. Pi owns the error/isError normalization;
+	// structured details are carried through the supported tool_result hook.
+	recordFailure?.({ details, usage });
+	throw new Error(truncateUtf8(message, PER_TASK_OUTPUT_CAP, true));
+}
+
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
-function canRetryWithFallback(result: SingleResult): boolean {
+export function canRetryWithFallback(result: SingleResult): boolean {
+	if (result.usedTools || result.protocolIncomplete || result.stopReason === "aborted" || result.stopReason === "timeout") return false;
 	const usedTools = result.messages.some(
-		(message) =>
-			message.role === "toolResult" ||
-			(message.role === "assistant" && message.content.some((part) => part.type === "toolCall")),
+		(message) => messageUsesTools(message),
 	);
 	if (usedTools) return false;
 
@@ -307,50 +439,80 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	fallbackModel?: string,
+	deadlineAt = Date.now() + readSubagentTimeoutSeconds() * 1000,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
+	const baseFailure = (message: string, source: "user" | "project" | "unknown" = "unknown"): SingleResult => ({
+		agent: agentName,
+		agentSource: source,
+		task,
+		exitCode: 1,
+		messages: [],
+		stderr: message,
+		usage: emptyUsage(),
+		step,
+		usedTools: false,
+	});
 
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		return {
-			agent: agentName,
-			agentSource: "unknown",
-			task,
-			exitCode: 1,
-			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			step,
-		};
+		return baseFailure(`Unknown agent: "${agentName}". Available agents: ${available}.`);
 	}
+	if (!Array.isArray(agent.tools) || agent.tools.length === 0) {
+		return baseFailure(`Agent "${agentName}" has no explicit nonempty tools allowlist.`, agent.source);
+	}
+	if (Date.now() >= deadlineAt) return baseFailure(`Subagent timed out before starting "${agentName}".`, agent.source);
 
 	const selectedModel = agent.model ?? DEFAULT_SUBAGENT_MODEL;
-	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", selectedModel];
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
-
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", selectedModel, "--tools", agent.tools.join(",")];
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
-
+	let spillPath: string | undefined;
+	let usedTools = false;
+	let protocolIncomplete = false;
+	let protocolErrorMessage: string | undefined;
+	const messageBuffer = new RollingMessageBuffer<Message>(MAX_MESSAGES, MAX_MESSAGE_BYTES_TOTAL);
 	const currentResult: SingleResult = {
 		agent: agentName,
 		agentSource: agent.source,
 		task,
 		exitCode: 0,
-		messages: [],
+		messages: messageBuffer.items,
 		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		usage: emptyUsage(),
 		model: selectedModel,
 		step,
+		usedTools: false,
+	};
+	const appendChildMessage = (message: Message): boolean => {
+		const bounded = boundMessage(message);
+		let bytes = 0;
+		try { bytes = Buffer.byteLength(JSON.stringify(bounded), "utf8"); } catch { return false; }
+		return messageBuffer.append(bounded, bytes);
 	};
 
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
+	const spill = (data: string) => {
+		if (!data) return;
+		try {
+			if (!spillPath) {
+				spillPath = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-log-"));
+				spillPath = path.join(spillPath, "output.log");
+				fs.writeFileSync(spillPath, "", { encoding: "utf8", mode: 0o600 });
+			}
+			const maxBytes = 1024 * 1024;
+			const remaining = maxBytes - fs.statSync(spillPath).size;
+			if (remaining > 0) {
+				const bounded = truncateUtf8(data, remaining, false);
+				if (Buffer.byteLength(bounded, "utf8") <= remaining) fs.appendFileSync(spillPath, bounded);
+			}
+		} catch {
+			// Diagnostics must never make the child lifecycle fail.
 		}
 	};
+	const emitUpdate = () => onUpdate?.({
+		content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+		details: makeDetails([currentResult]),
+	});
 
 	try {
 		if (agent.systemPrompt.trim()) {
@@ -359,33 +521,54 @@ async function runSingleAgent(
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
-
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
 
+		let wasAborted = false;
+		let timedOut = false;
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
-				env: createSubagentEnvironment(defaultCwd, agent.name),
+				env: createSubagentEnvironment(defaultCwd, agent.name, agent.source, agent.filePath),
 				shell: false,
+				detached: process.platform !== "win32",
 				stdio: ["ignore", "pipe", "pipe"],
 			});
-			let buffer = "";
-
+			let stderrLines = 0;
+			let settled = false;
+			let deadlineTimer: NodeJS.Timeout | undefined;
+			let onAbort: () => void = () => undefined;
+			const markProtocolIncomplete = (message: string) => {
+				protocolIncomplete = true;
+				currentResult.protocolIncomplete = true;
+				protocolErrorMessage ??= message;
+				currentResult.errorMessage = protocolErrorMessage;
+			};
+			const appendStderrLine = (line: string) => {
+				if (stderrLines++ < MAX_STDERR_LINES) currentResult.stderr = truncateUtf8(`${currentResult.stderr}${line}\n`, PER_TASK_OUTPUT_CAP, true);
+				else spill(`${line}\n`);
+			};
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
 				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
+				try { event = JSON.parse(line); } catch {
+					spill(`${line}\n`);
+					markProtocolIncomplete("Subagent emitted an invalid JSONL row; the protocol may be incomplete.");
 					return;
 				}
-
+				if (!event || typeof event !== "object") {
+					markProtocolIncomplete("Subagent emitted a non-object JSONL row; the protocol may be incomplete.");
+					return;
+				}
+				if ((event.type === "message_end" || event.type === "tool_result_end") && !event.message) {
+					markProtocolIncomplete(`Subagent emitted ${event.type} without a message; the protocol is incomplete.`);
+					return;
+				}
 				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
+					const msg = boundMessage(event.message as Message);
+					usedTools ||= messageUsesTools(msg);
+					currentResult.usedTools = usedTools;
+					if (!appendChildMessage(msg)) spill(`${line}\n`);
 					if (msg.role === "assistant") {
 						currentResult.usage.turns++;
 						const usage = msg.usage;
@@ -395,88 +578,92 @@ async function runSingleAgent(
 							currentResult.usage.cacheRead += usage.cacheRead || 0;
 							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
 							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
+							currentResult.usage.contextTokens = Math.max(currentResult.usage.contextTokens, usage.totalTokens || 0);
 						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						if (msg.model) currentResult.model = msg.model;
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+						if (msg.errorMessage) currentResult.errorMessage = truncateUtf8(msg.errorMessage, PER_TASK_OUTPUT_CAP);
 					}
 					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
+				} else if (event.type === "tool_result_end" && event.message) {
+					usedTools = true;
+					currentResult.usedTools = true;
+					if (!appendChildMessage(event.message as Message)) spill(`${line}\n`);
 					emitUpdate();
 				}
 			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
+			const stdoutReader = new BoundedJsonlReader({
+				maxLineBytes: MAX_MESSAGE_BYTES,
+				onLine: processLine,
+				onOverflow: ({ maxBytes }) => {
+					spill(`[subagent protocol overflow: stdout JSONL row exceeded ${maxBytes} bytes]\n`);
+					markProtocolIncomplete(`Subagent stdout contained a JSONL row larger than ${maxBytes} bytes; the protocol is incomplete.`);
+				},
 			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
+			const stderrReader = new BoundedJsonlReader({
+				maxLineBytes: MAX_STREAM_BUFFER_BYTES,
+				onLine: appendStderrLine,
+				onOverflow: ({ maxBytes }) => spill(`[stderr line exceeded ${maxBytes} bytes]\n`),
 			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+			const clearLifecycle = () => {
+				if (deadlineTimer) clearTimeout(deadlineTimer);
+				if (signal) signal.removeEventListener("abort", onAbort);
+			};
+			const terminator = createChildGroupTerminator(proc);
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				clearLifecycle();
+				stdoutReader.end();
+				stderrReader.end();
+				terminator.finish();
+				resolve(code);
+			};
+			const requestStop = (reason: "abort" | "timeout") => {
+				if (settled) return;
+				wasAborted ||= reason === "abort";
+				timedOut ||= reason === "timeout";
+				terminator.requestStop();
+			};
+			onAbort = () => requestStop("abort");
+			proc.stdout.on("data", (data) => stdoutReader.push(data));
+			proc.stderr.on("data", (data) => stderrReader.push(data));
+			proc.once("close", (code) => finish(code ?? 1));
+			proc.once("error", (error) => { currentResult.errorMessage = (error as Error).message; finish(1); });
+			const remaining = Math.max(1, deadlineAt - Date.now());
+			deadlineTimer = setTimeout(() => requestStop("timeout"), remaining);
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
 		});
 
 		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
-
-		if (fallbackModel && fallbackModel !== selectedModel && canRetryWithFallback(currentResult)) {
-			const fallbackAgents = agents.map((candidate) =>
-				candidate.name === agentName ? { ...candidate, model: fallbackModel } : candidate,
-			);
-			return runSingleAgent(
-				defaultCwd,
-				fallbackAgents,
-				agentName,
-				task,
-				cwd,
-				step,
-				signal,
-				onUpdate,
-				makeDetails,
-			);
+		currentResult.privateLogPath = spillPath;
+		currentResult.usedTools = usedTools;
+		if (wasAborted) {
+			currentResult.exitCode ||= 1;
+			currentResult.stopReason = "aborted";
+			currentResult.errorMessage = "Subagent was aborted.";
 		}
-
+		if (!wasAborted && timedOut) {
+			currentResult.stopReason = "timeout";
+			currentResult.errorMessage = `Subagent exceeded the ${readSubagentTimeoutSeconds()} second timeout.`;
+		}
+		if (protocolIncomplete) {
+			currentResult.exitCode ||= 1;
+			if (!wasAborted && !timedOut) currentResult.stopReason = "error";
+			if (!wasAborted && protocolErrorMessage) currentResult.errorMessage = protocolErrorMessage;
+		}
+		if (fallbackModel && fallbackModel !== selectedModel && canRetryWithFallback(currentResult) && Date.now() < deadlineAt) {
+			const fallbackAgents = agents.map((candidate) => candidate.name === agentName ? { ...candidate, model: fallbackModel } : candidate);
+			const fallback = await runSingleAgent(defaultCwd, fallbackAgents, agentName, task, cwd, step, signal, onUpdate, makeDetails, undefined, deadlineAt);
+			fallback.attempts = [currentResult, ...(fallback.attempts ?? [])];
+			fallback.usage = addUsage(currentResult.usage, fallback.usage);
+			return fallback;
+		}
 		return currentResult;
 	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
+		if (tmpPromptPath) try { fs.unlinkSync(tmpPromptPath); } catch { /* ignore */ }
+		if (tmpPromptDir) try { fs.rmdirSync(tmpPromptDir); } catch { /* ignore */ }
 	}
 }
 
@@ -510,6 +697,15 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	const pendingErrorDetails = new Map<string, ToolFailurePayload>();
+	pi.on("tool_result", async (event: any) => {
+		if (event.toolName !== "subagent" || !event.isError) return;
+		const failure = pendingErrorDetails.get(event.toolCallId);
+		pendingErrorDetails.delete(event.toolCallId);
+		return failure ? { details: failure.details, usage: failure.usage } : undefined;
+	});
+	pi.on("session_shutdown", () => pendingErrorDetails.clear());
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -542,47 +738,59 @@ export default function (pi: ExtensionAPI) {
 					agentScope,
 					projectAgentsDir: discovery.projectAgentsDir,
 					results,
+					collisions: discovery.collisions,
 				});
+			const failureDetails = (mode: "single" | "parallel" | "chain", results: SingleResult[] = []): SubagentDetails => makeDetails(mode)(results);
+			const fail = (message: string, details: SubagentDetails): never =>
+				throwToolFailure(message, details, (payload) => pendingErrorDetails.set(_toolCallId, payload));
 
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
+				fail(`Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`, failureDetails("single"));
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
-				if (params.agent) requestedAgentNames.add(params.agent);
+			const requestedAgentNames = new Set<string>();
+			if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+			if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
+			if (params.agent) requestedAgentNames.add(params.agent);
+			const projectAgentsRequested = Array.from(requestedAgentNames)
+				.map((name) => agents.find((a) => a.name === name))
+				.filter((a): a is AgentConfig => a?.source === "project");
+			if (discovery.collisions.length > 0 && ctx.hasUI) {
+				ctx.ui.notify(`Project agents override user agents with the same name: ${discovery.collisions.join(", ")}`, "warning");
+			}
 
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
-
-				if (projectAgentsRequested.length > 0) {
+			if (projectAgentsRequested.length > 0) {
+				let trusted = false;
+				const trustValue = (ctx as typeof ctx & { isProjectTrusted?: boolean | (() => boolean) }).isProjectTrusted;
+				if (typeof trustValue === "function") {
+					try { trusted = trustValue() === true; } catch { trusted = false; }
+				} else {
+					trusted = trustValue === true;
+				}
+				if (!ctx.hasUI && (!trusted || confirmProjectAgents !== false)) {
+					fail(
+						trusted
+							? "Headless project-local agents require explicit confirmProjectAgents:false."
+							: "Project-local agents require a trusted project in headless mode; explicit confirmProjectAgents:false cannot bypass trust.",
+						failureDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single"),
+					);
+				}
+				if (!trusted && ctx.hasUI) {
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
 					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						};
+					if (!ok) fail("Project-local agents were not approved.", failureDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single"));
 				}
 			}
 
 			if (params.chain && params.chain.length > 0) {
+				if (params.chain.length > MAX_CHAIN_STEPS) {
+					fail(`Too many chain steps (${params.chain.length}). Max is ${MAX_CHAIN_STEPS}.`, failureDetails("chain"));
+				}
 				const results: SingleResult[] = [];
 				let previousOutput = "";
 
@@ -622,31 +830,22 @@ export default function (pi: ExtensionAPI) {
 					const isError = isFailedResult(result);
 					if (isError) {
 						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
+						fail(`Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`, failureDetails("chain", results));
 					}
 					previousOutput = truncateChainHandoff(getFinalOutput(result.messages));
 				}
+				const usage = results.reduce((total, result) => addUsage(total, result.usage), emptyUsage());
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [{ type: "text", text: truncateUtf8(getFinalOutput(results[results.length - 1].messages) || "(no output)", PER_TASK_OUTPUT_CAP, true) }],
 					details: makeDetails("chain")(results),
+					usage: nestedUsage(usage) as any,
 				};
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
+				if (params.tasks.length > MAX_PARALLEL_TASKS) {
+					fail(`Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`, failureDetails("parallel"));
+				}
 
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
@@ -661,6 +860,7 @@ export default function (pi: ExtensionAPI) {
 						messages: [],
 						stderr: "",
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						usedTools: false,
 					};
 				}
 
@@ -709,14 +909,14 @@ export default function (pi: ExtensionAPI) {
 						: "completed";
 					return `### [${r.agent}] ${status}\n\n${output}`;
 				});
+				const combined = truncateUtf8(`Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`, PER_TASK_OUTPUT_CAP, true);
+				const usage = results.reduce((total, result) => addUsage(total, result.usage), emptyUsage());
+				const details = makeDetails("parallel")(results);
+				if (successCount !== results.length) fail(combined, details);
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
+					content: [{ type: "text", text: combined }],
+					details,
+					usage: nestedUsage(usage) as any,
 				};
 			}
 
@@ -734,25 +934,17 @@ export default function (pi: ExtensionAPI) {
 					fallbackModel,
 				);
 				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
-					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
-						isError: true,
-					};
-				}
+				const details = makeDetails("single")([result]);
+				if (isError) fail(`Agent ${result.stopReason || "failed"}: ${getResultOutput(result)}`, details);
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
+					content: [{ type: "text", text: truncateUtf8(getFinalOutput(result.messages) || "(no output)", PER_TASK_OUTPUT_CAP, true) }],
+					details,
+					usage: nestedUsage(result.usage) as any,
 				};
 			}
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
-			};
+			fail(`Invalid parameters. Available agents: ${available}`, failureDetails("single"));
 		},
 
 		renderCall(args, theme, context) {

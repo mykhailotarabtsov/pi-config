@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Text } from '@earendil-works/pi-tui'
 import { assessLocalDelivery, canCleanupAfterDelivery } from './delivery.ts'
@@ -13,6 +14,9 @@ import {
   hasExactWorkerIdentity,
   isPendingLeaseNoop,
   isAllowedFirstmateSubagentRequest,
+  isWatcherPollHealthy,
+  recordVerifiedEndpointAbsence,
+  recordWatcherPollOutcome,
   LifecycleOperationLock,
   taskArtifactPaths,
   type EndpointAbsenceStatus,
@@ -30,6 +34,7 @@ import {
   type WorkerReport,
 } from './task-state.ts'
 import { validateWorkerReport, workerReportContract } from './worker-report.ts'
+import { normalizeFirstmateToolResult } from './tool-result.ts'
 import { StringEnum } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 
@@ -42,6 +47,8 @@ const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
+const FIRSTMATE_POLICY_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'POLICY.md')
+const NO_PUBLISH_ENV = 'PI_PERMISSION_NO_PUBLISH'
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
 const TAB_ID_RE = /^w[0-9A-Za-z]+:t[0-9A-Za-z]+$/
@@ -58,29 +65,17 @@ const ISOLATION_STATE_ENTRY = 'firstmate-isolation'
 const WORKER_STATE_ENTRY = 'firstmate-worker'
 const LIFECYCLE_ACTIONS = new Set<FirstmateControlAction>(['task_create', 'task_reconcile', 'task_abort', 'task_recover', 'task_deliver', 'task_teardown'])
 
-const FIRSTMATE_SYSTEM_PROMPT = `
-# Herdr Firstmate Runtime Role
+type FirstmatePolicyLoad = { policy?: string; error?: string }
 
-You are the Herdr firstmate for this workspace. The captain is your only user-facing contact; coordinate software work and do not implement it. AGENTS.md is the canonical stable Firstmate policy; follow it even if prompt ordering changes.
-
-## Runtime safety delta
-
-- This pane is coordination-only: use read, grep, find, and ls for read-only inspection, use the browser-tester subagent only for browser QA, and use herdr_control.task_create / visible worker tabs for all implementation and code mutations; never call mcp directly. The artifact tool is the sole generated-output exception. Use artifact only for generated browser artifacts, reports, or diagrams under the project \`.pi/artifacts/\` directory; that output is not implementation work and does not permit arbitrary file edits. Never use local bash, edit, or write; delegate mutations through worker panes.
-- Preserve unrelated changes and keep worker changes surgical. Workers must never push, publish, or commit unless the captain explicitly authorizes a local commit; the worker-git guard still applies. The browser-tester subagent is the sole MCP-capable delegate and may use MCP only for browser QA; it must never automate sign-in or handle credentials.
-- Decide the number of workers yourself; do not ask the captain to choose it. One visible worker is the default; use two only for genuinely independent, bounded scopes, never uncontrolled fan-out. Delegate broad codebase reconnaissance and read-heavy investigation instead of spending a long local read/grep loop here. Narrow one-file questions may be inspected directly.
-- \`task_create\` is asynchronous/no-wait: create the worker, keep this pane focused on the captain, and rely on watcher follow-ups rather than polling or waiting on the worker.
-- Inspect enough context before delegation, ask focused clarification for ambiguity, create one visible tab per worker without taking focus, and reconcile the structured worker report before claiming completion.
-- Shared tasks stay in the requested checkout and never use task_deliver. Worktree tasks use Treehouse leases, require task_deliver before task_teardown, and are never auto-closed or auto-merged. Herdr has no native agent stop command; task_abort/task_recover use explicit pane close only with force and verify endpoint absence before lease recovery.
-- Keep the captain's focus here and report only verified outcomes, files, tests, validation, reconciliation evidence, and blockers. Failed/blocked shared reports may close only an exact idle/done worker tab after absence verification; never force-close an active/hung worker. Treehouse leases and worker changes are never auto-returned or discarded.
-
-## Captain-facing output discipline
-
-- Do not narrate internal inspection, commands, tool arguments, endpoint checks, or durable paths.
-- Use the \`subagent\` tool only with \`agent: "browser-tester"\` for browser QA; never use it for implementation or reconnaissance. Firstmate itself must never call \`mcp\`.
-- After \`task_create\`, give only a concise confirmation that the worker started and is working.
-- Do not poll or read worker scrollback for routine progress; watcher notifications and the structured report are the source of truth.
-- After \`task_reconcile\`, show only the worker report: summary, changed files, tests, validation, and blockers. Keep errors and blockers concise.
-`.trim()
+async function readFirstmatePolicy(): Promise<FirstmatePolicyLoad> {
+  try {
+    const policy = (await fs.promises.readFile(FIRSTMATE_POLICY_PATH, 'utf8')).trim()
+    if (!policy) return { error: 'canonical Firstmate POLICY.md is empty' }
+    return { policy }
+  } catch (error) {
+    return { error: `canonical Firstmate POLICY.md is unavailable: ${(error as Error).message}` }
+  }
+}
 
 const HerdrControlParams = Type.Object({
   action: StringEnum(FIRSTMATE_CONTROL_ACTIONS),
@@ -167,6 +162,7 @@ function isWatcherTaskRecord(value: unknown, taskId: string): value is TaskRecor
   if (value.deliveryError !== undefined && typeof value.deliveryError !== 'string') return false
   if (value.deliveryHelperTabId !== undefined && typeof value.deliveryHelperTabId !== 'string') return false
   if (value.deliveryHelperPaneId !== undefined && typeof value.deliveryHelperPaneId !== 'string') return false
+  if (value.projectRepoIdentity !== undefined && typeof value.projectRepoIdentity !== 'string') return false
   if (value.reviewTarget !== undefined && typeof value.reviewTarget !== 'string') return false
   if (value.workerKind !== undefined && !isWorkerKind(value.workerKind)) return false
   if (value.leaseReturnHelperTabId !== undefined && typeof value.leaseReturnHelperTabId !== 'string') return false
@@ -427,12 +423,34 @@ function validateTimeout(value: number | undefined): string | undefined {
   return undefined
 }
 
-function errorResult(message: string, details: Record<string, unknown> = {}) {
-  return {
-    content: [{ type: 'text' as const, text: `Error: ${message}` }],
-    isError: true,
-    details,
+class FirstmateControlError extends Error {
+  readonly details: Record<string, unknown>
+
+  constructor(message: string, details: Record<string, unknown>) {
+    super(message)
+    this.name = 'FirstmateControlError'
+    this.details = details
   }
+}
+
+function errorResult(message: string, details: Record<string, unknown> = {}): never {
+  throw new FirstmateControlError(message, details)
+}
+
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(Object.assign(new Error('operation aborted'), { name: 'AbortError' }))
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      reject(Object.assign(new Error('operation aborted'), { name: 'AbortError' }))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function parseJsonMaybe(text: string): unknown {
@@ -527,6 +545,9 @@ function workerReportRenderText(value: unknown): string | undefined {
 export default function firstmate(pi: ExtensionAPI) {
   if (!inHerdr()) return
 
+  const pendingErrorDetails = new Map<string, Record<string, unknown>>()
+  pi.on('tool_result', async (event: any) => normalizeFirstmateToolResult(event, pendingErrorDetails))
+
   delete process.env[ACTIVE_ENV]
   let active = false
   let registered = false
@@ -535,10 +556,14 @@ export default function firstmate(pi: ExtensionAPI) {
   let isolationMode: IsolationMode = 'shared'
   let selectedWorkerKind: WorkerKind = DEFAULT_WORKER_KIND
   let currentAgentKind: string | undefined
+  let firstmatePolicy = ''
   let watcherInterval: ReturnType<typeof setInterval> | undefined
+  let watcherAbortController: AbortController | undefined
+  let backgroundAbortController: AbortController | undefined
   let watcherRunning = false
   let watcherPollInFlight = false
-  let watcherLastPollAt: string | undefined
+  let watcherLastPollStartedAt: string | undefined
+  let watcherLastCompletedPollAt: string | undefined
   let watcherLastError: string | undefined
   let watcherGuardStatus = 'not_checked'
   let watcherGuardDiagnostic: string | undefined
@@ -554,6 +579,19 @@ export default function firstmate(pi: ExtensionAPI) {
 
   async function runHerdr(args: string[], signal: AbortSignal | undefined, timeout = 30_000): Promise<ExecResult> {
     return await pi.exec('herdr', args, { signal, timeout })
+  }
+
+  async function repositoryIdentity(project: string, signal?: AbortSignal): Promise<{ identity?: string; error?: string }> {
+    try {
+      const result = await pi.exec('git', ['-C', project, 'rev-parse', '--git-common-dir'], { signal, timeout: 10_000 })
+      if (result.code !== 0) return { error: commandResultText('git repository identity', result) }
+      const raw = result.stdout.trim()
+      if (!raw || raw.includes('\u0000')) return { error: 'git repository identity was empty or malformed.' }
+      const candidate = path.isAbsolute(raw) ? raw : path.resolve(project, raw)
+      return { identity: await fs.promises.realpath(candidate) }
+    } catch (error) {
+      return { error: `could not verify git repository identity: ${(error as Error).message}` }
+    }
   }
 
   async function deriveCurrentAgentKind(signal?: AbortSignal): Promise<string | undefined> {
@@ -572,6 +610,7 @@ export default function firstmate(pi: ExtensionAPI) {
   }
 
   async function renameHerdrAgent(signal?: AbortSignal): Promise<void> {
+    if (!active || signal?.aborted) return
     const paneId = process.env.HERDR_PANE_ID
     if (!paneId || !PANE_ID_RE.test(paneId)) return
     await runHerdr(['agent', 'rename', paneId, FIRSTMATE_NAME], signal, 5_000).catch(() => undefined)
@@ -582,7 +621,9 @@ export default function firstmate(pi: ExtensionAPI) {
       active: watcherRunning,
       isolationMode,
       intervalMs: WATCHER_INTERVAL_MS,
-      lastPollAt: watcherLastPollAt,
+      lastPollAt: watcherLastCompletedPollAt,
+      lastPollStartedAt: watcherLastPollStartedAt,
+      lastCompletedPollAt: watcherLastCompletedPollAt,
       health: watcherLastError ? 'degraded' : 'ok',
       error: watcherLastError,
       unverifiedWorkers: [...watcherMissingEndpoints.values()],
@@ -683,12 +724,11 @@ export default function firstmate(pi: ExtensionAPI) {
   function watcherSupervision(): { healthy: boolean; diagnostic?: string } {
     if (!watcherRunning) return { healthy: false, diagnostic: 'watcher is not running' }
     if (watcherLastError) return { healthy: false, diagnostic: `watcher error: ${watcherLastError}` }
-    if (!watcherLastPollAt) return { healthy: false, diagnostic: 'watcher has not completed a poll' }
-    const lastPollAt = Date.parse(watcherLastPollAt)
-    if (!Number.isFinite(lastPollAt)) return { healthy: false, diagnostic: 'watcher lastPollAt is invalid' }
-    const age = Date.now() - lastPollAt
-    if (age < 0 || age > WATCHER_RECENCY_WINDOW_MS) {
-      return { healthy: false, diagnostic: `watcher last poll is ${age}ms old; expected at most ${WATCHER_RECENCY_WINDOW_MS}ms` }
+    if (!watcherLastCompletedPollAt) return { healthy: false, diagnostic: 'watcher has not completed a poll' }
+    if (!isWatcherPollHealthy(watcherLastCompletedPollAt, Date.now(), WATCHER_RECENCY_WINDOW_MS)) {
+      const completedAt = Date.parse(watcherLastCompletedPollAt)
+      const age = Number.isFinite(completedAt) ? Date.now() - completedAt : Number.NaN
+      return { healthy: false, diagnostic: Number.isFinite(age) ? `watcher last completed poll is ${age}ms old; expected at most ${WATCHER_RECENCY_WINDOW_MS}ms` : 'watcher last completed poll is invalid' }
     }
     return { healthy: true }
   }
@@ -778,9 +818,11 @@ export default function firstmate(pi: ExtensionAPI) {
   async function pollWatcher(): Promise<void> {
     if (!watcherRunning || watcherPollInFlight) return
     watcherPollInFlight = true
-    watcherLastPollAt = new Date().toISOString()
+    const pollSignal = watcherAbortController?.signal
+    watcherLastPollStartedAt = new Date().toISOString()
     const seenTaskIds = new Set<string>()
     let sweepObservations = false
+    let pollSucceeded = false
     try {
       const workspaceId = process.env.HERDR_WORKSPACE_ID
       if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) {
@@ -806,7 +848,13 @@ export default function firstmate(pi: ExtensionAPI) {
           continue
         }
 
-        const result = await runHerdr(['agent', 'get', task.paneId!], undefined, 5_000).catch(() => undefined)
+        let result: ExecResult | undefined
+        try {
+          result = await runHerdr(['agent', 'get', task.paneId!], pollSignal, 5_000)
+        } catch (error) {
+          watcherLastError = `watcher agent inspection failed: ${(error as Error).message}`
+        }
+        if (!result || result.killed || result.code === null) watcherLastError ||= 'watcher agent inspection did not complete'
         const parsed = result && result.code === 0 ? (parseJsonMaybe(result.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined) : undefined
         const agent = parsed?.result?.agent
         if (
@@ -855,9 +903,23 @@ export default function firstmate(pi: ExtensionAPI) {
         }
         watcherObservations.set(task.taskId, { state, edgeLatched, endpointMissingLatched: false })
       }
+      pollSucceeded = true
     } catch (error) {
       watcherLastError = `poll failed: ${(error as Error).message}`
     } finally {
+      if (!watcherRunning || pollSignal?.aborted) {
+        watcherPollInFlight = false
+        return
+      }
+      const outcome = pollSucceeded && !watcherLastError ? 'completed' : 'error'
+      const pollState = recordWatcherPollOutcome(
+        { lastCompletedPollAt: watcherLastCompletedPollAt, lastError: watcherLastError },
+        outcome,
+        new Date().toISOString(),
+        watcherLastError,
+      )
+      watcherLastCompletedPollAt = pollState.lastCompletedPollAt
+      watcherLastError = pollState.lastError
       if (sweepObservations) {
         for (const taskId of watcherObservations.keys()) {
           if (!seenTaskIds.has(taskId)) watcherObservations.delete(taskId)
@@ -872,6 +934,7 @@ export default function firstmate(pi: ExtensionAPI) {
 
   function startWatcher(): void {
     if (watcherRunning || watcherInterval) return
+    watcherAbortController = new AbortController()
     watcherRunning = true
     watcherInterval = setInterval(() => void pollWatcher(), WATCHER_INTERVAL_MS)
     watcherInterval.unref?.()
@@ -880,9 +943,10 @@ export default function firstmate(pi: ExtensionAPI) {
 
   function stopWatcher(): void {
     watcherRunning = false
+    watcherAbortController?.abort()
+    watcherAbortController = undefined
     if (watcherInterval) clearInterval(watcherInterval)
     watcherInterval = undefined
-    watcherPollInFlight = false
     watcherObservations.clear()
     watcherMissingEndpoints.clear()
   }
@@ -1031,14 +1095,15 @@ export default function firstmate(pi: ExtensionAPI) {
         const resultText = boundedFirstmateRenderText(result.content.map((entry) => (entry.type === 'text' ? entry.text : `[${entry.type}]`)).join('\n'))
         return new Text(theme.fg(context.isError ? 'error' : 'muted', resultText), 0, 0)
       },
-      async execute(_toolCallId, params: ControlParams, signal, _onUpdate, ctx) {
-        if (!active) return errorResult('herdr_control is only available in the active Herdr firstmate pane.')
-        if (!inHerdr()) return errorResult('not running inside Herdr.')
-        if (!isFirstmateControlAction(params.action)) return errorResult('unsupported Firstmate task operation.', { action: params.action })
-
-        const releaseLifecycle = isFirstmateControlAction(params.action) && LIFECYCLE_ACTIONS.has(params.action) ? await lifecycleLock.acquire() : undefined
-        let releaseSharedAdmission: (() => Promise<void>) | undefined
+      async execute(toolCallId, params: ControlParams, signal, _onUpdate, ctx) {
         try {
+          if (!active) return errorResult('herdr_control is only available in the active Herdr firstmate pane.')
+          if (!inHerdr()) return errorResult('not running inside Herdr.')
+          if (!isFirstmateControlAction(params.action)) return errorResult('unsupported Firstmate task operation.', { action: params.action })
+
+          const releaseLifecycle = isFirstmateControlAction(params.action) && LIFECYCLE_ACTIONS.has(params.action) ? await lifecycleLock.acquire() : undefined
+          let releaseSharedAdmission: (() => Promise<void>) | undefined
+          try {
           const timeoutError = validateTimeout(params.timeoutMs)
           if (timeoutError) return errorResult(timeoutError, { action: params.action })
           const timeout = params.timeoutMs ?? 120_000
@@ -1525,13 +1590,13 @@ export default function firstmate(pi: ExtensionAPI) {
 
               let project = path.resolve(ctx.cwd, params.project)
               const taskIsolation = isolationMode
-              if (taskIsolation === 'shared') {
-                try {
-                  project = await fs.promises.realpath(project)
-                } catch (error) {
-                  return errorResult(`shared-checkout project is not accessible: ${(error as Error).message}`, { action: params.action, project })
-                }
+              try {
+                project = await fs.promises.realpath(project)
+              } catch (error) {
+                return errorResult(`project checkout is not accessible: ${(error as Error).message}`, { action: params.action, project })
               }
+              const projectIdentity = await repositoryIdentity(project, signal)
+              if (!projectIdentity.identity) return errorResult(projectIdentity.error || 'could not verify git repository identity.', { action: params.action, project })
               if (taskIsolation === 'shared' && params.reviewTarget !== undefined) {
                 return errorResult('reviewTarget tasks require worktree isolation; switch with /firstmate-isolation worktree.', { action: params.action, project, reviewTarget: params.reviewTarget })
               }
@@ -1693,6 +1758,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 version: TASK_VERSION,
                 taskId,
                 project,
+                projectRepoIdentity: projectIdentity.identity,
                 worktree: taskIsolation === 'shared' ? project : null,
                 worktreeProvider: taskIsolation === 'shared' ? 'herdr' : 'treehouse',
                 ...(taskIsolation === 'worktree' ? { leaseStatus: 'pending' as const, leaseHolder: taskId } : {}),
@@ -1740,6 +1806,8 @@ export default function firstmate(pi: ExtensionAPI) {
                 params.label || taskId,
                 '--env',
                 `${WORKER_ENV}=1`,
+                '--env',
+                `${NO_PUBLISH_ENV}=1`,
                 '--env',
                 `${TASK_ENV}=${taskId}`,
                 '--env',
@@ -1939,7 +2007,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 'pane',
                 'run',
                 returnedPaneId,
-                `export ${WORKER_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
+                `export ${WORKER_ENV}=1 ${NO_PUBLISH_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
               ]
               const envResult = await runHerdr(envArgs, signal, 10_000)
               if (envResult.code !== 0) {
@@ -2043,7 +2111,7 @@ export default function firstmate(pi: ExtensionAPI) {
               let startAttempt = 1
               while (isRetryableAgentStartFailure(startResult) && startAttempt < 10) {
                 const delayMs = Math.min(250 * 2 ** (startAttempt - 1), 4_000)
-                await new Promise((resolve) => setTimeout(resolve, delayMs))
+                await abortableDelay(delayMs, signal)
                 startAttempt += 1
                 startResult = await runHerdr(startArgs, signal, timeout)
               }
@@ -2218,12 +2286,32 @@ export default function firstmate(pi: ExtensionAPI) {
               const reportPath = reportFilePath(taskId)
               let task = await readTaskState(taskId)
               if (!task || task.version !== TASK_VERSION || task.taskId !== taskId) return errorResult('durable task state is absent or malformed.', { action: params.action, taskId, taskPath })
-              if (task.project !== path.resolve(ctx.cwd, params.project))
-                return errorResult('requested primary project does not exactly match the durable task project.', {
+              let requestedProject: string
+              try {
+                requestedProject = await fs.promises.realpath(path.resolve(ctx.cwd, params.project))
+              } catch (error) {
+                return errorResult(`requested primary project is not accessible: ${(error as Error).message}`, { action: params.action, taskId, task })
+              }
+              if (task.project !== requestedProject)
+                return errorResult('requested primary project does not exactly match the canonical durable task project.', {
                   action: params.action,
                   taskId,
                   task,
-                  requestedProject: path.resolve(ctx.cwd, params.project),
+                  requestedProject,
+                })
+              if (typeof task.projectRepoIdentity !== 'string' || !task.projectRepoIdentity) {
+                return errorResult('durable task has no recorded git repository identity; refusing delivery.', { action: params.action, taskId, task })
+              }
+              const currentProjectIdentity = await repositoryIdentity(requestedProject, signal)
+              if (!currentProjectIdentity.identity || currentProjectIdentity.identity !== task.projectRepoIdentity)
+                return errorResult('primary project git repository identity changed; refusing delivery.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  requestedProject,
+                  recordedRepositoryIdentity: task.projectRepoIdentity,
+                  currentRepositoryIdentity: currentProjectIdentity.identity,
+                  identityError: currentProjectIdentity.error,
                 })
               if (task.reportPath !== reportPath)
                 return errorResult('durable task state has an unexpected report path.', { action: params.action, taskId, taskPath, expectedReportPath: reportPath, task })
@@ -2383,6 +2471,11 @@ export default function firstmate(pi: ExtensionAPI) {
                   `evidence=${shellQuote(evidencePath)}`,
                   `dirty_paths=${shellQuote(dirtyPathsPath)}`,
                   `worker_paths=${shellQuote(workerPathsPath)}`,
+                  `expected_repo_identity=${shellQuote(task.projectRepoIdentity || '')}`,
+                  'repo_identity=$(git -C "$project" rev-parse --git-common-dir 2>/dev/null || true)',
+                  'case "$repo_identity" in /*) ;; *) repo_identity="$project/$repo_identity";; esac',
+                  'repo_identity=$(cd "$repo_identity" 2>/dev/null && pwd -P || true)',
+                  'if [ -n "$expected_repo_identity" ] && [ "$repo_identity" = "$expected_repo_identity" ]; then repo_identity_check=complete; else repo_identity_check=failed; fi',
                   'target_ref=$(git -C "$project" symbolic-ref --quiet HEAD 2>/dev/null || true)',
                   'case "$target_ref" in refs/heads/*) target="${target_ref#refs/heads/}";; *) target=;; esac',
                   'if git -C "$project" show-ref --verify --quiet "refs/heads/$branch"; then branch_exists=true; else branch_exists=false; fi',
@@ -2391,8 +2484,8 @@ export default function firstmate(pi: ExtensionAPI) {
                   'if ! { git -C "$project" diff --name-only -z; git -C "$project" diff --cached --name-only -z; git -C "$project" ls-files --others --exclude-standard -z; } > "$dirty_paths"; then dirty_paths_check=failed; elif [ -n "$target" ] && [ "$branch_exists" = true ]; then if git -C "$project" diff --name-only --no-renames -z "$target" "$branch" > "$worker_paths"; then dirty_paths_check=complete; else dirty_paths_check=failed; fi; fi',
                   `if [ "$dirty_paths_check" = complete ] && [ -s "$dirty_paths" ] && [ -s "$worker_paths" ]; then if ${shellQuote(process.execPath)} -e ${shellQuote(dirtyPathOverlapCheck)} "$dirty_paths" "$worker_paths"; then dirty_paths_overlap=false; else case "$?" in 1) dirty_paths_overlap=true;; *) dirty_paths_check=failed;; esac; fi; fi`,
                   'if [ -n "$target" ] && [ "$branch_exists" = true ] && git -C "$project" merge-base --is-ancestor "$target" "$branch"; then fast_forward=true; else fast_forward=false; fi',
-                  'printf \'target=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
-                  'if [ -z "$target" ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
+                  'printf \'target=%s\\nrepo_identity_check=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$repo_identity_check" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
+                  'if [ -z "$target" ] || [ "$repo_identity_check" != complete ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the repository identity changed, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
                   '[ "$code" -eq 0 ]',
                 ].join('\n') + '\n'
               try {
@@ -2463,6 +2556,7 @@ export default function firstmate(pi: ExtensionAPI) {
               const resultCode = statusText.trim() && /^-?\d+$/.test(statusText.trim()) ? Number.parseInt(statusText.trim(), 10) : null
               const deliveryDecision = assessLocalDelivery({
                 targetBranch: values.target || '',
+                repositoryIdentityCheckSucceeded: values.repo_identity_check === 'complete',
                 dirtyPathCheckSucceeded: values.dirty_paths_check === 'complete',
                 dirtyPathsOverlap: values.dirty_paths_overlap === 'true',
                 branchExists: values.branch_exists === 'true',
@@ -2472,9 +2566,11 @@ export default function firstmate(pi: ExtensionAPI) {
                 ? undefined
                 : deliveryDecision.reason === 'detached'
                   ? 'primary checkout is detached or not on a local branch'
-                  : deliveryDecision.reason === 'dirty-path-check-failed'
-                    ? 'could not safely compare primary dirty paths with the worker branch'
-                    : deliveryDecision.reason === 'dirty-overlap'
+                  : deliveryDecision.reason === 'repository-identity-mismatch'
+                    ? 'primary checkout repository identity changed'
+                    : deliveryDecision.reason === 'dirty-path-check-failed'
+                      ? 'could not safely compare primary dirty paths with the worker branch'
+                      : deliveryDecision.reason === 'dirty-overlap'
                       ? 'primary checkout has dirty paths overlapping the worker branch'
                       : deliveryDecision.reason === 'missing-branch'
                         ? 'recorded worker branch is missing'
@@ -3011,16 +3107,10 @@ export default function firstmate(pi: ExtensionAPI) {
                     recordedPaneAbsent,
                   }
                   if (recordedTabAbsent && recordedPaneAbsent) {
-                    const recoveredTask: TaskRecord = treehouseRecoveryEligible
-                      ? {
-                          ...taskTeardownRecord,
-                          endpointStatus: 'absent_verified',
-                          leaseStatus: 'returned',
-                          leaseReturnStatus: 'returned',
-                          leaseReturnError: undefined,
-                          updatedAt: new Date().toISOString(),
-                        }
-                      : { ...taskTeardownRecord, endpointStatus: 'absent_verified', updatedAt: new Date().toISOString() }
+                    const recoveredTask: TaskRecord = {
+                      ...recordVerifiedEndpointAbsence(taskTeardownRecord),
+                      updatedAt: new Date().toISOString(),
+                    }
                     try {
                       await writeTaskState(recoveredTask)
                     } catch (error) {
@@ -3426,12 +3516,16 @@ export default function firstmate(pi: ExtensionAPI) {
             content: [{ type: 'text' as const, text: parsed ? JSON.stringify(parsed, null, 2) : commandResultText(`herdr ${args.join(' ')}`, result) }],
             details,
           }
-        } finally {
-          try {
-            await releaseSharedAdmission?.()
           } finally {
-            releaseLifecycle?.()
+            try {
+              await releaseSharedAdmission?.()
+            } finally {
+              releaseLifecycle?.()
+            }
           }
+        } catch (error) {
+          if (error instanceof FirstmateControlError) pendingErrorDetails.set(toolCallId, error.details)
+          throw error
         }
       },
     })
@@ -3439,6 +3533,12 @@ export default function firstmate(pi: ExtensionAPI) {
 
   pi.on('session_start', async (_event, ctx) => {
     if (active || !isInteractivePiPane(ctx)) return
+    const policyLoad = await readFirstmatePolicy()
+    if (!policyLoad.policy) {
+      ctx.ui.notify(`Firstmate activation blocked: ${policyLoad.error || 'canonical POLICY.md could not be loaded.'}`, 'error')
+      delete process.env[ACTIVE_ENV]
+      return
+    }
     try {
       const isPaneLive = async (paneId: string) => {
         const result = await runHerdr(['agent', 'get', paneId], undefined, 5_000)
@@ -3454,6 +3554,7 @@ export default function firstmate(pi: ExtensionAPI) {
       return
     }
     process.env[ACTIVE_ENV] = '1'
+    firstmatePolicy = policyLoad.policy
 
     const toolsExpanded = ctx.ui.getToolsExpanded()
     ctx.ui.setToolsExpanded(false)
@@ -3469,18 +3570,27 @@ export default function firstmate(pi: ExtensionAPI) {
     startWatcher()
     pi.setSessionName(FIRSTMATE_NAME)
     ctx.ui.setTitle(FIRSTMATE_NAME)
+    backgroundAbortController?.abort()
+    backgroundAbortController = new AbortController()
+    const backgroundSignal = backgroundAbortController.signal
     void (async () => {
       for (const delay of [0, 500, 1500, 3000, 6000]) {
-        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
-        await renameHerdrAgent()
-        await deriveCurrentAgentKind().catch(() => undefined)
+        if (delay > 0) await abortableDelay(delay, backgroundSignal)
+        if (!active || backgroundSignal.aborted) return
+        await renameHerdrAgent(backgroundSignal)
+        if (!active || backgroundSignal.aborted) return
+        await deriveCurrentAgentKind(backgroundSignal).catch(() => undefined)
       }
-    })()
+    })().catch(() => undefined)
   })
 
   pi.on('session_shutdown', async () => {
     delete process.env[ACTIVE_ENV]
+    active = false
+    backgroundAbortController?.abort()
+    backgroundAbortController = undefined
     stopWatcher()
+    pendingErrorDetails.clear()
     restoreToolsExpanded?.()
     restoreToolsExpanded = undefined
   })
@@ -3494,7 +3604,7 @@ export default function firstmate(pi: ExtensionAPI) {
     applyFirstmateTools()
     const kindLine = `\n\nCurrent firstmate agent kind: ${currentAgentKind || 'unknown'}. Current selected worker kind: ${selectedWorkerKind}; task_create uses this by default. Select the allowlisted worker kind with /firstmate-worker pi or /firstmate-worker claude.`
     const isolationLine = `\n\nCurrent session isolation mode: ${isolationMode}. task_create must use ${isolationMode === 'shared' ? 'the requested shared checkout; do not start concurrent shared tasks for that project' : 'an isolated Treehouse worktree and require task_deliver before teardown'}. The captain can switch it with /firstmate-isolation shared or /firstmate-isolation worktree.`
-    return { systemPrompt: `${FIRSTMATE_SYSTEM_PROMPT}${kindLine}${isolationLine}\n\n${event.systemPrompt}` }
+    return { systemPrompt: `${firstmatePolicy}${kindLine}${isolationLine}\n\n${event.systemPrompt}` }
   })
 
   pi.on('tool_call', (event) => {

@@ -1,208 +1,100 @@
-# pi-config
+# Pi agent configuration
 
-Pi agent configuration for easy setup across machines.
+Portable Pi resources for local development: prompts, user agents, skills,
+auto-discovered extensions, themes, and safe setup helpers.
 
-## What's in here
+## Inventory
 
-| File or directory      | Purpose                                                                |
-| ---------------------- | ---------------------------------------------------------------------- |
-| `settings.json`        | Default provider, model, theme, packages, and Pi settings              |
-| `package.json`         | Pinned runtime dependencies for the artifacts extension                |
-| `package-lock.json`    | Reproducible dependency lockfile                                      |
-| `models.json.template` | Model providers with env var placeholders (never commit `models.json`) |
-| `AGENTS.md`            | Pi-specific subagent and skill configuration                           |
-| `APPEND_SYSTEM.md`     | Global coding principles appended to Pi's system prompt                |
-| `agents/*.md`          | Subagent definitions used by the local subagent extension              |
-| `prompts/*.md`         | Prompt templates, including implementation and handoff workflows       |
-| `skills/*/SKILL.md`    | Custom skill definitions (commit, review, GitHub, and setup workflows) |
-| `extensions/`          | Auto-discovered UI, workflow, permission, and subagent extensions      |
-| `extensions/firstmate/` | Herdr-gated Firstmate coordination, session isolation, and task lifecycle |
-| `tests/firstmate-delivery.test.mjs` | Focused delivery and teardown guard tests                  |
-| `themes/`              | Pi themes, with `slop.json` currently selected                         |
-| `bin/`                 | Helper binaries                                                        |
-| `setup.sh`             | One-command restore script                                             |
+- `settings.json` — provider/model defaults, UI settings, packages, and agent timeout.
+- `agents/` — seven roles: scout, planner, worker, reviewer, builder,
+  unit-tester, and browser-tester.
+- `prompts/` — implementation, review, planning, handoff, and pickup templates.
+- `skills/` — optional review, commit, GitHub, Herdr, MCP, and codebase workflows.
+- `extensions/` — startup/UI, permission, artifacts, subagent, and Herdr-gated
+  Firstmate integrations.
+- `mcp.json` — the configured global MCP servers; the browser QA server is
+  `chrome-devtools`.
+- `themes/`, `models.json.template`, `package.json`, and `package-lock.json` —
+  selectable themes, optional local provider template, and pinned runtime deps.
 
-## Environment variables
+## Setup
 
-These are optional. Set them on machines where you want local providers configured (add to `~/.zshrc` or `~/.bashrc`):
+Requirements: Node.js **22.19 or newer**, npm, and Pi (validated against **0.85.1**).
+The test suite uses the installed Pi host libraries; set `PI_PACKAGE_DIR` to the
+Pi package directory if it is not installed alongside your active Node runtime.
 
-```bash
-# URL of your llama-cpp server (e.g., local machine or GPU server)
-export PI_LLAMA_CPP_URL="http://192.168.0.XXX:8080/v1"
-
-# URL of your ollama server (can be the same as llama-cpp)
-export PI_OLLAMA_URL="http://192.168.0.XXX:11434/v1"
-```
-
-## Setup on a new machine
-
-```bash
-# 1. Clone this repo
-git clone git@github.com:mykhailotarabtsov/pi-config.git ~/pi-config
+```sh
+git clone <this-repository> ~/pi-config
 cd ~/pi-config
-
-# 2. Optional: set local provider environment variables (see above)
-echo 'export PI_LLAMA_CPP_URL="http://192.168.0.XXX:8080/v1"' >> ~/.zshrc
-echo 'export PI_OLLAMA_URL="http://192.168.0.XXX:11434/v1"' >> ~/.zshrc
-source ~/.zshrc
-
-# 3. Run the setup script
 ./setup.sh
 ```
 
-This copies all config files into `~/.pi/agent/` and generates `models.json` from the template. If local provider environment variables are unset, their URL placeholders are left empty.
+Use `./setup.sh --dry-run` to preview changes, or pass `--target PATH` to
+install elsewhere. Setup synchronizes the managed resource tree, preserves
+existing `settings.json`, `mcp.json`, and `models.json`, maintains backups and
+an ownership manifest, skips disabled entries and external source symlinks, and
+runs `npm ci --ignore-scripts`. Conflicting unowned files and modified obsolete
+files are kept with a warning; only unchanged obsolete managed files are pruned.
+Backups live in `.pi-agent-backups/`; `.pi-agent-managed.json` records ownership.
+An in-place checkout at `~/.pi/agent` skips copying/pruning its own files.
 
-### Dry run
+Set `PI_LLAMA_CPP_URL=https://your-server/v1` when you explicitly want setup to
+update the llama.cpp provider; it backs up `models.json` and preserves other
+providers. Without a URL, existing model configuration is left alone, and fresh
+installs start with an empty provider map. Secrets and `models.json` are not
+committed. Setup never copies sessions, credentials, or local helper binaries.
 
-```bash
-./setup.sh --dry-run
+**Restart Pi after this update**, rather than relying on `/reload`: older styled
+output patches cannot restore their original methods. Future patches have
+explicit reload/shutdown cleanup.
+
+The optional `nono` profile is an external OS sandbox and is owned outside this
+repository. Install it with `nono pull nolabs-ai/pi`; its own installer wires the
+local package into Pi. Portable setup omits machine-local package references
+when seeding settings. Merely loading its diagnostic extension does not sandbox
+Pi: launch through your reviewed `nono run` profile to enforce OS restrictions.
+
+Herdr is external too. The linked skill resolves to `~/.agents/skills/herdr`;
+install it independently on a new machine. Setup leaves Herdr's managed
+`extensions/herdr-agent-state.ts` to Herdr and skips the external skill symlink.
+It does not overwrite registry-managed nono files or their diagnostic guidance.
+
+## Tests and safety
+
+```sh
+npm test          # behavioral and source-contract tests; no model calls
+npm run check     # JSON, JS/TS parsing, and shell syntax (not a typecheck)
+git diff --check
 ```
 
-Shows what would be copied without making changes.
+Tests use disposable files/processes and a token-protected loopback HTTP server;
+they do not install packages, publish changes, or use external services.
 
-## Optional sandboxing with nono
+Pi permission and environment guardrails are tool-level controls, not a
+complete filesystem or network sandbox. Review and approve an entire MCP script
+before running it. Worker workflows are local-only by policy and do not push or
+publish, but no documentation here promises a comprehensive OS-level
+publishing guarantee. MCP gateway calls, scripts, and direct tools registered by
+the adapter are gated. Script approval covers the entire script, not each nested
+call; use adapter-level per-tool approvals or an outer sandbox for finer control.
+The headless browser exception is limited to `chrome-devtools`, never auth actions.
+Chrome DevTools MCP is pinned to the already-installed **1.7.0** release; review
+and deliberately update this pin when upgrading.
 
-[nono](https://nono.sh/) can run Pi with OS-enforced filesystem and network restrictions. Review the profile before using it:
+Subagents default to Luna/high with parent-model fallback before any tool use.
+`agents.defaults.timeoutSeconds` sets the per-task deadline (120 seconds by
+default, including fallback attempts); increase it for longer implementation jobs.
+Parallel batches allow at most eight tasks/four concurrent processes; chains at
+most eight steps. Outputs are bounded and larger final reports spill to private
+temporary files. Children retain the parent environment except coordinator
+identity; use minimal/phantom credentials if environment isolation is required.
 
-```bash
-brew install nono
-nono pull nolabs-ai/pi
-nono profile show nolabs-ai/pi
+Project agents override same-named user agents only with explicit project scope;
+collisions are reported. Headless project agents require a trusted project and
+`confirmProjectAgents: false`. Global trusted skills/Pi docs have narrow read-only
+resource exceptions; auth/session files do not. Browser provenance is a
+trusted-process guardrail, not cryptographic isolation.
 
-cd /path/to/project
-nono run --profile nolabs-ai/pi -- pi
-```
-
-For convenience, add this alias to `~/.zshrc` (or `~/.bashrc`):
-
-```bash
-alias pi='nono run --profile nolabs-ai/pi -- pi'
-```
-
-Then reload the shell with `source ~/.zshrc`.
-
-## Current UI and behavior
-
-The configuration uses Pi's local auto-discovery for extensions, prompts, and
-skills; `settings.json` does not need to list each local extension explicitly.
-The active UI configuration includes:
-
-- `themes/slop.json` as the active theme.
-- A startup dashboard, styled transcript/tool output, boxed chat input, animated
-  working status, a two-row footer, and safe browser artifacts.
-- Hidden thinking blocks, quiet startup, tree view on double Escape, and disabled
-  terminal progress.
-- A permission gate for sensitive paths, out-of-project access, unsafe Bash
-  commands, interactive `!`/`!!` commands, MCP calls, and headless subagents.
-- Local subagent delegation through `extensions/subagent/`.
-
-The Pikit UI and a hardened artifacts extension are included; web access, MCP
-setup, plan/chat modes, and other non-UI modules are not. Artifacts default to
-sanitized Markdown/static HTML, project-contained file inputs, and a
-token-protected localhost server. The original project is available at
-https://github.com/adrianapan/pikit. The old working-message extension remains
-renamed to `fun-working-message.ts.disabled` so it does not conflict with the
-new spinners extension.
-
-## Herdr Firstmate workflow
-
-The `extensions/firstmate/` extension is auto-discovered by Pi. It is active only
-inside Herdr when `HERDR_ENV=1`; the first interactive Pi pane acts as the staff
-engineer, communicates with the captain, and delegates implementation work to
-visible workers. It delegates browser QA to the `browser-tester` agent.
-
-Firstmate uses a session-scoped worker isolation mode. The default is `shared`,
-which starts the worker in the requested project checkout. For broad codebase
-reconnaissance or read-heavy investigation, delegate rather than spending a long
-local read/grep loop in firstmate: use one visible worker by default, two only for
-genuinely independent bounded scopes, and never uncontrolled fan-out. Narrow
-one-file questions may be inspected directly. `task_create` is asynchronous/no-wait;
-keep firstmate available for the captain and rely on watcher follow-ups instead of
-polling. Switch modes with:
-
-```text
-/firstmate-isolation shared
-/firstmate-isolation worktree
-```
-
-The selection is persisted in the Pi session and applies to later `task_create`
-calls. Worker selection is explicitly allowlisted: Pi is the default, and Claude
-can be selected for later workers with `/firstmate-worker claude` (or overridden
-per task with `kind: "claude"`). Use `/firstmate-worker pi` to restore the default.
-Shared-checkout tasks are already local, so they require only a structured
-report and reconciliation before teardown. Worktree tasks use [Treehouse](https://github.com/kunchenguid/treehouse)
-for isolated leases and follow this lifecycle:
-
-```text
-task_create -> worker structured report -> task_reconcile -> explicit task_deliver
-(fast-forward landing) -> idempotent delivery retry if needed -> task_teardown
-```
-
-`task_reconcile` validates the worker's structured report. `task_deliver` is only
-for worktree tasks and must explicitly land the worker branch with a local
-fast-forward before cleanup; retry it idempotently if a delivery attempt needs to
-be repeated. `task_teardown` verifies the exact task identity, closes the exact
-worker tab, and returns the Treehouse lease when applicable. Do not manually close
-worker tabs before cleanup.
-
-Firstmate itself never calls MCP. The `browser-tester` agent may use the configured
-browser MCP server for QA, but sign-in is always performed manually by the captain;
-the agent must never automate credentials. Implementation workers and their
-subagents cannot push or publish remote changes. The permission gate hard-blocks
-`git push` through the worker Git wrapper and the permission gate.
-
-Firstmate is inspired by [firstmate](https://github.com/kunchenguid/firstmate),
-but this configuration ports only local-only delivery and teardown behavior,
-not the full PR workflow.
-
-For Firstmate changes, run the focused tests in
-`tests/firstmate-delivery.test.mjs`, applicable Node syntax checks, and finish
-with `git diff --check` plus link/path grep validation.
-
-## Project-local session files
-
-`/handoff` and `/pickup` use project-relative `.pi/handoffs/`; handoffs are
-project-local documents. Artifact output uses project-relative `.pi/artifacts/`.
-Generated `.pi/artifacts/` is excluded from git. These commands resolve paths
-relative to the session cwd, so start Pi in the project or use an absolute
-handoff path.
-
-## What's excluded from git
-
-These files are machine-specific and should never be committed:
-
-```
-auth.json      # Contains auth tokens
-trust.json     # Machine-specific project trust decisions
-models.json    # Generated from template (contains local IPs)
-node_modules/  # Installed runtime dependencies
-sessions/      # Conversation history
-.pi/artifacts/ # Generated browser artifacts
-mcp-cache.json / mcp-npx-cache.json  # Caches
-.git/          # Cloned repo data
-.DS_Store      # macOS junk
-```
-
-## Custom extensions
-
-| Extension | Description |
-| --- | --- |
-| `extensions/styled-outputs/` | Styled assistant/user/thinking/tool transcript output, diffs, tool spinners, and `!`/`!!` command rendering. |
-| `extensions/artifacts/` | Safe Markdown/static-HTML browser artifacts with diffs, code highlighting, optional pinned Mermaid, path restrictions, CSP, and a token-protected localhost server. |
-| `extensions/footer/` | Two-row status footer with model, path, Git, context, token, and cost information. |
-| `extensions/chat-input/` | Boxed, theme-aware chat editor with native history, autocomplete, and paste support. |
-| `extensions/spinners/` | Animated working verbs with elapsed-time and token status. |
-| `extensions/startup/` | Startup dashboard showing loaded resources and keyboard shortcuts. |
-| `extensions/permission-gate.ts` | Allows ordinary in-project work and non-sensitive reads under the current user’s global `~/.pi` while guarding protected paths, unsafe Bash, `!`/`!!` commands, MCP calls, and headless subagents. Outside-project non-sensitive file operations and Bash can opt into `Allow safe operations for this session`; `/permissions` shows the status and `/permissions clear` resets it. |
-| `extensions/subagent/` | Registers the `subagent` tool for single, parallel, and chained delegation to `agents/*.md`. |
-| `extensions/fun-working-message.ts.disabled` | Disabled because the Pikit spinners extension provides the working status without competing timers. |
-
-## Updating configs
-
-After pulling new config from this repo, always run:
-
-```bash
-./setup.sh
-```
-
-This regenerates `models.json` with your current environment variables and installs the pinned runtime dependencies from `package-lock.json`, so if your server IP changes, it picks up the new value.
+Firstmate is active only under its gated Herdr policy. It coordinates visible
+workers; it does not implement locally. Read `extensions/firstmate/POLICY.md`
+for authoritative lifecycle and reporting behavior.

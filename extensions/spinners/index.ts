@@ -107,9 +107,13 @@ export default function spinners(pi: ExtensionAPI) {
   /**
    * Stops all active timers.
    */
+  function stopTypeTimer(): void {
+    if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
+  }
+
   function stopAllTimers(): void {
     if (cycleTimer) { clearInterval(cycleTimer); cycleTimer = null; }
-    if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
+    stopTypeTimer();
     if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
   }
 
@@ -299,7 +303,9 @@ export default function spinners(pi: ExtensionAPI) {
       resetResponseTracking();
     } else if (evt.type === "text_start") {
       setResponseTextBlockLength(evt.contentIndex, 0);
-      stopAllTimers();
+      // A streamed response may contain multiple text blocks. Keep the
+      // elapsed-time refresh and verb cycling alive between their deltas.
+      stopTypeTimer();
     } else if (evt.type === "text" || evt.type === "text_delta") {
       const prev = responseTextBlockLengths[evt.contentIndex] ?? 0;
       setResponseTextBlockLength(

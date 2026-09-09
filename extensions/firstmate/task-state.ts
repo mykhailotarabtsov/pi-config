@@ -31,6 +31,7 @@ export type TaskRecord = {
   version: number
   taskId: string
   project: string
+  projectRepoIdentity?: string
   worktree: string | null
   worktreeProvider?: WorktreeProvider
   leaseStatus?: LeaseStatus

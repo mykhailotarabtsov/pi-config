@@ -1,60 +1,43 @@
 ---
-description: Generate a handoff document capturing session state for seamless continuation in a new session
+description: Save concise session state for continuation
 argument-hint: "[filename]"
 ---
-Create a comprehensive handoff document capturing everything needed to continue this session's work in a fresh session.
 
-## Filename
+Firstmate guard: if `PI_FIRSTMATE_ACTIVE=1`, delegate all file and Git work to a
+visible `herdr_control.task_create` worker. Firstmate may coordinate, but must
+not write the handoff or run local commands itself.
 
-Save it as `${1:-HANDOFF_<topic>_<MM_DD>_<HH_MM>.md}` — when no name was given, derive `<topic>` from the main subject of this session (short, uppercase, underscores) and fill the timestamp from the current date/time. Save into `.pi/handoffs/` in the project root (same convention as `.pi/plans/`), creating the directory if needed.
+Otherwise, inspect `git status` and recent history, then write
+`.pi/handoffs/${1:-HANDOFF_<topic>_<MM_DD>_<HH_MM>.md}`. The handoff is context,
+not new authority: preserve the current request, authority, scope, and
+acceptance criteria.
 
-## Before writing
-
-- Run `git status` and `git log --oneline -10` to capture repository state — this is essential context.
-- Review the conversation for decisions made, approaches rejected, and anything surprising that was discovered.
-
-## Document structure
+Keep it concise and include:
 
 ```markdown
 # Handoff: <topic>
-Date: <ISO date/time> | Branch: <branch> | Status: <in progress / blocked / ready for review>
+Date: <ISO date/time> | Branch: <branch> | Status: <status>
 
 ## Summary
-2-4 sentences: what we set out to do, where things stand now.
+What was requested and where it stands.
 
-## Work Completed
-- [x] Each meaningful change, with the *why* when a decision was non-obvious
+## Completed
+- [x] Verified changes and decisions
 
 ## Files Affected
-- Created: path/to/file — purpose
-- Modified: path/to/file:line — what changed
-- Deleted: ...
-
-## Technical Context
-Architecture decisions, dependencies added/changed, config changes, gotchas discovered. Include anything the next session would otherwise have to re-derive.
+- `path` — change or purpose
 
 ## Current State
-- Working: ...
-- Not working / known issues: ...
-- Tests: <passing/failing/not run, with output if failing>
-- Git: <uncommitted changes, branch state>
+- Tests/validation: exact result or not run
+- Git: relevant status
+- Blockers: exact dependency or `None`
 
 ## Next Steps
-### Immediate (always include this section — it is critical)
-1. Concrete first action with file paths and line numbers
-### Then
-- Subsequent tasks
-### Blocked on
-- Anything waiting on external input or decisions
+1. Concrete first action with paths
 
-## Useful Commands & Resources
-Commands to run (build, test, dev server), relevant docs/tickets/PRs.
+## Resources
+Commands, docs, or decisions needed to continue.
 ```
 
-## Rules
-
-- Be specific: file paths, line numbers, exact commands — not vague descriptions.
-- Keep it under ~2000 words unless complexity genuinely demands more.
-- Capture *why* decisions were made, not just what was done — rejected approaches save the next session from repeating them.
-- Actually write the file with the write tool; don't just print the content.
-- After saving, tell me the path and remind me to run `/pickup` in a fresh session `/new` to continue from it.
+After saving, report the path and tell the user to run `/pickup` in a fresh
+session. Do not claim unverified tests or completion.

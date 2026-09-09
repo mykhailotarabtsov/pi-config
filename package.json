@@ -2,8 +2,13 @@
   "name": "pi-config",
   "private": true,
   "description": "Local Pi agent configuration and extensions",
+  "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "check": "node scripts/check.mjs"
   },
   "dependencies": {
     "@mermaid-js/tiny": "11.16.0",

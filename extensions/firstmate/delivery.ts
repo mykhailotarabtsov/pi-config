@@ -4,14 +4,16 @@ export type LocalDeliveryProbe = {
   dirtyPathsOverlap: boolean
   branchExists: boolean
   fastForward: boolean
+  repositoryIdentityCheckSucceeded?: boolean
 }
 
 export type LocalDeliveryDecision =
   | { allowed: true }
-  | { allowed: false; reason: 'detached' | 'dirty-path-check-failed' | 'dirty-overlap' | 'missing-branch' | 'diverged' }
+  | { allowed: false; reason: 'detached' | 'dirty-path-check-failed' | 'dirty-overlap' | 'missing-branch' | 'diverged' | 'repository-identity-mismatch' }
 
 export function assessLocalDelivery(probe: LocalDeliveryProbe): LocalDeliveryDecision {
   if (!probe.targetBranch) return { allowed: false, reason: 'detached' }
+  if (probe.repositoryIdentityCheckSucceeded === false) return { allowed: false, reason: 'repository-identity-mismatch' }
   if (!probe.branchExists) return { allowed: false, reason: 'missing-branch' }
   if (!probe.fastForward) return { allowed: false, reason: 'diverged' }
   if (!probe.dirtyPathCheckSucceeded) return { allowed: false, reason: 'dirty-path-check-failed' }

@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -11,9 +12,96 @@ const MUTATING_TOOLS = new Set(["write", "edit"]);
 // trying to prove that every chained segment is read-only.
 const SHELL_CONTROL = /[\n\r;&|`$()<>\\]/;
 const GIT_PUSH_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+push(?:\s|$)/i;
+// This is intentionally an obvious-command guard, not an OS sandbox. It catches
+// common publishing paths while leaving comprehensive enforcement to the host.
+const PUBLISH_COMMAND = /(?:\bnpm|pnpm|yarn|bun)\s+publish\b|\b(?:cargo|twine)\s+publish\b|\btwine\s+upload\b|\b(?:docker|podman)\s+push\b|\bgh\s+(?:pr\s+create|release\s+(?:create|upload))\b/i;
 
 function containsGitPush(command: string): boolean {
   return GIT_PUSH_COMMAND.test(command.replaceAll(/["']/g, ""));
+}
+
+function containsPublishCommand(command: string): boolean {
+  return PUBLISH_COMMAND.test(command.replaceAll(/["']/g, ""));
+}
+
+type ToolSourceInfo = {
+  path?: unknown;
+  source?: unknown;
+  package?: unknown;
+  server?: unknown;
+  serverName?: unknown;
+  mcpServer?: unknown;
+  [key: string]: unknown;
+};
+
+type RegisteredTool = { name?: unknown; sourceInfo?: ToolSourceInfo; source?: ToolSourceInfo };
+
+function sourceInfoText(sourceInfo: ToolSourceInfo | undefined): string {
+  if (!sourceInfo) return "";
+  return Object.entries(sourceInfo)
+    .filter(([, value]) => typeof value === "string")
+    .map(([key, value]) => `${key}:${value}`)
+    .join(" ")
+    .toLowerCase();
+}
+
+function isMcpSourceInfo(sourceInfo: ToolSourceInfo | undefined): boolean {
+  if (!sourceInfo) return false;
+  const text = sourceInfoText(sourceInfo);
+  return /(?:^|[\\\\/:@._-])pi-mcp-adapter(?:$|[\\\\/:@._-])/.test(text)
+    || /(?:^|[\\\\/:@._-])mcp-adapter(?:$|[\\\\/:@._-])/.test(text)
+    || /(?:^|[\\\\/:._-])mcp(?:$|[\\\\/:._-])/.test(String(sourceInfo.source ?? "").toLowerCase());
+}
+
+function mcpServerFromSource(sourceInfo: ToolSourceInfo | undefined): string | undefined {
+  if (!sourceInfo) return undefined;
+  for (const key of ["server", "serverName", "mcpServer"]) {
+    const value = sourceInfo[key];
+    if (typeof value === "string" && value.trim()) return value.trim().toLowerCase();
+  }
+  return undefined;
+}
+
+function isMcpToolName(toolName: string): boolean {
+  return toolName === "mcp"
+    || toolName === "mcpScript"
+    || /^(?:mcp|mcp-script)(?:__|[_:./-])/i.test(toolName)
+    || /(?:^|[_:./-])mcp(?:$|[_:./-])/i.test(toolName);
+}
+
+function mcpToolKey(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === "mcp") {
+    const server = typeof input.server === "string" ? input.server : "";
+    const tool = typeof input.tool === "string" ? input.tool : "";
+    return server ? `${server}/${tool}` : tool || "mcp";
+  }
+  return toolName;
+}
+
+// Browser QA is the one headless MCP exception. Match the configured server,
+// including the adapter's qualified tool names, not a generic "browser" alias.
+function isBrowserMcpRequest(toolName: string, input: Record<string, unknown>, source?: ToolSourceInfo): boolean {
+  const server = "chrome-devtools";
+  const qualified = (name: unknown) => typeof name === "string"
+    && /^(?:chrome-devtools_|chrome_devtools_|mcp__chrome[-_]devtools__)/.test(name);
+  if (toolName !== "mcp") {
+    return toolName !== "mcpScript" && (mcpServerFromSource(source) === server || qualified(toolName));
+  }
+  // Auth actions are always captain-managed, never delegated.
+  if (input.action) return false;
+  if (input.tool) return input.server ? input.server === server : qualified(input.tool);
+  if (input.connect) return input.connect === server;
+  if (input.describe) return qualified(input.describe);
+  if (input.server) return input.server === server;
+  if (input.instructions) return input.instructions === server;
+  return true; // Gateway status/search only; no call, connection, or auth action.
+}
+
+function mcpScriptText(input: Record<string, unknown>): string {
+  for (const key of ["script", "code", "source"]) {
+    if (typeof input[key] === "string") return input[key] as string;
+  }
+  return "";
 }
 
 const DANGEROUS_BASH = [
@@ -263,6 +351,65 @@ function isWithinGlobalPi(filePath: string): boolean {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
+function resourceRootsFromEnvironment(): string[] {
+  return (process.env.PI_PERMISSION_RESOURCE_ROOTS ?? "")
+    .split(path.delimiter)
+    .map((root) => root.trim())
+    .filter(Boolean)
+    .map((root) => {
+      try {
+        return realpathSync(root);
+      } catch {
+        return null;
+      }
+    })
+    .filter((root): root is string => Boolean(root));
+}
+
+function isWithinTrustedSubagentResource(filePath: string): boolean {
+  const resolvedFile = resolveForBoundary(filePath);
+  if (!resolvedFile || isSensitivePath(resolvedFile)) return false;
+  return resourceRootsFromEnvironment().some((root) => {
+    const relative = path.relative(root, resolvedFile);
+    return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  });
+}
+
+function isValidatedFirstmateReportPath(filePath: string): boolean {
+  const taskId = process.env.PI_FIRSTMATE_TASK_ID ?? "";
+  const reportPath = process.env.PI_FIRSTMATE_REPORT_PATH ?? "";
+  if (!taskId || !reportPath || !path.isAbsolute(reportPath)) return false;
+  if (!/^task-[a-z0-9-]{8,80}$/.test(taskId)) return false;
+
+  // Firstmate writes to this exact lexical path. Canonicalize only the root to
+  // detect symlink escapes; accepting two resolved paths alone would allow a
+  // report-path symlink to redirect writes to an arbitrary file.
+  const taskRoot = path.resolve(os.homedir(), ".pi", "firstmate", "tasks");
+  const expected = path.join(taskRoot, `${taskId}.report.json`);
+  if (path.resolve(reportPath) !== expected || path.resolve(filePath) !== expected) return false;
+  let canonicalRoot: string;
+  let canonicalReport: string;
+  try {
+    canonicalRoot = realpathSync(taskRoot);
+    if (lstatSync(expected).isSymbolicLink()) return false;
+    canonicalReport = realpathSync(expected);
+  } catch {
+    // The report may be a new file, but its complete existing parent chain must
+    // still be canonical and inside the canonical Firstmate task root.
+    const parent = path.dirname(expected);
+    try {
+      canonicalRoot = realpathSync(taskRoot);
+      canonicalReport = path.join(realpathSync(parent), path.basename(expected));
+    } catch {
+      return false;
+    }
+  }
+  const relative = path.relative(canonicalRoot, canonicalReport);
+  return relative === path.basename(expected)
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
+
 function commandPathArguments(command: string): string[] {
   const normalizedCommand = command.replaceAll(/["']/g, "");
   const paths: string[] = [];
@@ -317,6 +464,7 @@ export default function (pi: ExtensionAPI) {
   const trustedExactCommands = new Set<string>();
   const trustedToolPaths = new Set<string>();
   const trustedMcpTools = new Set<string>();
+  const trustedMcpScripts = new Set<string>();
   const trustedAllMutatingTools = new Set<string>();
   let allowSafeOperationsForSession = false;
   const permissionGateGlobal = globalThis as Record<string, unknown>;
@@ -331,9 +479,28 @@ export default function (pi: ExtensionAPI) {
   publishPermissionState(false);
 
   const isSubagentChild = process.env.PI_SUBAGENT_CHILD === "1";
-  const isBrowserTesterSubagent = isSubagentChild && process.env.PI_SUBAGENT_AGENT === "browser-tester";
+  const userAgentDir = path.resolve(
+    process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
+    "agents",
+  );
+  const browserDefinition = process.env.PI_SUBAGENT_AGENT_DEFINITION;
+  const isTrustedBrowserDefinition = (() => {
+    if (!browserDefinition || !path.isAbsolute(browserDefinition)) return false;
+    try {
+      const definition = realpathSync(browserDefinition);
+      const expected = realpathSync(path.join(userAgentDir, "browser-tester.md"));
+      return definition === expected;
+    } catch {
+      return false;
+    }
+  })();
+  const isTrustedBrowserTester = isSubagentChild
+    && process.env.PI_SUBAGENT_AGENT === "browser-tester"
+    && process.env.PI_SUBAGENT_AGENT_SOURCE === "user"
+    && isTrustedBrowserDefinition;
   const isFirstmateExecution = process.env.PI_FIRSTMATE_WORKER === "1";
   const isFirstmateWorker = isFirstmateExecution && !isSubagentChild;
+  const noPublishIdentity = process.env.PI_PERMISSION_NO_PUBLISH === "1";
   const withPermissionDialog = async <T>(label: string, dialog: () => Promise<T>): Promise<T> => {
     pi.events.emit("herdr:blocked", { active: true, label });
     try {
@@ -349,10 +516,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   const checkBashPermission = async (command: string, cwd: string, ctx: ExtensionContext) => {
-    if (isFirstmateExecution && containsGitPush(command)) {
+    if ((isFirstmateExecution || noPublishIdentity) && containsGitPush(command)) {
       return { allowed: false as const, reason: "git push is blocked for Firstmate workers and their subagents" };
     }
-    if (isFirstmateWorker) return { allowed: true as const };
+    if ((isFirstmateExecution || noPublishIdentity) && containsPublishCommand(command)) {
+      return { allowed: false as const, reason: "Publishing commands are blocked for Firstmate workers and their subagents" };
+    }
 
     const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
     const sensitive = containsSensitivePath(command, cwd);
@@ -414,6 +583,7 @@ export default function (pi: ExtensionAPI) {
         trustedExactCommands.clear();
         trustedToolPaths.clear();
         trustedMcpTools.clear();
+        trustedMcpScripts.clear();
         trustedAllMutatingTools.clear();
         allowSafeOperationsForSession = false;
         publishPermissionState(false);
@@ -427,6 +597,7 @@ export default function (pi: ExtensionAPI) {
         `- Trusted bash commands: ${trustedExactCommands.size}`,
         `- Trusted file tool/path pairs: ${trustedToolPaths.size}`,
         `- Trusted MCP tools: ${trustedMcpTools.size}`,
+        `- Trusted MCP scripts: ${trustedMcpScripts.size}`,
         `- Trusted all-tool entries: ${trustedAllMutatingTools.size}`,
         `- Safe operations for this session: ${allowSafeOperationsForSession ? "enabled" : "disabled"}`,
         "",
@@ -451,6 +622,26 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    const registeredTools = (() => {
+      try {
+        return (pi as ExtensionAPI & { getAllTools?: () => RegisteredTool[] }).getAllTools?.() ?? [];
+      } catch {
+        return [];
+      }
+    })();
+    const registeredTool = registeredTools.find((tool) => tool.name === event.toolName);
+    const sourceInfo = registeredTool?.sourceInfo ?? registeredTool?.source;
+    const sourceMcp = isMcpSourceInfo(sourceInfo);
+    const classifiedMcp = sourceMcp || isMcpToolName(event.toolName);
+
+    // A headless child must not gain an unclassified tool merely because the
+    // host added it after the allowlist was built. Known MCP tools are handled
+    // below; all other unknown tools fail closed.
+    const knownBuiltinTool = PATH_TOOLS.has(event.toolName) || event.toolName === "bash";
+    if (isSubagentChild && !registeredTool && !classifiedMcp && !knownBuiltinTool) {
+      return { block: true, reason: `Unknown tool blocked for headless subagent: ${event.toolName}` };
+    }
+
     // Subagents run in headless `pi --mode json -p --no-session` child processes.
     // They cannot answer UI permission prompts, so allow normal work only inside
     // the parent project and block sensitive or out-of-boundary operations.
@@ -459,7 +650,7 @@ export default function (pi: ExtensionAPI) {
       if (!permission.allowed) return { block: true, reason: permission.reason };
     }
 
-    if (PATH_TOOLS.has(event.toolName) && !isFirstmateWorker) {
+    if (PATH_TOOLS.has(event.toolName)) {
       const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
       const rawPath = READ_ONLY_TOOLS.has(event.toolName) && event.toolName !== "read"
         ? event.input.path ?? ctx.cwd
@@ -475,7 +666,16 @@ export default function (pi: ExtensionAPI) {
         && !isSubagentChild
         && !sensitive
         && isWithinGlobalPi(filePath);
-      const needsApproval = sensitive || protectedMutation || symlinkEscape || (!inProject && !globalPiRead);
+      const trustedSubagentResourceRead = READ_ONLY_TOOLS.has(event.toolName)
+        && isSubagentChild
+        && isWithinTrustedSubagentResource(filePath);
+      const validatedReportWrite = isFirstmateWorker
+        && MUTATING_TOOLS.has(event.toolName)
+        && isValidatedFirstmateReportPath(filePath);
+      const needsApproval = sensitive
+        || protectedMutation
+        || symlinkEscape
+        || (!inProject && !globalPiRead && !trustedSubagentResourceRead && !validatedReportWrite);
 
       // Ordinary project reads, searches, listings, and edits are allowed without interruption.
       // Non-sensitive global ~/.pi reads are also allowed for interactive users;
@@ -535,39 +735,63 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: "Blocked by permission gate" };
     }
 
-    if (process.env.PI_FIRSTMATE_ACTIVE === "1" && event.toolName === "mcp") {
-      return { block: true, reason: "Firstmate delegates MCP browser work to the browser-tester agent" };
-    }
+    if (classifiedMcp) {
+      if (process.env.PI_FIRSTMATE_ACTIVE === "1") {
+        return { block: true, reason: "Firstmate delegates MCP browser work to the browser-tester agent" };
+      }
+      const key = mcpToolKey(event.toolName, event.input);
+      const trustedBrowserMcp = isTrustedBrowserTester && isBrowserMcpRequest(event.toolName, event.input, sourceInfo);
+      if (isFirstmateExecution || (noPublishIdentity && !trustedBrowserMcp)) {
+        return { block: true, reason: "MCP calls are blocked for Firstmate workers and their subagents" };
+      }
+      // mcpScript executes its own internal calls in the vendor adapter, so the
+      // only safe hook available here is approval of the entire script. Direct
+      // tools additionally require provenance for the approved browser server;
+      // an adapter path without server metadata is not trusted by a child.
+      if (trustedBrowserMcp && event.toolName !== "mcpScript") return undefined;
 
-    if (isFirstmateExecution && event.toolName === "mcp") {
-      return { block: true, reason: "MCP calls are blocked for Firstmate implementation workers" };
-    }
-
-    if (isBrowserTesterSubagent && event.toolName === "mcp") return undefined;
-
-    if (!isFirstmateWorker && event.toolName === "mcp" && event.input.tool) {
-      const server = String(event.input.server ?? "");
-      const tool = String(event.input.tool ?? "");
-      const key = server ? `${server}/${tool}` : tool;
-      if (trustedMcpTools.has(key)) return undefined;
+      const script = event.toolName === "mcpScript" ? mcpScriptText(event.input) : "";
+      if (event.toolName === "mcpScript" && !script) {
+        return { block: true, reason: "MCP script is missing a nonempty script body; blocked fail-closed" };
+      }
+      const trustKey = script ? `script:${script}` : key;
+      if (script ? trustedMcpScripts.has(trustKey) : trustedMcpTools.has(key)) return undefined;
 
       if (isSubagentChild) {
-        return { block: true, reason: `MCP tool blocked for headless subagent: ${key}` };
+        return {
+          block: true,
+          reason: script
+            ? "MCP script blocked for headless subagent; trusted user browser provenance is required"
+            : `MCP tool blocked for headless subagent: ${key}`,
+        };
       }
 
       if (!ctx.hasUI) {
-        return { block: true, reason: `Permission required for MCP tool ${key}, but no UI is available` };
+        return {
+          block: true,
+          reason: script
+            ? "Permission required for the entire MCP script, but no UI is available"
+            : `Permission required for MCP tool ${key}, but no UI is available`,
+        };
       }
 
+      const preview = script || JSON.stringify(event.input.args ?? event.input, null, 2);
       const choice = await withPermissionDialog(
-        "MCP tool",
-        () => ctx.ui.select(`🔌 Allow MCP tool call?\n\n${key}\n\nArgs:\n${String(event.input.args ?? "")}`, [
-          "Allow once",
-          "Trust this MCP tool for this session",
-          "Block",
-        ]),
+        script ? "MCP script" : "MCP tool",
+        () => ctx.ui.select(
+          `${script ? "🔌 Allow entire MCP script?" : "🔌 Allow MCP tool call?"}\n\n${key}\n\nArgs:\n${preview.slice(0, 8_000)}`,
+          [
+            "Allow once",
+            ...(script ? ["Trust this MCP script for this session"] : ["Trust this MCP tool for this session"]),
+            "Block",
+          ],
+        ),
       );
 
+      if (choice === "Trust this MCP script for this session" && script) {
+        trustedMcpScripts.add(trustKey);
+        return undefined;
+      }
       if (choice === "Trust this MCP tool for this session") {
         trustedMcpTools.add(key);
         return undefined;
@@ -583,6 +807,7 @@ export default function (pi: ExtensionAPI) {
     trustedExactCommands.clear();
     trustedToolPaths.clear();
     trustedMcpTools.clear();
+    trustedMcpScripts.clear();
     trustedAllMutatingTools.clear();
     allowSafeOperationsForSession = false;
     publishPermissionState(false);

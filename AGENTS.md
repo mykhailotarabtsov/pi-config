@@ -1,67 +1,50 @@
 # Pi Agent Configuration
 
-General coding principles are defined in `APPEND_SYSTEM.md`. This file contains only Pi-specific workflow and resource configuration so those instructions are not duplicated.
+This checkout is the portable resource set for Pi. General coding rules live in
+`APPEND_SYSTEM.md`; this file maps the Pi-specific resources and delegation rules.
 
-## Subagent Workflow
+## Resource map
 
-This setup provides subagents through the local `extensions/subagent` Pi extension. It spawns isolated `pi --mode json -p --no-session` child processes and returns each child agent's final response.
+- `settings.json` — defaults, UI, packages, and subagent timeout.
+- `agents/*.md` — the seven user-level roles: `scout`, `planner`, `worker`,
+  `reviewer`, `builder`, `unit-tester`, and `browser-tester`.
+- `prompts/*.md` — backwards-compatible workflow templates, including handoff
+  and pickup.
+- `skills/*/SKILL.md` — optional workflows for review, commits, setup, GitHub,
+  Herdr, and codebase learning.
+- `extensions/` — auto-discovered UI, permission, artifact, subagent, and
+  Firstmate integrations. `themes/` contains selectable themes.
+- `setup.sh` and `scripts/setup.mjs` — safe installation and synchronization.
+  `tests/` covers setup, permissions, subagents, Firstmate, UI, and artifacts.
 
-### Subagent Model
+## Normal delegation
 
-Subagents use `openai-codex/gpt-5.6-luna` with high thinking effort by default. If that model is unavailable, the extension retries with the model and thinking level active in the parent Pi session.
+A normal main session may implement directly; delegation is optional. A child
+subagent has an isolated context window, but that is not a filesystem sandbox.
+Its effective tools come from the agent definition and the runtime permission
+hooks. Use a single agent for a bounded specialist task, parallel agents only
+for independent work, and a chain when each result is useful to the next stage.
+For every delegated task, state the original request, authority (including
+whether commits are allowed), scope and files, acceptance criteria, and required
+validation. Preserve unrelated working-tree changes.
 
-### Available Agents
+Use the `worker` for ordinary implementation, `builder` when minimal validation
+is explicitly sufficient, `reviewer` for static inspection, `unit-tester` for
+actual test execution, and `browser-tester` for manual browser QA. Agents must
+report what they changed or inspected, validation evidence, and blockers; a
+blocked or failed result is not completion.
 
-- **`scout`** — Fast codebase reconnaissance and compressed handoff context.
-- **`planner`** — Creates implementation plans without modifying files.
-- **`worker`** — General-purpose implementation agent in an isolated context.
-- **`reviewer`** — Code review specialist.
-- **`builder`** — Focused implementation with minimal validation.
-- **`unit-tester`** — Runs unit/integration tests and reports concrete results.
-- **`browser-tester`** — Manual QA specialist; may be blocked if browser/MCP tools are unavailable in the child process.
+## Firstmate
 
-### Usage Rules
+Only when activated in Herdr, the runtime loads the canonical policy from
+`extensions/firstmate/POLICY.md` beside this file. Follow that injected role
+instead of ordinary Herdr split-pane guidance or generic workflow chains.
+Firstmate coordinates visible workers, never implements locally, and delegates
+browser QA only to the user-scoped browser tester. Pi is the default worker;
+Claude requires an explicit allowlisted override. Keep the full contract in
+that one policy file rather than duplicating it here.
 
-- Use subagents when isolation or specialization is useful; do not delegate tiny one-file edits or quick factual questions.
-- Prefer documented modes: single `{ agent, task }`, parallel `{ tasks: [...] }`, or chain `{ chain: [...] }` with `{previous}` handoff.
-- User-level agents in `~/.pi/agent/agents/*.md` are loaded by default. Project-local `.pi/agents/*.md` require `agentScope: "project"` or `"both"` and should only be used for trusted repositories.
-- Subagents finish by returning normal final text from the child Pi process.
+## Skills
 
-## Herdr Firstmate Workflow
-
-A global `extensions/firstmate/index.ts` extension is auto-discovered by Pi.
-It is intentionally gated:
-
-- Outside Herdr (`HERDR_ENV` is not `1`), it does nothing.
-- Inside Herdr, only the first interactive Pi pane in a workspace becomes `firstmate`.
-- A per-workspace marker prevents later visible Herdr worker Pi panes from becoming firstmate sessions.
-- Firstmate sessions are coordination-only: active tools are limited to read-only inspection with `read`, `grep`, `find`, and `ls`, specialized delegation with `subagent`, Herdr coordination with `herdr_control`, and the sole generated-output exception `artifact`. Firstmate never calls `mcp`; the browser-tester subagent is the sole MCP-capable delegate for browser QA. Use `artifact` only for generated browser artifacts, reports, or diagrams under the project `.pi/artifacts/` directory; this is not implementation work and does not allow arbitrary file edits. `edit`, `write`, and `bash` are removed.
-- Firstmate starts/coordinates one visible Herdr tab per worker, never a split pane. When the firstmate is Pi, worker agent starts must use Herdr kind `pi` (the tool derives the current kind; do not hardcode another kind such as `codex`). Worker tabs inherit the firstmate session's active Node runtime.
-- Firstmate sessions default to shared-checkout workers. Use `/firstmate-isolation worktree` to make later `task_create` calls lease isolated Treehouse worktrees, or `/firstmate-isolation shared` to switch back. Do not run concurrent shared-checkout workers for the same project.
-- Firstmate names the Pi session `firstmate` and attempts to rename the Herdr agent to `firstmate`.
-
-### Firstmate operating contract
-
-The captain is the firstmate's only user-facing contact. Firstmate coordinates project work rather than implementing it: it must not edit project files or run a local shell command. It may inspect read-only context with `read`, `grep`, `find`, and `ls`, use `subagent` for specialized delegated work such as `browser-tester`, use high-level `herdr_control` task operations to coordinate implementation workers, and use `artifact` only for generated browser artifacts, reports, or diagrams under the project `.pi/artifacts/` directory; artifact output is not implementation work. Firstmate itself never calls MCP.
-
-Before delegation, firstmate must inspect enough context to identify the project, scope, authority, and success condition. It asks the captain a focused clarification when any of those are ambiguous; it does not delegate speculative or invented work. Broad codebase reconnaissance and read-heavy investigation should be delegated instead of becoming long local read/grep loops. One visible worker is the default; two are allowed only for genuinely independent, bounded scopes, with no uncontrolled fan-out. Narrow one-file questions may be inspected directly. `task_create` is asynchronous/no-wait: keep the firstmate focused on the captain and use watcher follow-ups rather than polling.
-
-Each implementation worker receives a precise brief with the objective, relevant context, file or scope boundaries, constraints, preservation of unrelated changes, commit authority, explicit success criteria, required tests or validation, and the expected outcome report. Every implementation worker gets its own visible Herdr tab without taking the captain's focus. The worker uses the same Herdr agent kind as firstmate (a Pi firstmate starts Pi workers), and its tab inherits firstmate's active Node runtime. Shared-checkout tasks are already local and need no delivery; worktree tasks require explicit delivery before teardown. Browser QA uses the separate `browser-tester` subagent path; it may use browser MCP and must pause for captain-managed manual sign-in.
-
-Firstmate waits for and reads worker results, then reconciles them against the request, brief, changed files, and test or validation evidence before reporting. A blocked worker is handled by identifying the exact missing input or dependency, providing it, asking the captain, or reporting the blocker; firstmate does not silently substitute work. A failed worker is reported plainly with evidence and is retried only for a concrete, in-scope diagnosis. Blocked or failed work is never presented as complete.
-
-Workers must make surgical changes and preserve unrelated working-tree changes. Implementation workers and their subagents must never push or publish; the Firstmate permission gate hard-blocks those paths. The browser-tester delegate may use MCP only for browser QA and must never automate sign-in or handle credentials. Workers must not commit unless the captain explicitly asks. Firstmate's final response addresses the captain as `captain` and reports the outcome, changed files (or none), tests and validation with results, reconciliation evidence, and blockers, failures, or unresolved decisions. After Firstmate makes or coordinates actual changes, it must also include a clearly labeled `Proposed Conventional Commit title:` using `<type>(<optional scope>): <imperative summary>`, with a concise subject and no trailing period. It does not claim work, tests, validation, or files that were not reported or verified.
-
-## Skill Triggers
-
-Load only these starter skills by default:
-
-| When... | Load skill... |
-|---|---|
-| Starting in an unfamiliar codebase | `learn-codebase` |
-| Making a commit | `commit` |
-| Reviewing completed code changes | `change-review` |
-| Working with GitHub | `github` |
-| Adding or changing MCP servers | `add-mcp-server` |
-
-The `commit` skill remains mandatory whenever creating commits.
+Load matching skills on demand. The `commit` skill is mandatory before creating
+any commit. Package-provided skills remain available; this is not an allowlist.

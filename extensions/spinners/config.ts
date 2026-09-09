@@ -6,8 +6,8 @@
  */
 
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface ThemeTokens {
   verb: string;
@@ -27,7 +27,7 @@ export const DEFAULT_THEME_TOKENS: ThemeTokens = {
   separatorIcon: "└─",
 };
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "configs", "spinners.json");
+const CONFIG_PATH = join(getAgentDir(), "configs", "spinners.json");
 
 function validateThemeTokens(tokens: unknown): ThemeTokens {
   if (typeof tokens !== "object" || tokens === null) {

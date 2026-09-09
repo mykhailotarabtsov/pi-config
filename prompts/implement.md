@@ -1,10 +1,15 @@
 ---
-description: Full implementation workflow - scout gathers context, planner creates plan, worker implements
+description: Focused implementation workflow
 ---
-Use the subagent tool with the chain parameter to execute this workflow:
 
-1. First, use the "scout" agent to find all code relevant to: $@
-2. Then, use the "planner" agent to create an implementation plan for "$@" using the context from the previous step (use {previous} placeholder)
-3. Finally, use the "worker" agent to implement the plan from the previous step (use {previous} placeholder)
+Firstmate guard: when `PI_FIRSTMATE_ACTIVE=1`, do not invoke a generic chain.
+Route reconnaissance and file/Git work through visible
+`herdr_control.task_create`; use headless `subagent` only for `browser-tester`
+QA.
 
-Execute this as a chain, passing output between steps via {previous}.
+For a simple bounded task, invoke `worker` directly. If context is missing,
+use `scout` then `worker`; do not add a planner or reviewer without a reason.
+At every stage include the cumulative original request `$@`, authority and
+commit limits, scope/files, acceptance criteria, and validation requirements.
+`{previous}` is context only. Preserve unrelated changes, run the requested
+checks, and report changed files, evidence, failures, and blockers.

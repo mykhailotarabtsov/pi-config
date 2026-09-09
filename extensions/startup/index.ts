@@ -1,7 +1,6 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { readFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { discoverLoadedCounts } from "./discovery.js";
 import { renderBox } from "./layout.js";
@@ -9,7 +8,7 @@ import type { KeyMap } from "./layout.js";
 
 /** Read shortcuts.toggleMode from an extension config; fall back to default. */
 function readToggleMode(configName: string, fallback: string): string {
-  const path = join(homedir(), ".pi", "agent", "configs", configName);
+  const path = join(getAgentDir(), "configs", configName);
   try {
     if (existsSync(path)) {
       const cfg = JSON.parse(readFileSync(path, "utf8"));
@@ -27,10 +26,12 @@ function hasModeCommand(commands: Array<{ name: string }>, mode: "chat-mode" | "
 
 export default function startup(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
-    if (!ctx.hasUI) return;
+    if (ctx.mode !== "tui") return;
 
     const commands = pi.getCommands();
-    const counts = discoverLoadedCounts(commands);
+    const counts = discoverLoadedCounts(commands, {
+      activeModel: ctx.model ? 1 : 0,
+    });
     const kb = getKeybindings();
     const keyMap: KeyMap = {
       "app.model.cycleForward": kb.getKeys("app.model.cycleForward")[0] ?? "ctrl+p",

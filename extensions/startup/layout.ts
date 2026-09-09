@@ -44,16 +44,21 @@ export function buildTipsColumn(theme: Theme, keyMap: KeyMap): string[] {
 
 function buildRightColumn(theme: Theme, counts: LoadedCounts): string[] {
   const dim = (s: string) => theme.fg("dim", s);
-  const { models, contextFiles, extensions, skills, promptTemplates, mcpServers } = counts;
   const itemPrefix = dim("• ");
-  const countLines: string[] = [
-    ` ${itemPrefix}${theme.fg(models > 0 ? "success" : "dim", `${models}`)} model${models !== 1 ? "s" : ""}`,
-    ` ${itemPrefix}${theme.fg(extensions > 0 ? "success" : "dim", `${extensions}`)} extension${extensions !== 1 ? "s" : ""}`,
-    ` ${itemPrefix}${theme.fg(skills > 0 ? "success" : "dim", `${skills}`)} skill${skills !== 1 ? "s" : ""}`,
-    ` ${itemPrefix}${theme.fg(mcpServers > 0 ? "success" : "dim", `${mcpServers}`)} MCP config${mcpServers !== 1 ? "s" : ""}`,
-    ` ${itemPrefix}${theme.fg(promptTemplates > 0 ? "success" : "dim", `${promptTemplates}`)} prompt template${promptTemplates !== 1 ? "s" : ""}`,
-    ` ${itemPrefix}${theme.fg(contextFiles > 0 ? "success" : "dim", `${contextFiles}`)} context file${contextFiles !== 1 ? "s" : ""}`,
-  ];
+  const countLines: string[] = [];
+  if (counts.activeModel !== undefined) {
+    countLines.push(` ${itemPrefix}${theme.fg(counts.activeModel > 0 ? "success" : "dim", `${counts.activeModel}`)} active model${counts.activeModel !== 1 ? "s" : ""}`);
+  }
+  if (counts.extensionCommands !== undefined) {
+    countLines.push(` ${itemPrefix}${theme.fg(counts.extensionCommands > 0 ? "success" : "dim", `${counts.extensionCommands}`)} extension command${counts.extensionCommands !== 1 ? "s" : ""}`);
+  }
+  countLines.push(
+    ` ${itemPrefix}${theme.fg(counts.skills > 0 ? "success" : "dim", `${counts.skills}`)} skill${counts.skills !== 1 ? "s" : ""}`,
+    ` ${itemPrefix}${theme.fg(counts.promptTemplates > 0 ? "success" : "dim", `${counts.promptTemplates}`)} prompt template${counts.promptTemplates !== 1 ? "s" : ""}`,
+  );
+  if (counts.contextFiles !== undefined) {
+    countLines.push(` ${itemPrefix}${theme.fg(counts.contextFiles > 0 ? "success" : "dim", `${counts.contextFiles}`)} context file${counts.contextFiles !== 1 ? "s" : ""}`);
+  }
 
   return ["", ...countLines, ""];
 }

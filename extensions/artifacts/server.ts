@@ -169,7 +169,7 @@ function handle(req: IncomingMessage, res: ServerResponse, clients: Set<ServerRe
   const trusted = trustedArtifacts.get(match[1]) === digest(raw);
   const body = trusted ? raw : sanitizeStoredHtml(raw);
   const policy = trusted ? extractCsp(raw) ?? SAFE_CSP : SAFE_CSP;
-  send(res, 200, mimeType(safe), req.method === "HEAD" ? "" : body, { "Content-Security-Policy": policy, ...authHeaders });
+  send(res, 200, mimeType(safe), body, { "Content-Security-Policy": policy, ...authHeaders });
 }
 
 function extractCsp(html: string): string | null {

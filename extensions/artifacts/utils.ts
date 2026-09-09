@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { ARTIFACT_DIR, MAX_ARTIFACT_BYTES, MAX_INPUT_BYTES } from "./config.js";
 
 const SAFE_SLUG = /^[a-z0-9-]+$/;
-const PROTECTED_SEGMENTS = new Set([".git", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform.d", ".env", "credentials", "secrets", "private"]);
+const PROTECTED_SEGMENTS = new Set([".git", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform.d", ".env", "credentials", "secrets"]);
 const PROTECTED_NAMES = new Set([
   ".env", ".envrc", "auth.json", "credentials.json", "secrets.json", "token.json",
   "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".npmrc", ".netrc",

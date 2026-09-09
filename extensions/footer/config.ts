@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { FooterUserConfig, StatusLineSegmentId, ColorScheme, StatusLineSegmentOptions } from "./types.js";
 import { getDefaultColors } from "./theme.js";
 import type { IconSet } from "./icons.js";
@@ -26,8 +27,7 @@ let userConfigCacheTime = 0;
 const CACHE_TTL = 5000; // 5 seconds
 
 function getConfigPath(): string {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  return join(homeDir, ".pi", "agent", "configs", "footer.json");
+  return join(getAgentDir(), "configs", "footer.json");
 }
 
 export function loadUserConfig(): FooterUserConfig | null {

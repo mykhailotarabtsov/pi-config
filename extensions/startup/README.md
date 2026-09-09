@@ -7,7 +7,7 @@ A startup header for the pi coding agent. Displays a three-column welcome box at
 ## Features
 
 - **Pi logo**: ASCII art rendered in the accent colour
-- **Loaded counts**: Reports how many extensions, skills, MCP configs, prompt templates, and context files are active
+- **Loaded counts**: Reports runtime-proven counts for active model, extension commands, skills, and prompt templates; host metadata is omitted when unavailable
 - **Quick tips**: Inline keyboard shortcut reminders
 - **Version banner**: Agent version shown in the top border
 - **Responsive layout**: Box adapts to terminal width; hidden below 44 columns
@@ -18,21 +18,22 @@ A startup header for the pi coding agent. Displays a three-column welcome box at
 | Column | Content |
 |--------|---------|
 | Left | Pi ASCII art logo |
-| Centre | Counts of extensions, skills, MCP configs, prompt templates, and context files |
+| Centre | Runtime-proven counts for active model, extension commands, skills, prompt templates, and optional context metadata |
 | Right | Keyboard shortcuts |
 
 ## Loaded counts discovery
 
-The extension counts what is active via pi's command registry and standard pi paths:
+The extension uses Pi runtime metadata where available. It counts skills, prompt templates, and extension commands from `pi.getCommands()` provenance, and only displays active-model/context metadata supplied by the host. It intentionally does not duplicate Pi's loader to guess ancestor overrides, local paths, package filters, models, or MCP server counts.
+
+The legacy exported count helpers remain available for focused compatibility tests, but are not used to render the dashboard:
 
 | Type | Source |
 |------|--------|
-| Models | `~/.pi/agent/settings.json`, `<cwd>/.pi/settings.json` (`defaultModel` and `enabledModels`) |
-| Context files | `~/.pi/agent/AGENTS.md`, `~/.claude/AGENTS.md`, `<cwd>/AGENTS.md`, `<cwd>/CLAUDE.md`, `<cwd>/.pi/AGENTS.md` |
-| Extensions | `~/.pi/agent/settings.json`, `<cwd>/.pi/settings.json` (each package's `package.json` `pi.extensions` manifest — glob-expanded, with `!`/`+`/`-` overrides — under `npm/node_modules/<name>` and `git/<host>/<path>`, user + project scope; packages with no manifest fall back to a convention `extensions/` dir; object-form entries may additionally filter via an `extensions` array, where `[]` disables all), plus local dirs `~/.pi/agent/extensions/`, `<cwd>/.pi/extensions/`, `<cwd>/extensions/` (smart discovery: flat `.ts`/`.js` files and `index.ts` subdirs, mirroring pi's `collectAutoExtensionEntries`) |
-| Skills | pi command registry — `pi.getCommands()` with `source: "skill"` (local + package-installed) |
-| Prompt templates | pi command registry — `pi.getCommands()` with `source: "prompt"` (local + package-installed) |
-| MCP servers | `~/.pi/agent/mcp.json` |
+| Active model | `ctx.model` at session start |
+| Extension commands | `pi.getCommands()` entries with `source: "extension"` |
+| Skills | `pi.getCommands()` entries with `source: "skill"` |
+| Prompt templates | `pi.getCommands()` entries with `source: "prompt"` |
+| Context files | Omitted at startup unless supplied by host metadata |
 
 ## Icons
 

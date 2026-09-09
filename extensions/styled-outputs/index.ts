@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, SkillInvocationMessageComponent, CustomMessageComponent, BashExecutionComponent, createReadTool, createBashTool, createEditTool, createWriteTool, createLsTool, createGrepTool, createFindTool, truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, keyText } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, UserMessageComponent, ToolExecutionComponent, SkillInvocationMessageComponent, CustomMessageComponent, BashExecutionComponent, createReadTool, createBashTool, createEditTool, createWriteTool, createLsTool, createGrepTool, createFindTool, truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
-import { PATCH_FLAG, setCurrentTheme, currentTheme, applyColor, toolPrefix, errorPrefix } from "./utils.js";
+import { setCurrentTheme, currentTheme, applyColor, toolPrefix, errorPrefix } from "./utils.js";
 import { CONFIG } from "./config.js";
 import { createAssistantMessage } from "./components/assistant-message.js";
 import { createThinkingMessage } from "./components/thinking-message.js";
@@ -24,19 +24,49 @@ import {
 import { createSkillInvocationMessage } from "./components/skill-message.js";
 import { createCustomMessage } from "./components/custom-message.js";
 import { branchLine, doneLabel, errorLabel, expandHint, formatExpandedLines } from "./components/tool-shared.js";
+import { createPrototypePatchManager, hasLegacyPatchState, LEGACY_PATCH_MESSAGE } from "./patch-state.js";
+import { startBashSpinner, stopBashSpinner } from "./bash-spinner.js";
 
 const WEB_TOOLS = new Set(["web_search", "fetch_content", "get_search_content"]);
 
 export default function styledOutputs(pi: ExtensionAPI) {
+  const patchPrototypes = [
+    AssistantMessageComponent.prototype,
+    UserMessageComponent.prototype,
+    ToolExecutionComponent.prototype,
+    SkillInvocationMessageComponent.prototype,
+    CustomMessageComponent.prototype,
+    BashExecutionComponent.prototype,
+  ];
+  if (hasLegacyPatchState(patchPrototypes)) {
+    console.warn(`[styled-outputs] ${LEGACY_PATCH_MESSAGE}`);
+    return;
+  }
+
+  const owner = {};
+  const patchManager = createPrototypePatchManager(owner);
+  const patch = patchManager.patch;
+  const activeBashExecutions = new Set<any>();
+  const cleanupPatches = () => {
+    for (const execution of activeBashExecutions) stopBashSpinner(execution);
+    activeBashExecutions.clear();
+    patchManager.cleanup();
+    setCurrentTheme(undefined);
+  };
+
   pi.on("session_start", async (_event, ctx) => {
-    setCurrentTheme(ctx.ui.theme);
+    if (ctx.mode === "tui" && ctx.ui.theme) setCurrentTheme(ctx.ui.theme);
+  });
+
+  pi.on("session_shutdown", async () => {
+    cleanupPatches();
   });
 
   // --- Patch AssistantMessageComponent ---
   const assistantProto = AssistantMessageComponent.prototype as any;
-  if (!assistantProto[PATCH_FLAG]) {
+  {
     const originalUpdateContent = assistantProto.updateContent;
-    assistantProto.updateContent = function patchedUpdateContent(message: any) {
+    patch(assistantProto, "updateContent", function patchedUpdateContent(message: any) {
       if (!message?.content || !Array.isArray(message.content)) {
         return originalUpdateContent.call(this, message);
       }
@@ -62,16 +92,14 @@ export default function styledOutputs(pi: ExtensionAPI) {
           }
         }
       }
-    };
-
-    assistantProto[PATCH_FLAG] = true;
+    });
   }
 
   // --- Patch UserMessageComponent ---
   const userProto = UserMessageComponent.prototype as any;
-  if (!userProto[PATCH_FLAG]) {
+  {
     const originalUserRender = userProto.render;
-    userProto.render = function patchedUserRender(width: number) {
+    patch(userProto, "render", function patchedUserRender(width: number) {
       const contentBox = this.contentBox;
       if (contentBox?.children && !this._styledReplaced) {
         for (let i = 0; i < contentBox.children.length; i++) {
@@ -94,16 +122,14 @@ export default function styledOutputs(pi: ExtensionAPI) {
         this._styledReplaced = true;
       }
       return originalUserRender.call(this, width);
-    };
-
-    userProto[PATCH_FLAG] = true;
+    });
   }
 
   // --- Patch ToolExecutionComponent (conditionally apply bg) ---
   const toolProto = ToolExecutionComponent.prototype as any;
-  if (!toolProto[PATCH_FLAG]) {
+  {
     const originalUpdateDisplay = toolProto.updateDisplay;
-    toolProto.updateDisplay = function patchedUpdateDisplay() {
+    patch(toolProto, "updateDisplay", function patchedUpdateDisplay() {
       const savedResult = this.result;
       if (this.isPartial) this.result = undefined;
       originalUpdateDisplay.call(this);
@@ -123,11 +149,11 @@ export default function styledOutputs(pi: ExtensionAPI) {
           this.contentBox.setBgFn(undefined);
         }
       }
-    };
+    });
 
     // --- Inject web + MCP renderers for tools without custom renderers ---
     const originalGetCallRenderer = toolProto.getCallRenderer;
-    toolProto.getCallRenderer = function patchedGetCallRenderer() {
+    patch(toolProto, "getCallRenderer", function patchedGetCallRenderer() {
       const renderer = originalGetCallRenderer.call(this);
       if (renderer !== undefined) return renderer;
       const name = this.toolName;
@@ -138,10 +164,10 @@ export default function styledOutputs(pi: ExtensionAPI) {
       }
       const label = this.toolDefinition?.label ?? name;
       return (args: any, theme: any, ctx: any) => renderMcpCall(label, args, theme, ctx);
-    };
+    });
 
     const originalGetResultRenderer = toolProto.getResultRenderer;
-    toolProto.getResultRenderer = function patchedGetResultRenderer() {
+    patch(toolProto, "getResultRenderer", function patchedGetResultRenderer() {
       const renderer = originalGetResultRenderer.call(this);
       if (renderer !== undefined) return renderer;
       const name = this.toolName;
@@ -152,15 +178,13 @@ export default function styledOutputs(pi: ExtensionAPI) {
       }
       const label = this.toolDefinition?.label ?? name;
       return (result: any, options: any, theme: any, ctx: any) => renderMcpResult(label, result, options, theme, ctx);
-    };
-
-    toolProto[PATCH_FLAG] = true;
+    });
   }
 
   // --- Patch SkillInvocationMessageComponent ---
   const skillProto = SkillInvocationMessageComponent.prototype as any;
-  if (!skillProto[PATCH_FLAG]) {
-    skillProto.updateDisplay = function patchedSkillUpdateDisplay() {
+  {
+    patch(skillProto, "updateDisplay", function patchedSkillUpdateDisplay() {
       if (!this.skillBlock) return;
 
       if (!this._styledSkillComponent) {
@@ -183,15 +207,13 @@ export default function styledOutputs(pi: ExtensionAPI) {
       this._styledSkillComponent.setExpanded(this.expanded);
       this.clear();
       this.addChild(this._styledSkillComponent);
-    };
-
-    skillProto[PATCH_FLAG] = true;
+    });
   }
 
   // --- Patch CustomMessageComponent ---
   const customProto = CustomMessageComponent.prototype as any;
-  if (!customProto[PATCH_FLAG]) {
-    customProto.rebuild = function patchedCustomRebuild() {
+  {
+    patch(customProto, "rebuild", function patchedCustomRebuild() {
       // Extract text content from message
       let textContent: string;
       if (typeof this.message.content === "string") {
@@ -223,22 +245,20 @@ export default function styledOutputs(pi: ExtensionAPI) {
       this._styledCustomComponent.setExpanded(this._expanded);
       this.clear();
       this.addChild(this._styledCustomComponent);
-    };
+    });
 
     const originalSetExpanded = customProto.setExpanded;
-    customProto.setExpanded = function patchedCustomSetExpanded(expanded: boolean) {
+    patch(customProto, "setExpanded", function patchedCustomSetExpanded(expanded: boolean) {
       if (this._styledCustomComponent) {
         this._styledCustomComponent.setExpanded(expanded);
       }
       return originalSetExpanded.call(this, expanded);
-    };
-
-    customProto[PATCH_FLAG] = true;
+    });
   }
 
   // --- Patch BashExecutionComponent (! / !! commands) ---
   const bashExecProto = BashExecutionComponent.prototype as any;
-  if (!bashExecProto[PATCH_FLAG]) {
+  {
     const SPINNER_CHARS = CONFIG.tools.toolSpinnerPrefix.prefixChars;
     const SPINNER_FRAMES = [...SPINNER_CHARS, ...[...SPINNER_CHARS].reverse()];
     const SPINNER_INTERVAL = 80;
@@ -256,13 +276,17 @@ export default function styledOutputs(pi: ExtensionAPI) {
     // updateDisplay is otherwise only triggered by appendOutput, meaning
     // commands like `! sleep 5 && echo "test"` show unstyled for 5s.
     const origRender = bashExecProto.render;
-    bashExecProto.render = function patchedRender(width: number) {
+    patch(bashExecProto, "render", function patchedRender(width: number) {
       this.updateDisplay();
       return origRender.call(this, width);
-    };
+    });
 
     // Replace updateDisplay with styled version matching tool call pattern
-    bashExecProto.updateDisplay = function patchedBashUpdateDisplay() {
+    patch(bashExecProto, "updateDisplay", function patchedBashUpdateDisplay() {
+      if (this._spinnerInterval && this.status !== "running") {
+        stopBashSpinner(this);
+        activeBashExecutions.delete(this);
+      }
       const t = currentTheme!;
       const bc = CONFIG.bashExecution;
       const tc = CONFIG.tools;
@@ -284,13 +308,16 @@ export default function styledOutputs(pi: ExtensionAPI) {
         // changes on next command and would flip titles of previous components
         this._excludeFromContext = lastBashExcludeFromContext;
 
-        // Start header spinner
-        this._spinnerFrame = 0;
-        this._spinnerInterval = setInterval(() => {
-          this._spinnerFrame = (this._spinnerFrame + 1) % SPINNER_FRAMES.length;
-          this.updateDisplay();
-          this._tui?.requestRender();
-        }, SPINNER_INTERVAL);
+        // Start header spinner. A command can complete before its first
+        // render; do not start a timer for that already-complete execution.
+        const spinnerStarted = startBashSpinner(
+          this,
+          SPINNER_FRAMES,
+          SPINNER_INTERVAL,
+          () => this.updateDisplay(),
+          () => this._tui?.requestRender(),
+        );
+        if (spinnerStarted) activeBashExecutions.add(this);
 
         this._styledInitDone = true;
       }
@@ -364,19 +391,15 @@ export default function styledOutputs(pi: ExtensionAPI) {
       }
 
       cc.addChild(new Text(display, 1, 0));
-    };
+    });
 
     // Patch setComplete to clear spinner
     const OrigSetComplete = bashExecProto.setComplete;
-    bashExecProto.setComplete = function patchedSetComplete(exitCode: any, cancelled: any, truncationResult: any, fullOutputPath: any) {
-      if (this._spinnerInterval) {
-        clearInterval(this._spinnerInterval);
-        this._spinnerInterval = undefined;
-      }
+    patch(bashExecProto, "setComplete", function patchedSetComplete(exitCode: any, cancelled: any, truncationResult: any, fullOutputPath: any) {
+      stopBashSpinner(this);
+      activeBashExecutions.delete(this);
       OrigSetComplete.call(this, exitCode, cancelled, truncationResult, fullOutputPath);
-    };
-
-    bashExecProto[PATCH_FLAG] = true;
+    });
   }
 
   // --- Register styled tool renderers ---

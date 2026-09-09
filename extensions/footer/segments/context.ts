@@ -58,7 +58,7 @@ export const contextPctSegment = {
     const end     = (barOpts.gradientEnd   ? resolveColorToRgb(ctx.theme, barOpts.gradientEnd)   : null) ?? DEFAULT_END;
     const midFrac = barOpts.gradientMidPoint ?? DEFAULT_MID_FRAC;
 
-    const filled = Math.round((pct / 100) * barWidth);
+    const filled = pct == null ? 0 : Math.round((pct / 100) * barWidth);
 
     let bar = "";
     for (let i = 0; i < barWidth; i++) {
@@ -70,7 +70,7 @@ export const contextPctSegment = {
     }
     bar += "\x1b[0m";
 
-    const pctLabel = `${pct.toFixed(1)}%`;
+    const pctLabel = pct == null ? "?%" : `${pct.toFixed(1)}%`;
     const pctStr = color(ctx, "contextLabel", pctLabel);
     const tokensLabel = `/ ${formatTokens(ctx.contextWindow)}`;
     const tokensStr = color(ctx, "contextLabel", tokensLabel);

@@ -1,13 +1,24 @@
 ---
-description: Full complex-task workflow - scout gathers context, planner creates plan, worker implements, reviewer reviews, worker applies feedback, unit-tester validates
+description: Complex implementation workflow with review and final validation
 ---
-Use the subagent tool with the chain parameter to execute this workflow:
 
-1. First, use the "scout" agent to find all code relevant to: $@
-2. Then, use the "planner" agent to create an implementation plan for "$@" using the context from the previous step (use {previous} placeholder)
-3. Then, use the "worker" agent to implement the plan from the previous step (use {previous} placeholder)
-4. Then, use the "reviewer" agent to review the implementation from the previous step (use {previous} placeholder)
-5. Then, use the "worker" agent to apply the feedback from the review (use {previous} placeholder)
-6. Finally, use the "unit-tester" agent to run relevant tests and report concrete results for the completed implementation (use {previous} placeholder)
+Firstmate guard: if `PI_FIRSTMATE_ACTIVE=1`, do not run this generic chain.
+Route reconnaissance, implementation, and review through visible
+`herdr_control.task_create`; use headless `subagent` only for the
+`browser-tester` browser-QA exception. Otherwise use this workflow.
 
-Execute this as a chain, passing output between steps via {previous}.
+For a simple bounded task, use a direct `worker` and skip unnecessary planning.
+For a complex task, chain `scout`, `planner`, `worker`, `reviewer`, `worker`,
+then `unit-tester`.
+
+Every stage must carry the cumulative context below; `{previous}` supplements
+it and never replaces it:
+- Original request: `$@`
+- Authority: what may change, whether commits are authorized, and no push/publish
+- Scope/files: in-scope paths and explicit exclusions
+- Acceptance: observable completion criteria
+- Validation: required checks and truthful reporting of blockers
+
+Review findings are input, not commands: the second worker must assess each
+finding against the original request before applying or rejecting it. Run final
+validation after feedback and report changed files, evidence, and blockers.

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export const DEFAULT_CONFIG = {
 	BOX_PAD_X: 1,
@@ -41,7 +41,7 @@ interface ChatInputUserConfig {
 	};
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "configs", "chat-input.json");
+const CONFIG_PATH = join(getAgentDir(), "configs", "chat-input.json");
 
 function loadUserConfig(): ChatInputUserConfig {
 	try {

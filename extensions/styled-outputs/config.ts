@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { StyledOutputsUserConfig } from "./types.js";
 
 
@@ -87,17 +87,13 @@ export const DEFAULT_CONFIG = {
       IS_THEME_BACKGROUND_VISIBLE: false,             // whether to apply theme background color to tool outputs
       VERTICAL_PADDING: 0,                            // paddingY for tool content box (0 = compact, core default = 1)
       HORIZONTAL_PADDING: 3,                          // paddingX for tool content box (1 = default, controls left+right indent)
-      DIFF_ADDED_COLOR: "toolDiffAdded",              // color for diff added lines
-      DIFF_REMOVED_COLOR: "toolDiffRemoved",          // color for diff removed lines
-      DIFF_CONTEXT_COLOR: "toolDiffContext",          // color for diff context lines
-      MAX_DIFF_FILE_SIZE: "1MB",                      // skip diff for files exceeding this size
     },
   },
 };
 
 
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "configs", "styled-outputs.json");
+const CONFIG_PATH = join(getAgentDir(), "configs", "styled-outputs.json");
 
 function loadUserConfig(): StyledOutputsUserConfig {
   try {
@@ -181,10 +177,6 @@ export const CONFIG = {
       isThemeBackgroundVisible: userConfig.tools?.general?.isThemeBackgroundVisible ?? DEFAULT_CONFIG.TOOLS.GENERAL.IS_THEME_BACKGROUND_VISIBLE,
       verticalPadding: userConfig.tools?.general?.verticalPadding ?? DEFAULT_CONFIG.TOOLS.GENERAL.VERTICAL_PADDING,
       horizontalPadding: userConfig.tools?.general?.horizontalPadding ?? DEFAULT_CONFIG.TOOLS.GENERAL.HORIZONTAL_PADDING,
-      diffAddedColor: userConfig.tools?.general?.diffAddedColor ?? DEFAULT_CONFIG.TOOLS.GENERAL.DIFF_ADDED_COLOR,
-      diffRemovedColor: userConfig.tools?.general?.diffRemovedColor ?? DEFAULT_CONFIG.TOOLS.GENERAL.DIFF_REMOVED_COLOR,
-      diffContextColor: userConfig.tools?.general?.diffContextColor ?? DEFAULT_CONFIG.TOOLS.GENERAL.DIFF_CONTEXT_COLOR,
-      maxDiffFileSize: userConfig.tools?.general?.maxDiffFileSize ?? DEFAULT_CONFIG.TOOLS.GENERAL.MAX_DIFF_FILE_SIZE,
     },
     groups: {
       base: userConfig.tools?.groups?.base ?? {},

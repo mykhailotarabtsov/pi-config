@@ -10,6 +10,8 @@ sessions/
 mcp-cache.json
 mcp-npx-cache.json
 pi-debug.log
+.pi-agent-managed.json
+.pi-agent-backups/
 
 # macOS
 .DS_Store

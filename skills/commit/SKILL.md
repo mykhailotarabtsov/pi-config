@@ -1,36 +1,26 @@
 ---
 name: commit
-description: "Read this skill before making git commits"
+description: Create an authorized local commit using Conventional Commits
 license: From mitsuhiko/agent-stuff
 ---
 
-Create a git commit for the current changes using Conventional Commits format with a **polished, highly descriptive** message.
+Only use this skill when the user explicitly asks for a commit. Never push or
+publish. Include only task-owned files; do not stage every dirty file merely
+because it is present. Do not add sign-offs. Breaking changes may be documented
+when they are real and relevant; do not hide or invent them.
 
 ## Format
 
-`<type>(<scope>): <summary>`
+`<type>(<optional scope>): <imperative summary>`
 
-- `type` REQUIRED. Use `feat` for new features, `fix` for bug fixes. Other common types: `docs`, `refactor`, `chore`, `test`, `perf`.
-- `scope` OPTIONAL. Short noun in parentheses for the affected area (e.g., `api`, `parser`, `ui`).
-- `summary` REQUIRED. Short, imperative, <= 72 chars, no trailing period.
-
-## Notes
-
-- Body is **strongly encouraged** — always include one unless the change is trivially obvious (e.g., fixing a typo). The body should explain **what** changed, **why** it changed, the approach taken, and any notable decisions. A reader of `git log` should understand the change without looking at the diff.
-- Do NOT include breaking-change markers or footers.
-- Do NOT add sign-offs (no `Signed-off-by`).
-- Only commit; do NOT push.
-- If it is unclear whether a file should be included, ask the user which files to commit.
-- Treat any caller-provided arguments as additional commit guidance. Common patterns:
-  - Freeform instructions should influence scope, summary, and body.
-  - File paths or globs should limit which files to commit. If files are specified, only stage/commit those unless the user explicitly asks otherwise.
-  - If arguments combine files and instructions, honor both.
+Use a concise subject of at most 72 characters with no trailing period. Add a
+short body when it clarifies what changed and why.
 
 ## Steps
 
-1. Infer from the prompt if the user provided specific file paths/globs and/or additional instructions.
-2. Review `git status` and `git diff` to understand the current changes (limit to argument-specified files if provided).
-3. (Optional) Run `git log -n 50 --pretty=format:%s` to see commonly used scopes.
-4. If there are ambiguous extra files, ask the user for clarification before committing.
-5. Stage only the intended files (all changes if no files specified).
-6. Run `git commit -m "<subject>"` (and `-m "<body>"` if needed).
+1. Inspect `git status` and the relevant diff. Confirm the requested paths and
+   resolve any ambiguous ownership before staging.
+2. Stage only the task-owned files, then create the local commit with the
+   Conventional Commit subject (and an explanatory body when useful).
+3. Report the commit and exact files. Do not claim a commit if the command
+   failed.

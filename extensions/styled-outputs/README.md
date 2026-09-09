@@ -11,12 +11,12 @@ https://github.com/user-attachments/assets/6bcf414f-9114-405e-af9e-392a8f4e8bdc
 - **User messages** — Prefixed with custom icon; optional theme background toggle
 - **Thinking blocks** — Animated prefix with optional label ("Thinking:"); continuation lines align to prefix width, not the label
 - **Tool executions** — Custom call/result renderers for `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, web tools, and MCP tools
-- **Diff viewer** — Side-by-side-style diff highlighting for `edit` and `write` with added/removed/context colours; skips oversized files (configurable threshold)
+- **Diff viewer** — Side-by-side-style diff highlighting for `edit` and `write` using pi's theme diff colours
 - **Skill invocations** — Expandable skill blocks with prefix icon, title, and content
 - **Custom messages** — Expandable custom messages with prefix icon, type name, and content; all custom messages get styled output regardless of registered renderers
 - **Tool spinner** — Animated character spinner while tools are running
 - **Bash execution** — `!` commands styled as `Command`, `!!` commands styled as `Shell` (no context); error prefix swaps to `✗`
-- **Group-aware config** — Override any general tool setting per group (`base`, `mcp`, `web`, `custom`); unset properties fall through to `general`
+- **Group-aware config** — Override tool title colour per group (`base`, `mcp`, `web`, `custom`); unset values fall through to `general`
 - **Theme-aware colours** — All colour fields accept pi theme tokens (`"accent"`, `"dim"`, etc.) or hex values (`"#ff6347"`)
 - **Expand/collapse** — Tool outputs and skill blocks collapse by default; expand with a keypress
 
@@ -131,31 +131,26 @@ These apply to all tool types unless overridden by a group.
 | `tools.general.isThemeBackgroundVisible` | `boolean` | `false` | Apply theme background behind tool blocks, skill invocations, and custom messages |
 | `tools.general.verticalPadding` | `number` | `0` | Vertical padding inside tool content boxes (0 = compact, core default = 1) |
 | `tools.general.horizontalPadding` | `number` | `3` | Horizontal padding inside tool content boxes (left+right indent; core default = 1) |
-| `tools.general.diffAddedColor` | `string` | `"toolDiffAdded"` | Colour for diff added lines |
-| `tools.general.diffRemovedColor` | `string` | `"toolDiffRemoved"` | Colour for diff removed lines |
-| `tools.general.diffContextColor` | `string` | `"toolDiffContext"` | Colour for diff context lines |
-| `tools.general.maxDiffFileSize` | `string\|number` | `"1MB"` | Skip diff rendering for files exceeding this size |
 
 ### Tool groups
 
-Any `tools.general` key can be overridden per group. Unset properties fall through to `general`.
+Tool title colour can be overridden per group. Unset values fall through to `general`.
 
 | Key | Description |
 |-----|-------------|
-| `tools.groups.base` | Built-in tool renderers (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`) |
-| `tools.groups.mcp` | MCP tool renderers |
-| `tools.groups.web` | Web tool renderers (`web_search`, `fetch_content`, `get_search_content`) |
-| `tools.groups.custom` | Any other tool |
+| `tools.groups.base.titleColor` | Title colour for built-in tool renderers (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`) |
+| `tools.groups.mcp.titleColor` | Title colour for MCP tool renderers |
+| `tools.groups.web.titleColor` | Title colour for web tool renderers (`web_search`, `fetch_content`, `get_search_content`) |
+| `tools.groups.custom.titleColor` | Title colour for any other tool |
 
-Example — give MCP tools a different title colour and expanded line limit:
+Example — give MCP tools a different title colour:
 
 ```json
 {
   "tools": {
     "groups": {
       "mcp": {
-        "titleColor": "#c07898",
-        "maxExpandedLines": 20
+        "titleColor": "#c07898"
       }
     }
   }
@@ -173,7 +168,7 @@ Theme tokens adapt to your active theme automatically.
 
 ## How it works
 
-The extension patches pi's built-in message components (`AssistantMessage`, `UserMessage`, `ToolExecution`, `SkillInvocationMessage`, `CustomMessage`, `BashExecution`) at prototype level. A `Symbol.for` patch flag prevents double-patching on reload.
+The extension patches pi's built-in message components (`AssistantMessage`, `UserMessage`, `ToolExecution`, `SkillInvocationMessage`, `CustomMessage`, `BashExecution`) at prototype level. Each owned patch records its original descriptor and is restored during session shutdown/reload, so stale prototype methods and timers are not retained.
 
 For `BashExecutionComponent`, the extension listens to the `user_bash` event to determine whether a command is `!` (Command) or `!!` (Shell), then patches `updateDisplay` to strip borders and apply the styled header/status/output format.
 

@@ -1,3 +1,5 @@
+import type { TaskRecord } from './task-state.ts'
+
 export const WAIT_STATUSES = ['idle', 'done', 'blocked', 'working', 'unknown'] as const
 
 const ALLOWED_FIRSTMATE_SUBAGENT = 'browser-tester'
@@ -61,6 +63,38 @@ export function appendUntilArgs(args: string[], value: WaitStatus | WaitStatus[]
 
 export function canMarkLeaseReturned(input: { commandSucceeded: boolean; tempCleanupSucceeded: boolean; helperClosed: boolean }): boolean {
   return input.commandSucceeded && input.tempCleanupSucceeded && input.helperClosed
+}
+
+/** Record endpoint absence without claiming that an external lease was returned. */
+export function recordVerifiedEndpointAbsence(task: TaskRecord): TaskRecord {
+  const next = { ...task, endpointStatus: 'absent_verified' as const }
+  if (task.worktreeProvider === 'treehouse' && task.leaseStatus === 'leased') {
+    next.leaseStatus = 'leased'
+    if (task.leaseReturnStatus === 'returned') next.leaseReturnStatus = 'failed'
+  }
+  return next
+}
+
+export type WatcherPollOutcome = 'completed' | 'error' | 'aborted'
+export type WatcherPollState = { lastCompletedPollAt?: string; lastError?: string }
+
+/** Update watcher health only after a poll actually completes. */
+export function recordWatcherPollOutcome(
+  state: WatcherPollState,
+  outcome: WatcherPollOutcome,
+  completedAt: string,
+  error?: string,
+): WatcherPollState {
+  if (outcome === 'completed') return { lastCompletedPollAt: completedAt }
+  return { lastCompletedPollAt: state.lastCompletedPollAt, lastError: error || (outcome === 'aborted' ? 'watcher poll aborted' : 'watcher poll failed') }
+}
+
+export function isWatcherPollHealthy(lastCompletedPollAt: string | undefined, now: number, recencyWindowMs: number): boolean {
+  if (!lastCompletedPollAt) return false
+  const completedAt = Date.parse(lastCompletedPollAt)
+  if (!Number.isFinite(completedAt)) return false
+  const age = now - completedAt
+  return age >= 0 && age <= recencyWindowMs
 }
 
 export function isPendingLeaseNoop(status: string | undefined): boolean {

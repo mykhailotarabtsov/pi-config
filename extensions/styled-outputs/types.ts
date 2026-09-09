@@ -65,17 +65,17 @@ export interface ToolGeneralUserConfig {
   maxExpandedLines?: number;
   moreColor?: string;
   moreBgColor?: string;
-  diffAddedColor?: string;
-  diffRemovedColor?: string;
-  diffContextColor?: string;
-  maxDiffFileSize?: string | number;
+}
+
+export interface ToolGroupUserConfig {
+  titleColor?: string;
 }
 
 export interface ToolGroupsUserConfig {
-  base?: ToolGeneralUserConfig;
-  mcp?: ToolGeneralUserConfig;
-  web?: ToolGeneralUserConfig;
-  custom?: ToolGeneralUserConfig;
+  base?: ToolGroupUserConfig;
+  mcp?: ToolGroupUserConfig;
+  web?: ToolGroupUserConfig;
+  custom?: ToolGroupUserConfig;
 }
 
 export interface ToolsUserConfig {

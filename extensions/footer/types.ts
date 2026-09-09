@@ -102,7 +102,7 @@ export interface SegmentContext {
   thinkingLevel: string;
   sessionId: string | undefined;
   usageStats: UsageStats;
-  contextPercent: number;
+  contextPercent: number | null;
   contextWindow: number;
   usingSubscription: boolean;
   sessionStartTime: number;
@@ -123,19 +123,6 @@ export interface ToolResultEvent {
 export interface UserBashEvent {
   command: string;
 }
-
-// Minimal session event shapes used for footer stats
-export interface ThinkingLevelEvent {
-  type: "thinking_level_change";
-  thinkingLevel?: string;
-}
-
-export interface AssistantMessageEvent {
-  type: "message";
-  message: { role: string };
-}
-
-export type SessionEvent = ThinkingLevelEvent | AssistantMessageEvent | { type: string };
 
 // Rendered segment output
 export interface RenderedSegment {

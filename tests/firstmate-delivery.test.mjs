@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict'
+import os from 'node:os'
+import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction } from '../extensions/firstmate/control.ts'
 import { assessLocalDelivery, canCleanupAfterDelivery } from '../extensions/firstmate/delivery.ts'
-import { validateWorkerReport, REPORT_VERSION } from '../extensions/firstmate/worker-report.ts'
+import { validateWorkerReport, workerReportContract, REPORT_VERSION } from '../extensions/firstmate/worker-report.ts'
+import { reportFilePath, TASK_STATE_DIR } from '../extensions/firstmate/task-state.ts'
 import {
   appendUntilArgs,
   canDeleteWithoutRecordedEndpoint,
+  isWatcherPollHealthy,
   isAllowedFirstmateSubagentRequest,
   canMarkLeaseReturned,
   endpointListsConfirmAbsence,
@@ -15,6 +19,8 @@ import {
   isPendingLeaseNoop,
   LifecycleOperationLock,
   normalizeUntil,
+  recordVerifiedEndpointAbsence,
+  recordWatcherPollOutcome,
   taskArtifactNames,
 } from '../extensions/firstmate/lifecycle.ts'
 import { readFile } from 'node:fs/promises'
@@ -129,6 +135,10 @@ test('delivery rejects an overlapping tracked modification', () => {
   assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathsOverlap: true }), { allowed: false, reason: 'dirty-overlap' })
 })
 
+test('delivery rejects a changed repository identity', () => {
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, repositoryIdentityCheckSucceeded: false }), { allowed: false, reason: 'repository-identity-mismatch' })
+})
+
 test('delivery rejects an incomplete dirty-path check', () => {
   assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathCheckSucceeded: false }), { allowed: false, reason: 'dirty-path-check-failed' })
 })
@@ -167,6 +177,16 @@ test('Firstmate entrypoint parses before it can be loaded into a captain pane', 
   await execFileAsync(process.execPath, ['--check', new URL('../extensions/firstmate/index.ts', import.meta.url).pathname])
 })
 
+test('worker report contract uses the canonical global task-state output path', () => {
+  const taskId = 'task-abc-12345678-123'
+  const reportPath = reportFilePath(taskId)
+  assert.equal(reportPath, path.join(os.homedir(), '.pi', 'firstmate', 'tasks', `${taskId}.report.json`))
+  assert.equal(TASK_STATE_DIR, path.join(os.homedir(), '.pi', 'firstmate', 'tasks'))
+  const contract = workerReportContract(taskId, reportPath)
+  assert.ok(contract.includes(`write a UTF-8 JSON report to the exact outside-project path ${reportPath}`))
+  assert.ok(contract.includes(`PI_FIRSTMATE_REPORT_PATH=${reportPath}`))
+})
+
 test('worker reports are validated independently of worker lifecycle operations', () => {
   const report = {
     version: REPORT_VERSION,
@@ -196,7 +216,7 @@ test('Firstmate permits only user-scoped browser QA subagent requests', () => {
 
 test('Firstmate injects visible-worker-only implementation instructions and guards subagent calls', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
-  assert.match(source, /herdr_control\.task_create \/ visible worker tabs for all implementation and code mutations/)
+  assert.match(source, /herdr_control\.task_create and visible worker tabs for all implementation and code mutations/)
   assert.match(source, /only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance/)
   assert.match(source, /event\.toolName === 'subagent' && !isAllowedFirstmateSubagentRequest\(event\.input\)/)
   assert.match(source, /isFirstmateAllowedTool\(event\.toolName\)/)
@@ -348,14 +368,14 @@ test('completed shared reconciliation returns the report without implicit teardo
 
 test('Firstmate delegates broad read-heavy work asynchronously with bounded visible fan-out', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
-  const agents = `${source}\n${await readFile(new URL('../AGENTS.md', import.meta.url), 'utf8')}`
-  assert.match(agents, /broad codebase reconnaissance and read-heavy investigation/i)
-  assert.match(agents, /one visible worker(?: is)? the default/i)
-  assert.match(agents, /two only for genuinely independent, bounded scopes/i)
-  assert.match(agents, /no uncontrolled fan-out/i)
-  assert.match(agents, /narrow one-file questions may be inspected directly/i)
-  assert.match(source, /task_create is asynchronous\/no-wait/i)
-  assert.match(source, /rely on watcher follow-ups rather than polling/i)
+  const policy = (await readFile(new URL('../extensions/firstmate/POLICY.md', import.meta.url), 'utf8')).replace(/\s+/g, ' ')
+  assert.match(policy, /broad codebase reconnaissance and read-heavy investigation/i)
+  assert.match(policy, /one visible worker is the default/i)
+  assert.match(policy, /two are allowed only for genuinely independent, bounded scopes/i)
+  assert.match(policy, /never fan out uncontrollably/i)
+  assert.match(policy, /narrow one-file questions may be inspected directly/i)
+  assert.match(policy, /`task_create` is asynchronous\/no-wait/i)
+  assert.match(policy, /rely on watcher follow-ups rather than polling/i)
   const taskCreateStart = source.indexOf("case 'task_create'")
   const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
   const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
@@ -423,7 +443,7 @@ test('delivery targets the current branch, checks NUL-delimited dirty-path overl
   assert.match(delivery, /target_ref=\$\(git -C "\$project" symbolic-ref --quiet HEAD/)
   assert.match(delivery, /case "\$target_ref" in refs\/heads\/\*\) target=/)
   assert.match(delivery, /merge-base --is-ancestor "\$target" "\$branch"/)
-  assert.ok(delivery.includes('target=%s\\\\ndirty_paths_check=%s\\\\ndirty_paths_overlap=%s'))
+  assert.ok(delivery.includes('target=%s\\\\nrepo_identity_check=%s\\\\ndirty_paths_check=%s\\\\ndirty_paths_overlap=%s'))
   assert.match(delivery, /diff --name-only -z/)
   assert.match(delivery, /diff --cached --name-only -z/)
   assert.match(delivery, /ls-files --others --exclude-standard -z/)
@@ -489,8 +509,10 @@ test('teardown recovers an absent recorded worker tab after durable return succe
   assert.ok(teardownSource.includes("runHerdr(['pane', 'list', '--workspace', targetWorkspaceId]"))
   assert.ok(teardownSource.includes('recordedTabAbsent && recordedPaneAbsent'))
   assert.ok(teardownSource.includes('const sharedRecoveryEligible = taskTeardownRecord?.worktreeProvider === \'herdr\''))
-  assert.ok(teardownSource.includes('endpointStatus: \'absent_verified\''))
-  assert.match(teardownSource, /leaseStatus: 'returned',\s+leaseReturnStatus: 'returned'/)
+  assert.ok(teardownSource.includes('recordVerifiedEndpointAbsence(taskTeardownRecord)'))
+  const absentRecoveryStart = teardownSource.indexOf('const recoveredTask')
+  const absentRecoveryEnd = teardownSource.indexOf('taskTeardownRecord = recoveredTask', absentRecoveryStart)
+  assert.doesNotMatch(teardownSource.slice(absentRecoveryStart, absentRecoveryEnd), /leaseStatus: 'returned'/)
   assert.ok(teardownSource.includes('taskTeardownTabAlreadyAbsent = true'))
   assert.ok(teardownSource.includes('if (taskTeardownTabAlreadyAbsent)'))
   assert.ok(teardownSource.includes('workerTabAbsent: true'))
@@ -533,11 +555,11 @@ test('Firstmate workers and subagents have a hard no-push guard', async () => {
   const gitWrapper = await readFile(new URL('../extensions/firstmate/worker-git/git', import.meta.url), 'utf8')
 
   assert.doesNotMatch(firstmate, /case 'pane_run'/)
-  assert.match(firstmate, /export \$\{WORKER_ENV\}=1/)
+  assert.match(firstmate, /export \$\{WORKER_ENV\}=1 \$\{NO_PUBLISH_ENV\}=1/)
   assert.match(permissionGate, /const isFirstmateExecution = process\.env\.PI_FIRSTMATE_WORKER === "1"/)
-  assert.match(permissionGate, /if \(isFirstmateExecution && containsGitPush\(command\)\)/)
-  assert.match(permissionGate, /MCP calls are blocked for Firstmate implementation workers/)
-  assert.match(permissionGate, /isBrowserTesterSubagent/)
+  assert.match(permissionGate, /\(isFirstmateExecution \|\| noPublishIdentity\) && containsGitPush\(command\)/)
+  assert.match(permissionGate, /MCP calls are blocked for Firstmate (?:implementation )?workers/)
+  assert.match(permissionGate, /(?:isBrowserTesterSubagent|isTrustedBrowserTester)/)
   assert.match(firstmate, /FIRSTMATE_WORKER_BIN_DIR/)
   assert.match(firstmate, /PI_FIRSTMATE_REAL_GIT/)
   assert.match(gitWrapper, /\[ "\$argument" = "push" \]/)
