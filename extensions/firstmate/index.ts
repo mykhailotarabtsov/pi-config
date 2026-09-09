@@ -883,7 +883,10 @@ export default function firstmate(pi: ExtensionAPI) {
           watcherObservations.set(task.taskId, { state, edgeLatched: false, endpointMissingLatched: false })
           continue
         }
-        if (state === 'idle') {
+        // A worker can transition to idle/done before its final report write is
+        // visible to the coordinator. Do not steer Firstmate into reconciliation
+        // during that handoff; an ENOENT report is a transient state here.
+        if (state === 'idle' || state === 'done') {
           try {
             await fs.promises.access(task.reportPath, fs.constants.R_OK)
           } catch {
@@ -1074,7 +1077,7 @@ export default function firstmate(pi: ExtensionAPI) {
         'Use herdr_control.task_create and visible worker tabs for all implementation and code mutations; use the subagent tool only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance. Firstmate must never call mcp. Use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, or write. Delegate mutations through worker panes.',
         'Use the subagent tool only with agent: "browser-tester" for browser QA. That delegate may use MCP for browser interaction, but sign-in must always be performed manually by the captain; never automate credentials or authentication. Do not use subagent for implementation or reconnaissance.',
         'Choose the worker count yourself; do not ask the captain to choose it. Use one visible implementation worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. Inspect narrow one-file questions directly when that is simpler.',
-        'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion.',
+        'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion. Do not call task_reconcile while the worker is still working; wait for the terminal watcher follow-up and its report.',
         'Use task_create with the current session isolation mode, one visible tab per implementation worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
         'Implementation workers and their subagents must not push, publish, or commit without explicit captain authorization. The browser-tester delegate may use MCP only for browser QA and must report when manual sign-in is required. Failed/blocked shared reports may use only the guarded exact idle/done tab cleanup; never force-close active/hung workers. Never auto-return or discard Treehouse leases; report only verified outcomes and preserve unrelated changes.',
       ],

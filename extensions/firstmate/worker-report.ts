@@ -37,5 +37,5 @@ Before claiming this task is complete, blocked, or failed, write a UTF-8 JSON re
   "blockers": ["blocker"],
   "summary": "concise summary"
 }
-The outcome must be exactly completed, blocked, or failed; tests entries may be strings or JSON objects; all other arrays contain strings. Write every required field, use empty arrays when applicable, and write the report before claiming completion. Preserve unrelated working-tree changes. Never push or publish changes. Do not commit unless the captain explicitly authorizes a local commit.`.trim()
+Use the write tool directly with that exact absolute path; do not use Bash, edit, a project-relative path, or a shortened filename for the report. After writing it, use the read tool to verify the JSON at the same path. The outcome must be exactly completed, blocked, or failed; tests entries may be strings or JSON objects; all other arrays contain strings. Write every required field, use empty arrays when applicable, and write the report before claiming completion. Preserve unrelated working-tree changes. Never push or publish changes. Do not commit unless the captain explicitly authorizes a local commit.`.trim()
 }

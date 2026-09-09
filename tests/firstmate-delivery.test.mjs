@@ -184,6 +184,7 @@ test('worker report contract uses the canonical global task-state output path', 
   assert.equal(TASK_STATE_DIR, path.join(os.homedir(), '.pi', 'firstmate', 'tasks'))
   const contract = workerReportContract(taskId, reportPath)
   assert.ok(contract.includes(`write a UTF-8 JSON report to the exact outside-project path ${reportPath}`))
+  assert.ok(contract.includes('Use the write tool directly with that exact absolute path'))
   assert.ok(contract.includes(`PI_FIRSTMATE_REPORT_PATH=${reportPath}`))
 })
 
@@ -223,10 +224,10 @@ test('Firstmate injects visible-worker-only implementation instructions and guar
   assert.match(source, /import \{ FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction, type FirstmateControlAction \} from '\.\/control\.ts'/)
 })
 
-test('watcher does not reconcile a transient idle worker before its report exists', async () => {
+test('watcher does not reconcile idle or done workers before their report exists', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const watcher = source.slice(source.indexOf('async function pollWatcher'), source.indexOf('function startWatcher'))
-  assert.match(watcher, /if \(state === 'idle'\) \{\s+try \{\s+await fs\.promises\.access\(task\.reportPath, fs\.constants\.R_OK\)/)
+  assert.match(watcher, /if \(state === 'idle' \|\| state === 'done'\) \{[\s\S]*?await fs\.promises\.access\(task\.reportPath, fs\.constants\.R_OK\)/)
   assert.match(watcher, /watcherObservations\.set\(task\.taskId, \{ state: 'working', edgeLatched: false, endpointMissingLatched: false \}\)\s+continue/)
 })
 
