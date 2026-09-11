@@ -20,7 +20,8 @@ const { createChildGroupTerminator, decodeUtf8Chunks } = subagentModule
 const ENV_KEYS = [
   'HOME', 'PI_CODING_AGENT_DIR', 'PI_PERMISSION_ROOT', 'PI_SUBAGENT_CHILD', 'PI_SUBAGENT_AGENT',
   'PI_SUBAGENT_AGENT_SOURCE', 'PI_SUBAGENT_AGENT_DEFINITION', 'PI_FIRSTMATE_WORKER', 'PI_FIRSTMATE_TASK_ID',
-  'PI_FIRSTMATE_REPORT_PATH', 'PI_PERMISSION_NO_PUBLISH', 'PI_PERMISSION_RESOURCE_ROOTS',
+  'PI_FIRSTMATE_REPORT_PATH', 'PI_FIRSTMATE_COMMIT_AUTHORIZED', 'PI_PERMISSION_NO_PUBLISH',
+  'PI_PERMISSION_RESOURCE_ROOTS',
 ]
 
 async function fixture(run) {
@@ -131,8 +132,13 @@ test('Firstmate keeps ordinary boundary checks and only permits a validated repo
   await fixture(async ({ project, home }) => {
     process.env.PI_FIRSTMATE_WORKER = '1'
     const gate = harness()
-    const outside = await gate.call({ toolName: 'write', input: { path: path.join(home, 'unrelated.txt') } }, { cwd: project })
+    const outside = await gate.call({ toolName: 'write', input: { path: path.join(home, 'unrelated.txt') } }, { cwd: project, hasUI: true })
     assert.equal(outside?.block, true)
+    assert.equal(gate.selections.length, 0)
+
+    const protectedMutation = await gate.call({ toolName: 'write', input: { path: path.join(project, 'node_modules', 'package', 'index.js') } }, { cwd: project, hasUI: true })
+    assert.equal(protectedMutation?.block, true)
+    assert.equal(gate.selections.length, 0)
 
     const taskId = 'task-abc12345-def67890'
     const report = path.join(home, '.pi', 'firstmate', 'tasks', `${taskId}.report.json`)

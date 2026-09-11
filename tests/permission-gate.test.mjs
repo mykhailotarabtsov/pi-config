@@ -6,7 +6,10 @@ import test from 'node:test'
 import permissionGate from '../extensions/permission-gate.ts'
 import { permissionsSegment } from '../extensions/footer/segments/permissions.ts'
 
-const ENV_KEYS = ['HOME', 'PI_PERMISSION_ROOT', 'PI_SUBAGENT_CHILD', 'PI_FIRSTMATE_WORKER']
+const ENV_KEYS = [
+  'HOME', 'PI_PERMISSION_ROOT', 'PI_SUBAGENT_CHILD', 'PI_FIRSTMATE_WORKER',
+  'PI_FIRSTMATE_COMMIT_AUTHORIZED',
+]
 
 async function withFixture(run) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'permission-gate-'))
@@ -21,6 +24,7 @@ async function withFixture(run) {
   delete process.env.PI_PERMISSION_ROOT
   delete process.env.PI_SUBAGENT_CHILD
   delete process.env.PI_FIRSTMATE_WORKER
+  delete process.env.PI_FIRSTMATE_COMMIT_AUTHORIZED
   try {
     return await run({ home, project, globalPi })
   } finally {
@@ -252,6 +256,48 @@ test('permissions clear and session shutdown reset safe operations', async () =>
     const statusHarness = createHarness()
     await statusHarness.permissions('', { cwd: project })
     assert.match(statusHarness.messages.at(-1).content, /Safe operations for this session: disabled/)
+  })
+})
+
+test('Firstmate workers run routine in-project commands autonomously and never open a permission dialog', async () => {
+  await withFixture(async ({ home, project }) => {
+    process.env.PI_FIRSTMATE_WORKER = '1'
+    const harness = createHarness()
+
+    for (const command of ['npm test', 'node -e 1', 'mkdir generated', 'cp source.txt target.txt']) {
+      assert.equal(await harness.callBash(command, { cwd: project, hasUI: true }), undefined, command)
+    }
+
+    for (const command of [
+      'rm -rf generated',
+      'git checkout main',
+      'npm install package',
+      'npm test && npm run check',
+      `cat ${path.join(home, 'outside.txt')}`,
+    ]) {
+      const result = await harness.callBash(command, { cwd: project, hasUI: true })
+      assert.ok(result?.result, `${command} should be blocked`)
+    }
+    assert.equal(harness.selections.length, 0)
+  })
+})
+
+test('Firstmate workers require launch-bound durable authority for Git staging and commits', async () => {
+  await withFixture(async ({ project }) => {
+    process.env.PI_FIRSTMATE_WORKER = '1'
+    const harness = createHarness()
+
+    for (const command of ['git add src/index.ts', 'git commit -m implementation']) {
+      const result = await harness.callBash(command, { cwd: project, hasUI: true })
+      assert.ok(result?.result)
+      assert.match(result.result.output, /durable captain commit authority/)
+    }
+
+    process.env.PI_FIRSTMATE_COMMIT_AUTHORIZED = '1'
+    assert.equal(await harness.callBash('git add src/index.ts', { cwd: project, hasUI: true }), undefined)
+    assert.equal(await harness.callBash('git commit -m implementation', { cwd: project, hasUI: true }), undefined)
+    assert.ok((await harness.callBash('git push origin task', { cwd: project }))?.result)
+    assert.equal(harness.selections.length, 0)
   })
 })
 

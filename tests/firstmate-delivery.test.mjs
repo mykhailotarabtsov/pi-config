@@ -478,7 +478,8 @@ test('Treehouse provisioning resolves the base ref and creates the worker branch
   assert.match(provisioning, /treehouse get --lease/)
   assert.match(source, /base_commit=\$\{shellQuote\(baseCommit \|\| ''\)\}/)
   assert.match(source, /if \[ -n "\$review_target" \]; then base="\$review_target"; else base="\$base_commit"; fi/)
-  assert.match(source, /git switch --create "\$branch" -- "\$base"/)
+  assert.match(source, /git_bin=\$\{PI_FIRSTMATE_REAL_GIT:-\/usr\/bin\/git\}/)
+  assert.match(source, /"\$git_bin" switch --create "\$branch" -- "\$base"/)
   assert.match(provisioning, /const branchSetupCommand = treehouseWorkerBranchCommand\(branch, task\.reviewTarget, task\.baseCommit\)/)
   assert.match(provisioning, /symbolic-ref', '--quiet', '--short', 'HEAD'/)
   assert.match(provisioning, /baseBranch, baseCommit/)
@@ -712,14 +713,40 @@ test('Firstmate workers and subagents have a hard no-push guard', async () => {
 
   assert.doesNotMatch(firstmate, /case 'pane_run'/)
   assert.match(firstmate, /export \$\{WORKER_ENV\}=1 \$\{NO_PUBLISH_ENV\}=1/)
+  assert.match(firstmate, /const COMMIT_AUTHORITY_ENV = 'PI_FIRSTMATE_COMMIT_AUTHORIZED'/)
+  assert.match(firstmate, /task\.commitAuthority \? \['--env', `\$\{COMMIT_AUTHORITY_ENV\}=1`\] : \[\]/)
   assert.match(permissionGate, /const isFirstmateExecution = process\.env\.PI_FIRSTMATE_WORKER === "1"/)
+  assert.match(permissionGate, /process\.env\[FIRSTMATE_COMMIT_AUTHORITY_ENV\] === "1"/)
   assert.match(permissionGate, /\(isFirstmateExecution \|\| noPublishIdentity\) && containsGitPush\(command\)/)
   assert.match(permissionGate, /MCP calls are blocked for Firstmate (?:implementation )?workers/)
   assert.match(permissionGate, /(?:isBrowserTesterSubagent|isTrustedBrowserTester)/)
   assert.match(firstmate, /FIRSTMATE_WORKER_BIN_DIR/)
   assert.match(firstmate, /PI_FIRSTMATE_REAL_GIT/)
-  assert.match(gitWrapper, /\[ "\$argument" = "push" \]/)
+  assert.match(gitWrapper, /case "\$subcommand" in/)
+  assert.match(gitWrapper, /PI_FIRSTMATE_COMMIT_AUTHORIZED/)
   assert.match(gitWrapper, /exit 126/)
+})
+
+test('Firstmate Git wrapper enforces commit authority and rejects push or history mutation', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'firstmate-worker-git-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const wrapper = new URL('../extensions/firstmate/worker-git/git', import.meta.url).pathname
+  const fakeGit = path.join(root, 'git-real')
+  await writeFile(fakeGit, '#!/bin/sh\nprintf "%s\\n" "$*"\n')
+  await chmod(fakeGit, 0o755)
+  const env = { ...process.env, PI_FIRSTMATE_REAL_GIT: fakeGit }
+
+  assert.equal((await execFileAsync(wrapper, ['status', '--short'], { env })).stdout.trim(), 'status --short')
+  await assert.rejects(execFileAsync(wrapper, ['add', 'file.ts'], { env }), /durable captain commit authority/)
+  assert.equal((await execFileAsync(wrapper, ['-C', '/tmp/project', 'commit', '-m', 'change'], {
+    env: { ...env, PI_FIRSTMATE_COMMIT_AUTHORIZED: '1' },
+  })).stdout.trim(), '-C /tmp/project commit -m change')
+  await assert.rejects(execFileAsync(wrapper, ['push', 'origin', 'task'], {
+    env: { ...env, PI_FIRSTMATE_COMMIT_AUTHORIZED: '1' },
+  }), /git push is blocked/)
+  await assert.rejects(execFileAsync(wrapper, ['reset', '--hard'], {
+    env: { ...env, PI_FIRSTMATE_COMMIT_AUTHORIZED: '1' },
+  }), /history or worktree mutation is blocked/)
 })
 
 test('Firstmate activation gates the headless path while task_create starts visible workers', async () => {

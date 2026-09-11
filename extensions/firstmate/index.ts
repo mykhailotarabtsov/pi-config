@@ -47,6 +47,7 @@ const SHARED_ADMISSION_LOCK_PREFIX = '.shared-admission-'
 const FIRSTMATE_EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url))
 const FIRSTMATE_WORKER_BIN_DIR = path.join(FIRSTMATE_EXTENSION_DIR, 'worker-git')
 const WORKER_ENV = 'PI_FIRSTMATE_WORKER'
+const COMMIT_AUTHORITY_ENV = 'PI_FIRSTMATE_COMMIT_AUTHORIZED'
 const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
@@ -295,13 +296,14 @@ function treehouseWorkerBranchCommand(branch: string, reviewTarget?: string, bas
       `branch=${shellQuote(branch)}`,
       `review_target=${shellQuote(reviewTarget || '')}`,
       `base_commit=${shellQuote(baseCommit || '')}`,
+      'git_bin=${PI_FIRSTMATE_REAL_GIT:-/usr/bin/git}',
       'if [ -n "$review_target" ]; then base="$review_target"; else base="$base_commit"; fi',
-      'if [ -z "$base" ] || ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then',
+      'if [ -z "$base" ] || ! "$git_bin" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then',
       '  echo "could not resolve the worker base ref: ${base:-none}" >&2',
       '  exit 1',
       'fi',
-      'git switch --create "$branch" -- "$base"',
-      'current=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)',
+      '"$git_bin" switch --create "$branch" -- "$base"',
+      'current=$("$git_bin" symbolic-ref --quiet --short HEAD 2>/dev/null || true)',
       'if [ "$current" != "$branch" ]; then echo "worker branch checkout did not land on $branch" >&2; exit 1; fi',
     ].join('\n') + '\n'
   )
@@ -1889,6 +1891,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 `${WORKER_ENV}=1`,
                 '--env',
                 `${NO_PUBLISH_ENV}=1`,
+                ...(task.commitAuthority ? ['--env', `${COMMIT_AUTHORITY_ENV}=1`] : []),
                 '--env',
                 `${TASK_ENV}=${taskId}`,
                 '--env',
@@ -2088,7 +2091,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 'pane',
                 'run',
                 returnedPaneId,
-                `export ${WORKER_ENV}=1 ${NO_PUBLISH_ENV}=1 ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
+                `export ${WORKER_ENV}=1 ${NO_PUBLISH_ENV}=1${task.commitAuthority ? ` ${COMMIT_AUTHORITY_ENV}=1` : ''} ${TASK_ENV}=${shellQuote(taskId)} ${REPORT_ENV}=${shellQuote(reportPath)} PI_FIRSTMATE_REAL_GIT=${shellQuote(firstmateGitPath())} PATH=${shellQuote(workerPath())}`,
               ]
               const envResult = await runHerdr(envArgs, signal, 10_000)
               if (envResult.code !== 0) {

@@ -12,6 +12,9 @@ const MUTATING_TOOLS = new Set(["write", "edit"]);
 // trying to prove that every chained segment is read-only.
 const SHELL_CONTROL = /[\n\r;&|`$()<>\\]/;
 const GIT_PUSH_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+push(?:\s|$)/i;
+const GIT_COMMIT_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+(?:add|commit|rm)(?:\s|$)/i;
+const GIT_HISTORY_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+(?:checkout|switch|restore|reset|clean|merge|rebase|pull|branch|tag|stash|worktree|cherry-pick|revert|am|bisect|replace|notes|update-ref|symbolic-ref|commit-tree)(?:\s|$)/i;
+const FIRSTMATE_COMMIT_AUTHORITY_ENV = "PI_FIRSTMATE_COMMIT_AUTHORIZED";
 // This is intentionally an obvious-command guard, not an OS sandbox. It catches
 // common publishing paths while leaving comprehensive enforcement to the host.
 const PUBLISH_COMMAND = /(?:\bnpm|pnpm|yarn|bun)\s+publish\b|\b(?:cargo|twine)\s+publish\b|\btwine\s+upload\b|\b(?:docker|podman)\s+push\b|\bgh\s+(?:pr\s+create|release\s+(?:create|upload))\b/i;
@@ -122,6 +125,28 @@ const DANGEROUS_BASH = [
   /\b(npm|pnpm|yarn|bun)\s+(i|install|add|remove|uninstall|dlx|create|exec)\b/,
   /\b(pip|pip3|uv|poetry)\s+(install|add|remove)\b/,
   /\bgit\s+(reset|clean|checkout|switch|restore|rebase|merge|push|commit|add|rm)\b/,
+  /\b(find|xargs)\b.*\b-exec\b/,
+  /\btee\b/,
+];
+
+// Firstmate workers are unattended. They must either proceed autonomously
+// inside their task boundary or stop with a report; an interactive permission
+// dialog would park the worker indefinitely. Keep this list narrower than the
+// interactive gate so routine project work remains autonomous.
+const FIRSTMATE_BLOCKED_BASH = [
+  /\bsudo\b/,
+  /\brm\b/,
+  /\b(rmdir|truncate)\b/,
+  /\bchown\b/,
+  /\bkill(all)?\b/,
+  /\bpkill\b/,
+  /\bdd\b/,
+  /\b(sh|bash|zsh)\s+-c\b/,
+  /\b(source|\.)\s+\S+/,
+  /\b(curl|wget)\b.*\|\s*(sh|bash|zsh)\b/,
+  /\b(curl|wget)\b.*(?:--upload-file|-T\b|--data(?:-raw|-binary)?\b|-X\s*(?:POST|PUT|PATCH|DELETE)\b)/,
+  /\b(npm|pnpm|yarn|bun)\s+(i|install|add|remove|uninstall|dlx|create|exec)\b/,
+  /\b(pip|pip3|uv|poetry)\s+(install|add|remove)\b/,
   /\b(find|xargs)\b.*\b-exec\b/,
   /\btee\b/,
 ];
@@ -529,6 +554,29 @@ export default function (pi: ExtensionAPI) {
     const outsideProject = containsOutOfProjectPath(command, cwd, boundaryRoot);
     const symlinkEscape = containsSymlinkEscape(command, cwd, boundaryRoot);
     const subagentOutsideRoot = isSubagentChild && !isWithinProject(cwd, boundaryRoot);
+
+    if (isFirstmateWorker) {
+      if (!command) return { allowed: true as const };
+      if (sensitive) return { allowed: false as const, reason: "Sensitive-path Bash command blocked for unattended Firstmate worker" };
+      if (outsideProject || !isWithinProject(cwd, boundaryRoot)) {
+        return { allowed: false as const, reason: "Project-boundary Bash command blocked for unattended Firstmate worker" };
+      }
+      if (symlinkEscape) return { allowed: false as const, reason: "Symlink escape blocked for unattended Firstmate worker" };
+      if (SHELL_CONTROL.test(command)) {
+        return { allowed: false as const, reason: "Shell control syntax blocked for unattended Firstmate worker; run simple commands separately" };
+      }
+      const normalized = command.replaceAll(/["']/g, "").toLowerCase();
+      if (GIT_COMMIT_COMMAND.test(normalized)) {
+        return process.env[FIRSTMATE_COMMIT_AUTHORITY_ENV] === "1"
+          ? { allowed: true as const }
+          : { allowed: false as const, reason: "Git staging and commits require durable captain commit authority for this Firstmate task" };
+      }
+      if (GIT_HISTORY_COMMAND.test(normalized) || FIRSTMATE_BLOCKED_BASH.some((pattern) => pattern.test(normalized))) {
+        return { allowed: false as const, reason: "Dangerous Bash command blocked for unattended Firstmate worker" };
+      }
+      return { allowed: true as const };
+    }
+
     if (!command || (!dangerous && !sensitive && !outsideProject && !subagentOutsideRoot) || trustedExactCommands.has(command)) {
       return { allowed: true as const };
     }
@@ -690,6 +738,15 @@ export default function (pi: ExtensionAPI) {
       if (allowSafeOperationsForSession && canEnableSafeOperations) return undefined;
       if (!sensitive && MUTATING_TOOLS.has(event.toolName) && trustedAllMutatingTools.has(event.toolName)) return undefined;
       if (trustedToolPaths.has(key)) return undefined;
+
+      if (isFirstmateWorker) {
+        return {
+          block: true,
+          reason: sensitive || protectedMutation || symlinkEscape
+            ? `Protected path blocked for unattended Firstmate worker: ${displayPath(filePath)}`
+            : `Project boundary blocked for unattended Firstmate worker: ${displayPath(filePath)}`,
+        };
+      }
 
       if (isSubagentChild) {
         return {

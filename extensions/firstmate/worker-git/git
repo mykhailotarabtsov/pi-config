@@ -1,11 +1,46 @@
 #!/bin/sh
 set -eu
 
+# Resolve Git's subcommand after the global options that consume a following
+# value. This is a defense-in-depth backstop for subprocesses started by a
+# Firstmate worker; permission-gate.ts remains the interactive tool boundary.
+subcommand=
+consume_next=0
 for argument in "$@"; do
-  if [ "$argument" = "push" ]; then
+  if [ "$consume_next" -eq 1 ]; then
+    consume_next=0
+    continue
+  fi
+  case "$argument" in
+    -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)
+      consume_next=1
+      ;;
+    --git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--bare|--no-pager|--paginate|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-replace-objects|--no-optional-locks)
+      ;;
+    -*)
+      ;;
+    *)
+      subcommand=$argument
+      break
+      ;;
+  esac
+done
+
+case "$subcommand" in
+  push)
     echo "git push is blocked for Firstmate workers and their subagents." >&2
     exit 126
-  fi
-done
+    ;;
+  add|commit|rm)
+    if [ "${PI_FIRSTMATE_COMMIT_AUTHORIZED:-}" != "1" ]; then
+      echo "git staging and commits require durable captain commit authority for this Firstmate task." >&2
+      exit 126
+    fi
+    ;;
+  checkout|switch|restore|reset|clean|merge|rebase|pull|branch|tag|stash|worktree|cherry-pick|revert|am|bisect|replace|notes|update-ref|symbolic-ref|commit-tree)
+    echo "git history or worktree mutation is blocked for Firstmate workers." >&2
+    exit 126
+    ;;
+esac
 
 exec "${PI_FIRSTMATE_REAL_GIT:-/usr/bin/git}" "$@"
