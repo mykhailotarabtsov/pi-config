@@ -5,11 +5,12 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction } from '../extensions/firstmate/control.ts'
-import { assessLocalDelivery, canCleanupAfterDelivery } from '../extensions/firstmate/delivery.ts'
+import { assessLocalDelivery, buildLocalDeliveryScript, canCleanupAfterDelivery } from '../extensions/firstmate/delivery.ts'
 import { validateWorkerReport, workerReportContract, REPORT_VERSION } from '../extensions/firstmate/worker-report.ts'
 import { reportFilePath, TASK_STATE_DIR } from '../extensions/firstmate/task-state.ts'
 import {
   appendUntilArgs,
+  buildTreehouseReturnCommand,
   canDeleteWithoutRecordedEndpoint,
   isWatcherPollHealthy,
   isAllowedFirstmateSubagentRequest,
@@ -22,8 +23,10 @@ import {
   recordVerifiedEndpointAbsence,
   recordWatcherPollOutcome,
   taskArtifactNames,
+  taskHasOpenLifecycleObligation,
+  workerIsTerminal,
 } from '../extensions/firstmate/lifecycle.ts'
-import { readFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 
 const execFileAsync = promisify(execFile)
 const fastForward = { targetBranch: 'feature/current', dirtyPathCheckSucceeded: true, dirtyPathsOverlap: false, branchExists: true, fastForward: true }
@@ -117,9 +120,11 @@ test('task artifacts are an exact bounded per-task list', () => {
     '.task-x-12345678-123.lease-return.stdout',
     '.task-x-12345678-123.lease-return.stderr',
     '.task-x-12345678-123.lease-return.status',
+    '.task-x-12345678-123.lease-return.worktree-status',
     '.task-x-12345678-123.delivery.evidence',
     '.task-x-12345678-123.delivery.dirty-paths',
     '.task-x-12345678-123.delivery.worker-paths',
+    '.task-x-12345678-123.delivery.worker-status',
     '.task-x-12345678-123.delivery.stdout',
     '.task-x-12345678-123.delivery.stderr',
     '.task-x-12345678-123.delivery.status',
@@ -135,12 +140,63 @@ test('delivery rejects an overlapping tracked modification', () => {
   assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathsOverlap: true }), { allowed: false, reason: 'dirty-overlap' })
 })
 
-test('delivery rejects a changed repository identity', () => {
+test('delivery rejects a changed repository or target-branch identity', () => {
   assert.deepEqual(assessLocalDelivery({ ...fastForward, repositoryIdentityCheckSucceeded: false }), { allowed: false, reason: 'repository-identity-mismatch' })
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, targetBranchMatches: false }), { allowed: false, reason: 'target-branch-mismatch' })
 })
 
 test('delivery rejects an incomplete dirty-path check', () => {
   assert.deepEqual(assessLocalDelivery({ ...fastForward, dirtyPathCheckSucceeded: false }), { allowed: false, reason: 'dirty-path-check-failed' })
+})
+
+test('delivery rejects dirty, mismatched, or uncommitted worker state', () => {
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, workerClean: false }), { allowed: false, reason: 'worker-dirty' })
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, workerBranchVerified: false }), { allowed: false, reason: 'worker-branch-mismatch' })
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, workerHeadMatchesBranch: false }), { allowed: false, reason: 'worker-head-mismatch' })
+  assert.deepEqual(assessLocalDelivery({ ...fastForward, reportedChangesCommitted: false }), { allowed: false, reason: 'reported-changes-uncommitted' })
+})
+
+test('terminal worker and durable lifecycle predicates keep post-report obligations open', () => {
+  assert.equal(workerIsTerminal('idle'), true)
+  assert.equal(workerIsTerminal('done'), true)
+  assert.equal(workerIsTerminal('working'), false)
+  assert.equal(taskHasOpenLifecycleObligation({ cleanupStatus: 'pending' }), true)
+  assert.equal(taskHasOpenLifecycleObligation({ cleanupStatus: 'tab_closed', worktreeProvider: 'treehouse', leaseStatus: 'leased' }), true)
+  assert.equal(taskHasOpenLifecycleObligation({ cleanupStatus: 'tab_closed', worktreeProvider: 'treehouse', leaseStatus: 'returned', leaseReturnStatus: 'returned' }), false)
+  assert.equal(taskHasOpenLifecycleObligation({ cleanupStatus: 'tab_closed', worktreeProvider: 'herdr' }), false)
+})
+
+test('Treehouse return command preserves a dirty worktree unless discard is explicit', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'firstmate-return-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const worktree = path.join(root, 'worktree')
+  const bin = path.join(root, 'bin')
+  await mkdir(worktree)
+  await mkdir(bin)
+  await execFileAsync('git', ['init', '-b', 'main', worktree])
+  await writeFile(path.join(worktree, 'uncommitted.txt'), 'preserve\n')
+  const invokedPath = path.join(root, 'treehouse-invoked')
+  const fakeTreehouse = path.join(bin, 'treehouse')
+  await writeFile(fakeTreehouse, `#!/bin/sh\nprintf invoked > ${JSON.stringify(invokedPath)}\n`)
+  await chmod(fakeTreehouse, 0o700)
+  const stdoutPath = path.join(root, 'stdout')
+  const stderrPath = path.join(root, 'stderr')
+  const statusPath = path.join(root, 'status')
+  const worktreeStatusPath = path.join(root, 'worktree-status')
+  const command = buildTreehouseReturnCommand({
+    worktree,
+    leaseHolder: 'task-test',
+    stdoutPath,
+    stderrPath,
+    statusPath,
+    worktreeStatusPath,
+    allowDiscard: false,
+  })
+  await execFileAsync('sh', ['-c', command], { env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ''}` } })
+  assert.equal((await readFile(statusPath, 'utf8')).trim(), '65')
+  assert.match(await readFile(stderrPath, 'utf8'), /worktree is missing or dirty/)
+  await assert.rejects(readFile(invokedPath, 'utf8'), /ENOENT/)
+  assert.equal(await readFile(path.join(worktree, 'uncommitted.txt'), 'utf8'), 'preserve\n')
 })
 
 test('delivery rejects an overlapping untracked path', () => {
@@ -227,13 +283,16 @@ test('Firstmate injects visible-worker-only implementation instructions and guar
 test('watcher does not reconcile idle or done workers before their report exists', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const watcher = source.slice(source.indexOf('async function pollWatcher'), source.indexOf('function startWatcher'))
-  assert.match(watcher, /if \(state === 'idle' \|\| state === 'done'\) \{[\s\S]*?await fs\.promises\.access\(task\.reportPath, fs\.constants\.R_OK\)/)
-  assert.match(watcher, /watcherObservations\.set\(task\.taskId, \{ state: 'working', edgeLatched: false, endpointMissingLatched: false \}\)\s+continue/)
+  assert.match(watcher, /\(state === 'idle' \|\| state === 'done'\) && phase === 'awaiting-report'/)
+  assert.match(watcher, /await fs\.promises\.access\(task\.reportPath, fs\.constants\.R_OK\)/)
+  assert.match(watcher, /watcherObservations\.set\(task\.taskId, \{ state: 'working', phase, edgeLatched: false, endpointMissingLatched: false \}\)\s+continue/)
 })
 
 test('extension source keeps delivery and cleanup identity/return guards', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
-  assert.match(source, /import \{ assessLocalDelivery, canCleanupAfterDelivery \} from '\.\/delivery\.ts'/)
+  const deliverySource = await readFile(new URL('../extensions/firstmate/delivery.ts', import.meta.url), 'utf8')
+  const lifecycleSource = await readFile(new URL('../extensions/firstmate/lifecycle.ts', import.meta.url), 'utf8')
+  assert.match(source, /import \{ assessLocalDelivery, buildLocalDeliveryScript, canCleanupAfterDelivery \} from '\.\/delivery\.ts'/)
   assert.match(source, /task_deliver/)
   assert.match(source, /const createRawHelper = async/)
   assert.match(source, /'tab', 'create', '--workspace', workspaceId, '--cwd', cwd, '--label', label, '--no-focus'/)
@@ -247,10 +306,10 @@ test('extension source keeps delivery and cleanup identity/return guards', async
   assert.match(source, /task delivery requires a reconciled completed worker report/)
   assert.match(source, /idempotent: true/)
   assert.match(source, /task\.branch !== `firstmate\/\$\{taskId\}`/)
-  assert.match(source, /git -C \"\$project\" merge --ff-only \"\$branch\"/)
+  assert.match(deliverySource, /git -C \"\$project\" merge --ff-only \"\$branch\"/)
   assert.match(source, /runHerdr\(\['pane', 'run', helper\.paneId/)
   assert.match(source, /taskTeardownRecord\.paneId.*taskTeardownRecord\.workerName.*taskTeardownRecord\.workerKind/)
-  assert.match(source, /treehouse return --force/)
+  assert.match(lifecycleSource, /treehouse return --force/)
   assert.match(source, /leaseStatus: taskTeardownRecord\.worktreeProvider === 'treehouse' \? 'returned'/)
   assert.match(source, /leaseReturnStatus === 'returned'/)
   assert.match(source, /Treehouse lease return failed/)
@@ -371,8 +430,8 @@ test('Firstmate delegates broad read-heavy work asynchronously with bounded visi
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   const policy = (await readFile(new URL('../extensions/firstmate/POLICY.md', import.meta.url), 'utf8')).replace(/\s+/g, ' ')
   assert.match(policy, /broad codebase reconnaissance and read-heavy investigation/i)
-  assert.match(policy, /one visible worker is the default/i)
-  assert.match(policy, /two are allowed only for genuinely independent, bounded scopes/i)
+  assert.match(policy, /one visible worker in the shared checkout is the default/i)
+  assert.match(policy, /two workers are allowed only for genuinely independent, bounded scopes/i)
   assert.match(policy, /never fan out uncontrollably/i)
   assert.match(policy, /narrow one-file questions may be inspected directly/i)
   assert.match(policy, /`task_create` is asynchronous\/no-wait/i)
@@ -382,7 +441,7 @@ test('Firstmate delegates broad read-heavy work asynchronously with bounded visi
   const taskCreate = source.slice(taskCreateStart, taskCreateEnd)
   assert.match(taskCreate, /const promptArgs = \['agent', 'prompt'/)
   assert.doesNotMatch(taskCreate, /promptArgs\.push\('--wait'/)
-  assert.match(source, /promptGuidelines: \[[\s\S]*one visible (?:implementation )?worker by default/i)
+  assert.match(source, /promptGuidelines: \[[\s\S]*one visible shared-checkout worker by default/i)
 })
 
 test('watcher reports and latches unverified endpoints while status exposes durable task visibility', async () => {
@@ -392,7 +451,7 @@ test('watcher reports and latches unverified endpoints while status exposes dura
   const notifySource = source.slice(notifyStart, notifyEnd)
   assert.match(notifySource, /pi\.sendUserMessage\(message, \{ deliverAs: 'steer' \}\)/)
   assert.doesNotMatch(notifySource, /deliverAs: 'followUp'/)
-  assert.match(source, /type WatcherObservation = \{ state\?: NativeWorkerState; edgeLatched: boolean; endpointMissingLatched: boolean \}/)
+  assert.match(source, /type WatcherObservation = \{ state\?: NativeWorkerState; phase\?: string; edgeLatched: boolean; endpointMissingLatched: boolean \}/)
   assert.match(source, /function notifyMissingEndpoint\(task: TaskRecord\)/)
   assert.match(source, /runHerdr\(\['agent', 'get'.*result\.code !== 0/s)
   assert.match(source, /Do not classify it as idle\/done or completed/)
@@ -402,11 +461,12 @@ test('watcher reports and latches unverified endpoints while status exposes dura
   assert.match(source, /durableTasks/)
   assert.match(source, /const active = records\.filter/)
   assert.match(source, /const stale = records\.filter/)
-  assert.match(source, /record\.reportStatus !== 'blocked'/)
+  assert.match(source, /const active = records\.filter\(\(record\) => record\.openObligation\)/)
   assert.match(source, /const missing = records\.filter/)
   assert.match(source, /function watcherTaskCandidate\(task: TaskRecord, workspaceId: string\)/)
-  assert.match(source, /task\.reportStatus !== 'completed'/)
-  assert.match(source, /task\.reportStatus !== 'failed'/)
+  assert.match(source, /taskHasOpenLifecycleObligation\(task\)/)
+  assert.match(source, /awaiting-delivery-authority/)
+  assert.match(source, /still has a durable lease or cleanup obligation/)
   assert.match(source, /return \{ total: records\.length, active, stale, missing, records \}/)
 })
 
@@ -416,10 +476,12 @@ test('Treehouse provisioning resolves the base ref and creates the worker branch
   const taskCreateEnd = source.indexOf("case 'task_reconcile'", taskCreateStart)
   const provisioning = source.slice(taskCreateStart, taskCreateEnd)
   assert.match(provisioning, /treehouse get --lease/)
-  assert.match(source, /origin_head=\$\(git symbolic-ref --quiet --short refs\/remotes\/origin\/HEAD/)
-  assert.match(source, /for candidate in main master/)
+  assert.match(source, /base_commit=\$\{shellQuote\(baseCommit \|\| ''\)\}/)
+  assert.match(source, /if \[ -n "\$review_target" \]; then base="\$review_target"; else base="\$base_commit"; fi/)
   assert.match(source, /git switch --create "\$branch" -- "\$base"/)
-  assert.match(provisioning, /const branchSetupCommand = treehouseWorkerBranchCommand\(branch, task\.reviewTarget\)/)
+  assert.match(provisioning, /const branchSetupCommand = treehouseWorkerBranchCommand\(branch, task\.reviewTarget, task\.baseCommit\)/)
+  assert.match(provisioning, /symbolic-ref', '--quiet', '--short', 'HEAD'/)
+  assert.match(provisioning, /baseBranch, baseCommit/)
   assert.match(provisioning, /runHerdr\(branchSetupArgs, signal, timeout\)/)
   assert.ok(provisioning.indexOf('branchSetupArgs') < provisioning.indexOf("const startArgs = ['agent', 'start'"), 'branch setup must precede agent start')
   assert.doesNotMatch(provisioning, /treehouse get --lease.*--branch/)
@@ -438,27 +500,113 @@ test('reviewTarget is an additive inspection input and keeps review cleanup sepa
 
 test('delivery targets the current branch, checks NUL-delimited dirty-path overlap, and retains backwards-safe state handling', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
-  const deliveryStart = source.indexOf("case 'task_deliver'")
-  const deliveryEnd = source.indexOf("case 'task_teardown'", deliveryStart)
-  const delivery = source.slice(deliveryStart, deliveryEnd)
+  const delivery = await readFile(new URL('../extensions/firstmate/delivery.ts', import.meta.url), 'utf8')
   assert.match(delivery, /target_ref=\$\(git -C "\$project" symbolic-ref --quiet HEAD/)
   assert.match(delivery, /case "\$target_ref" in refs\/heads\/\*\) target=/)
   assert.match(delivery, /merge-base --is-ancestor "\$target" "\$branch"/)
-  assert.ok(delivery.includes('target=%s\\\\nrepo_identity_check=%s\\\\ndirty_paths_check=%s\\\\ndirty_paths_overlap=%s'))
+  assert.ok(delivery.includes('target=%s\\\\ntarget_branch_matches=%s\\\\nrepo_identity_check=%s\\\\nworker_clean=%s'))
+  assert.match(delivery, /status --porcelain=v1 -z --untracked-files=all/)
+  assert.match(delivery, /worker_head_matches/)
+  assert.match(delivery, /reported_changes_committed/)
   assert.match(delivery, /diff --name-only -z/)
   assert.match(delivery, /diff --cached --name-only -z/)
   assert.match(delivery, /ls-files --others --exclude-standard -z/)
   assert.match(delivery, /diff --name-only --no-renames -z "\$target" "\$branch" > "\$worker_paths"/)
   assert.match(delivery, /entries\.push\(bytes\.subarray\(start,index\)\)/)
   assert.match(delivery, /dirtyAncestors/)
-  assert.match(delivery, /shellQuote\(process\.execPath\)/)
+  assert.match(delivery, /shellQuote\(input\.nodePath\)/)
   assert.doesNotMatch(delivery, /refs\/remotes\/origin\/HEAD/)
-  assert.match(delivery, /deliveryTargetBranch: values\.target,\s+deliveryDefaultBranch: undefined/)
-  assert.match(delivery, /task\.deliveryTargetBranch \|\| task\.deliveryDefaultBranch/)
+  assert.match(source, /deliveryTargetBranch: values\.target,\s+deliveryDefaultBranch: undefined/)
+  assert.match(source, /task\.deliveryTargetBranch \|\| task\.deliveryDefaultBranch/)
+})
+
+test('generated delivery script lands only clean committed worktree changes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'firstmate-delivery-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const project = path.join(root, 'project')
+  const worktree = path.join(root, 'worktree')
+  await mkdir(project)
+  await execFileAsync('git', ['init', '-b', 'main', project])
+  await execFileAsync('git', ['-C', project, 'config', 'user.name', 'Firstmate Test'])
+  await execFileAsync('git', ['-C', project, 'config', 'user.email', 'firstmate@example.test'])
+  await writeFile(path.join(project, 'base.txt'), 'base\n')
+  await execFileAsync('git', ['-C', project, 'add', 'base.txt'])
+  await execFileAsync('git', ['-C', project, 'commit', '-m', 'base'])
+  const branch = 'firstmate/task-test-12345678-123'
+  await execFileAsync('git', ['-C', project, 'worktree', 'add', '-b', branch, worktree])
+  await writeFile(path.join(worktree, 'change.txt'), 'committed\n')
+  await execFileAsync('git', ['-C', worktree, 'add', 'change.txt'])
+  await execFileAsync('git', ['-C', worktree, 'commit', '-m', 'change'])
+
+  const paths = Object.fromEntries(['evidence', 'dirty', 'workerPaths', 'workerStatus'].map((name) => [name, path.join(root, name)]))
+  const scriptPath = path.join(root, 'deliver.sh')
+  await writeFile(
+    scriptPath,
+    buildLocalDeliveryScript({
+      project,
+      worktree,
+      branch,
+      expectedTargetBranch: 'main',
+      evidencePath: paths.evidence,
+      dirtyPathsPath: paths.dirty,
+      workerPathsPath: paths.workerPaths,
+      workerStatusPath: paths.workerStatus,
+      repositoryIdentity: await realpath(path.join(project, '.git')),
+      reportedChanges: true,
+      nodePath: process.execPath,
+    }),
+  )
+  await execFileAsync('sh', [scriptPath])
+  const evidence = await readFile(paths.evidence, 'utf8')
+  assert.match(evidence, /worker_clean=true/)
+  assert.match(evidence, /worker_branch_verified=true/)
+  assert.match(evidence, /worker_head_matches=true/)
+  assert.match(evidence, /reported_changes_committed=true/)
+  assert.equal((await execFileAsync('git', ['-C', project, 'rev-parse', 'main'])).stdout.trim(), (await execFileAsync('git', ['-C', project, 'rev-parse', branch])).stdout.trim())
+})
+
+test('generated delivery script refuses a dirty worker worktree without moving the primary branch', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'firstmate-delivery-dirty-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const project = path.join(root, 'project')
+  const worktree = path.join(root, 'worktree')
+  await mkdir(project)
+  await execFileAsync('git', ['init', '-b', 'main', project])
+  await execFileAsync('git', ['-C', project, 'config', 'user.name', 'Firstmate Test'])
+  await execFileAsync('git', ['-C', project, 'config', 'user.email', 'firstmate@example.test'])
+  await writeFile(path.join(project, 'base.txt'), 'base\n')
+  await execFileAsync('git', ['-C', project, 'add', 'base.txt'])
+  await execFileAsync('git', ['-C', project, 'commit', '-m', 'base'])
+  const branch = 'firstmate/task-dirty-12345678-123'
+  await execFileAsync('git', ['-C', project, 'worktree', 'add', '-b', branch, worktree])
+  await writeFile(path.join(worktree, 'uncommitted.txt'), 'keep me\n')
+  const before = (await execFileAsync('git', ['-C', project, 'rev-parse', 'main'])).stdout.trim()
+  const paths = Object.fromEntries(['evidence', 'dirty', 'workerPaths', 'workerStatus'].map((name) => [name, path.join(root, name)]))
+  const scriptPath = path.join(root, 'deliver.sh')
+  await writeFile(
+    scriptPath,
+    buildLocalDeliveryScript({
+      project,
+      worktree,
+      branch,
+      expectedTargetBranch: 'main',
+      evidencePath: paths.evidence,
+      dirtyPathsPath: paths.dirty,
+      workerPathsPath: paths.workerPaths,
+      workerStatusPath: paths.workerStatus,
+      repositoryIdentity: await realpath(path.join(project, '.git')),
+      reportedChanges: true,
+      nodePath: process.execPath,
+    }),
+  )
+  await assert.rejects(execFileAsync('sh', [scriptPath]))
+  assert.match(await readFile(paths.evidence, 'utf8'), /worker_clean=false/)
+  assert.equal((await execFileAsync('git', ['-C', project, 'rev-parse', 'main'])).stdout.trim(), before)
+  assert.equal(await readFile(path.join(worktree, 'uncommitted.txt'), 'utf8'), 'keep me\n')
 })
 
 test('delivery refusal records a failure without exiting before wrapper status write', async () => {
-  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  const source = await readFile(new URL('../extensions/firstmate/delivery.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /refusing local delivery:[^']+' >&2; exit 1/)
   assert.match(source, /refusing local delivery:[^']+' >&2; code=1; else before=/)
 })
@@ -466,6 +614,7 @@ test('delivery refusal records a failure without exiting before wrapper status w
 test('delivery runs a durable shell script through the short helper command', async () => {
   const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
   assert.match(source, /const deliveryScriptPath = path\.join\(TASK_STATE_DIR, `\.\$\{taskId\}\.delivery\.sh`\)/)
+  assert.match(source, /const deliveryScript = buildLocalDeliveryScript\(/)
   assert.match(source, /fs\.promises\.writeFile\(deliveryScriptPath, deliveryScript, \{ encoding: 'utf8', mode: 0o700 \}\)/)
   assert.match(source, /fs\.promises\.chmod\(deliveryScriptPath, 0o700\)/)
   assert.ok(source.includes("const deliveryCommand = `sh ${shellQuote(deliveryScriptPath)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\\\n' \"$?\" > ${shellQuote(statusPath)}`"))
@@ -539,12 +688,18 @@ test('Firstmate defaults to session-scoped shared isolation and can switch to wo
   assert.match(source, /pi\.registerCommand\('firstmate-isolation'/)
   assert.match(source, /pi\.appendEntry\(ISOLATION_STATE_ENTRY, \{ mode: requested \}\)/)
   assert.match(source, /restoreIsolationMode\(ctx\)/)
-  assert.match(taskCreate, /const taskIsolation = isolationMode/)
+  assert.match(taskCreate, /const taskIsolation = params\.isolation \?\? isolationMode/)
+  assert.match(taskCreate, /implementation worktree tasks require the captain’s exact local-commit authorization/)
+  assert.match(taskCreate, /commitAuthority/)
   assert.match(taskCreate, /worktreeProvider: taskIsolation === 'shared' \? 'herdr' : 'treehouse'/)
   assert.match(taskCreate, /if \(taskIsolation === 'worktree'\) \{\s+const leaseArgs/)
   assert.match(taskCreate, /fs\.promises\.realpath\(project\)/)
   assert.match(taskCreate, /a shared-checkout task is already active for this project/)
   assert.match(taskCreate, /reviewTarget tasks require worktree isolation/)
+  assert.match(source, /task delivery requires the captain’s exact merge authorization/)
+  assert.match(source, /worker is not idle or done/)
+  const lifecycleSource = await readFile(new URL('../extensions/firstmate/lifecycle.ts', import.meta.url), 'utf8')
+  assert.match(lifecycleSource, /treehouse return --force[\s\S]*worker worktree is missing or dirty/)
   assert.match(source, /shared-checkout tasks are already local and must not use task_deliver/)
   assert.match(teardown, /task\.worktreeProvider === 'treehouse'\s*&&\s*!reviewTask/)
   assert.match(teardown, /leaseNotRequired: task\.worktreeProvider === 'herdr'/)

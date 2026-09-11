@@ -44,6 +44,8 @@ export type TaskRecord = {
   leaseReturnStderr?: string
   leaseReturnError?: string
   deliveryStatus?: DeliveryStatus
+  deliveryAuthority?: string
+  deliveryAuthorityAt?: string
   deliveryTargetBranch?: string
   deliveryDefaultBranch?: string
   deliveryBeforeCommit?: string
@@ -53,6 +55,10 @@ export type TaskRecord = {
   deliveryStdout?: string
   deliveryStderr?: string
   deliveryError?: string
+  deliveryWorkerClean?: boolean
+  deliveryWorkerBranchVerified?: boolean
+  deliveryWorkerHead?: string
+  deliveryReportedChangesCommitted?: boolean
   deliveryHelperTabId?: string
   deliveryHelperPaneId?: string
   leaseReturnHelperTabId?: string
@@ -61,7 +67,11 @@ export type TaskRecord = {
   tabId: string | null
   paneId: string | null
   branch: string
+  baseBranch?: string
+  baseCommit?: string
   reviewTarget?: string
+  commitAuthority?: string
+  commitAuthorityAt?: string
   workerName?: string
   workerKind?: WorkerKind
   status: TaskStatus

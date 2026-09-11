@@ -101,6 +101,38 @@ export function isPendingLeaseNoop(status: string | undefined): boolean {
   return status === 'pending'
 }
 
+/** A durable record remains open until its worker endpoint and any external lease are closed. */
+export function taskHasOpenLifecycleObligation(task: TaskRecord): boolean {
+  if (task.cleanupStatus !== 'tab_closed') return true
+  if (task.worktreeProvider === 'treehouse' && (task.leaseStatus !== 'returned' || task.leaseReturnStatus !== 'returned')) return true
+  return Boolean(task.cleanupError || task.deliveryStatus === 'failed' || task.leaseReturnStatus === 'failed')
+}
+
+export function workerIsTerminal(status: unknown): boolean {
+  return status === 'idle' || status === 'done'
+}
+
+export type TreehouseReturnCommandInput = {
+  worktree: string
+  leaseHolder: string
+  stdoutPath: string
+  stderrPath: string
+  statusPath: string
+  worktreeStatusPath: string
+  allowDiscard: boolean
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+export function buildTreehouseReturnCommand(input: TreehouseReturnCommandInput): string {
+  const returnCommand = `treehouse return --force ${shellQuote(input.worktree)} --if-lease-holder ${shellQuote(input.leaseHolder)} > ${shellQuote(input.stdoutPath)} 2> ${shellQuote(input.stderrPath)}`
+  if (input.allowDiscard) return `${returnCommand}; code=$?; printf '%s\\n' "$code" > ${shellQuote(input.statusPath)}`
+  const cleanCheck = `git -C ${shellQuote(input.worktree)} status --porcelain=v1 -z --untracked-files=all > ${shellQuote(input.worktreeStatusPath)} && [ ! -s ${shellQuote(input.worktreeStatusPath)} ]`
+  return `if ${cleanCheck}; then ${returnCommand}; code=$?; else echo 'refusing Treehouse return: worker worktree is missing or dirty; preserving the lease and changes' > ${shellQuote(input.stderrPath)}; code=65; fi; printf '%s\\n' "$code" > ${shellQuote(input.statusPath)}`
+}
+
 export type EndpointAbsenceStatus = 'recorded' | 'absent_verified' | 'unverified'
 
 export function canDeleteWithoutRecordedEndpoint(status: string | undefined): boolean {
@@ -146,9 +178,11 @@ export function taskArtifactNames(taskId: string): string[] {
     `.${taskId}.lease-return.stdout`,
     `.${taskId}.lease-return.stderr`,
     `.${taskId}.lease-return.status`,
+    `.${taskId}.lease-return.worktree-status`,
     `.${taskId}.delivery.evidence`,
     `.${taskId}.delivery.dirty-paths`,
     `.${taskId}.delivery.worker-paths`,
+    `.${taskId}.delivery.worker-status`,
     `.${taskId}.delivery.stdout`,
     `.${taskId}.delivery.stderr`,
     `.${taskId}.delivery.status`,

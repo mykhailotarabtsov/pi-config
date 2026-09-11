@@ -5,9 +5,10 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Text } from '@earendil-works/pi-tui'
-import { assessLocalDelivery, canCleanupAfterDelivery } from './delivery.ts'
+import { assessLocalDelivery, buildLocalDeliveryScript, canCleanupAfterDelivery } from './delivery.ts'
 import { FIRSTMATE_ALLOWED_TOOLS, FIRSTMATE_CONTROL_ACTIONS, isFirstmateAllowedTool, isFirstmateControlAction, type FirstmateControlAction } from './control.ts'
 import {
+  buildTreehouseReturnCommand,
   canDeleteWithoutRecordedEndpoint,
   canMarkLeaseReturned,
   endpointListsConfirmAbsence,
@@ -16,6 +17,8 @@ import {
   isAllowedFirstmateSubagentRequest,
   isWatcherPollHealthy,
   recordVerifiedEndpointAbsence,
+  taskHasOpenLifecycleObligation,
+  workerIsTerminal,
   recordWatcherPollOutcome,
   LifecycleOperationLock,
   taskArtifactPaths,
@@ -41,13 +44,14 @@ import { Type } from 'typebox'
 const MARKER_DIR = path.join(os.tmpdir(), 'pi-herdr-firstmate')
 const MARKER_VERSION = 1
 const SHARED_ADMISSION_LOCK_PREFIX = '.shared-admission-'
-const FIRSTMATE_WORKER_BIN_DIR = path.join(os.homedir(), '.pi', 'agent', 'extensions', 'firstmate', 'worker-git')
+const FIRSTMATE_EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url))
+const FIRSTMATE_WORKER_BIN_DIR = path.join(FIRSTMATE_EXTENSION_DIR, 'worker-git')
 const WORKER_ENV = 'PI_FIRSTMATE_WORKER'
 const TASK_ENV = 'PI_FIRSTMATE_TASK_ID'
 const REPORT_ENV = 'PI_FIRSTMATE_REPORT_PATH'
 const ACTIVE_ENV = 'PI_FIRSTMATE_ACTIVE'
 const FIRSTMATE_NAME = 'firstmate'
-const FIRSTMATE_POLICY_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'POLICY.md')
+const FIRSTMATE_POLICY_PATH = path.join(FIRSTMATE_EXTENSION_DIR, 'POLICY.md')
 const NO_PUBLISH_ENV = 'PI_PERMISSION_NO_PUBLISH'
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 const PANE_ID_RE = /^w[0-9A-Za-z]+:p[0-9A-Za-z]+$/
@@ -83,7 +87,10 @@ const HerdrControlParams = Type.Object({
   taskId: Type.Optional(Type.String({ description: 'Durable firstmate task id for task reconciliation, delivery, cleanup, or recovery.' })),
   label: Type.Optional(Type.String({ description: 'Optional label for a visible worker tab.' })),
   kind: Type.Optional(StringEnum(ALLOWED_WORKER_KINDS, { description: 'Allowlisted worker kind for task_create: pi (default) or claude.' })),
+  isolation: Type.Optional(StringEnum(['shared', 'worktree'] as const, { description: 'Per-task isolation choice for task_create. Defaults to the shared session preference; choose worktree for large or parallel scopes.' })),
   prompt: Type.Optional(Type.String({ description: 'Precise worker brief for task_create.' })),
+  commitAuthority: Type.Optional(Type.String({ description: 'Exact captain statement authorizing local commits for an implementation worktree task.' })),
+  authority: Type.Optional(Type.String({ description: 'Exact captain statement authorizing task_deliver to merge the completed local worktree branch.' })),
   timeoutMs: Type.Optional(Type.Number({ description: 'Timeout in milliseconds for a high-level task operation.' })),
   force: Type.Optional(Type.Boolean({ description: 'For task_abort/task_recover, explicitly stop an active worker with pane close.' })),
   discard: Type.Optional(Type.Boolean({ description: 'For task_abort/task_recover, explicitly allow returning a leased worktree with --force.' })),
@@ -99,7 +106,10 @@ type ControlParams = {
   tabId?: string
   label?: string
   kind?: WorkerKind
+  isolation?: IsolationMode
   prompt?: string
+  commitAuthority?: string
+  authority?: string
   timeoutMs?: number
   force?: boolean
   discard?: boolean
@@ -117,7 +127,7 @@ type Marker = {
 type IsolationMode = 'shared' | 'worktree'
 
 type NativeWorkerState = 'working' | 'blocked' | 'idle' | 'done'
-type WatcherObservation = { state?: NativeWorkerState; edgeLatched: boolean; endpointMissingLatched: boolean }
+type WatcherObservation = { state?: NativeWorkerState; phase?: string; edgeLatched: boolean; endpointMissingLatched: boolean }
 type WatcherMissingEndpoint = { taskId: string; workspaceId: string | null; tabId: string | null; paneId: string | null; workerName?: string; workerKind?: string }
 
 function isWatcherTaskRecord(value: unknown, taskId: string): value is TaskRecord {
@@ -151,6 +161,8 @@ function isWatcherTaskRecord(value: unknown, taskId: string): value is TaskRecor
   if (value.leaseReturnStderr !== undefined && typeof value.leaseReturnStderr !== 'string') return false
   if (value.leaseReturnError !== undefined && typeof value.leaseReturnError !== 'string') return false
   if (value.deliveryStatus !== undefined && value.deliveryStatus !== 'landing' && value.deliveryStatus !== 'landed' && value.deliveryStatus !== 'failed') return false
+  if (value.deliveryAuthority !== undefined && typeof value.deliveryAuthority !== 'string') return false
+  if (value.deliveryAuthorityAt !== undefined && typeof value.deliveryAuthorityAt !== 'string') return false
   if (value.deliveryTargetBranch !== undefined && typeof value.deliveryTargetBranch !== 'string') return false
   if (value.deliveryDefaultBranch !== undefined && typeof value.deliveryDefaultBranch !== 'string') return false
   if (value.deliveryBeforeCommit !== undefined && typeof value.deliveryBeforeCommit !== 'string') return false
@@ -160,10 +172,18 @@ function isWatcherTaskRecord(value: unknown, taskId: string): value is TaskRecor
   if (value.deliveryStdout !== undefined && typeof value.deliveryStdout !== 'string') return false
   if (value.deliveryStderr !== undefined && typeof value.deliveryStderr !== 'string') return false
   if (value.deliveryError !== undefined && typeof value.deliveryError !== 'string') return false
+  if (value.deliveryWorkerClean !== undefined && typeof value.deliveryWorkerClean !== 'boolean') return false
+  if (value.deliveryWorkerBranchVerified !== undefined && typeof value.deliveryWorkerBranchVerified !== 'boolean') return false
+  if (value.deliveryWorkerHead !== undefined && typeof value.deliveryWorkerHead !== 'string') return false
+  if (value.deliveryReportedChangesCommitted !== undefined && typeof value.deliveryReportedChangesCommitted !== 'boolean') return false
   if (value.deliveryHelperTabId !== undefined && typeof value.deliveryHelperTabId !== 'string') return false
   if (value.deliveryHelperPaneId !== undefined && typeof value.deliveryHelperPaneId !== 'string') return false
   if (value.projectRepoIdentity !== undefined && typeof value.projectRepoIdentity !== 'string') return false
+  if (value.baseBranch !== undefined && typeof value.baseBranch !== 'string') return false
+  if (value.baseCommit !== undefined && typeof value.baseCommit !== 'string') return false
   if (value.reviewTarget !== undefined && typeof value.reviewTarget !== 'string') return false
+  if (value.commitAuthority !== undefined && typeof value.commitAuthority !== 'string') return false
+  if (value.commitAuthorityAt !== undefined && typeof value.commitAuthorityAt !== 'string') return false
   if (value.workerKind !== undefined && !isWorkerKind(value.workerKind)) return false
   if (value.leaseReturnHelperTabId !== undefined && typeof value.leaseReturnHelperTabId !== 'string') return false
   if (value.leaseReturnHelperPaneId !== undefined && typeof value.leaseReturnHelperPaneId !== 'string') return false
@@ -268,26 +288,14 @@ async function acquireSharedAdmissionLock(project: string): Promise<{ release: (
   }
 }
 
-function treehouseWorkerBranchCommand(branch: string, reviewTarget?: string): string {
+function treehouseWorkerBranchCommand(branch: string, reviewTarget?: string, baseCommit?: string): string {
   return (
     [
       '#!/bin/sh',
       `branch=${shellQuote(branch)}`,
       `review_target=${shellQuote(reviewTarget || '')}`,
-      'if [ -n "$review_target" ]; then',
-      '  base="$review_target"',
-      'else',
-      '  origin_head=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)',
-      '  if [ -n "$origin_head" ]; then',
-      '    base="$origin_head"',
-      '  else',
-      '    base=',
-      '    for candidate in main master; do',
-      '      if git show-ref --verify --quiet "refs/heads/$candidate"; then base="refs/heads/$candidate"; break; fi',
-      '      if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then base="refs/remotes/origin/$candidate"; break; fi',
-      '    done',
-      '  fi',
-      'fi',
+      `base_commit=${shellQuote(baseCommit || '')}`,
+      'if [ -n "$review_target" ]; then base="$review_target"; else base="$base_commit"; fi',
       'if [ -z "$base" ] || ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then',
       '  echo "could not resolve the worker base ref: ${base:-none}" >&2',
       '  exit 1',
@@ -651,16 +659,12 @@ export default function firstmate(pi: ExtensionAPI) {
       paneId: task.paneId,
       workerName: task.workerName,
       workerKind: task.workerKind,
+      deliveryStatus: task.deliveryStatus,
+      leaseStatus: task.leaseStatus,
+      openObligation: taskHasOpenLifecycleObligation(task),
       visibility: watcherMissingEndpoints.has(task.taskId) ? 'missing' : task.cleanupStatus === 'tab_closed' ? 'closed' : 'recorded',
     }))
-    const active = records.filter(
-      (record) =>
-        record.status !== 'failed' &&
-        record.cleanupStatus !== 'tab_closed' &&
-        record.reportStatus !== 'completed' &&
-        record.reportStatus !== 'blocked' &&
-        record.reportStatus !== 'failed',
-    )
+    const active = records.filter((record) => record.openObligation)
     const stale = records.filter(
       (record) =>
         record.status === 'failed' ||
@@ -712,9 +716,7 @@ export default function firstmate(pi: ExtensionAPI) {
         readDiagnostic ||= `task-state read failed for ${filePath}: ${(error as Error).message}`
       })
       if (readDiagnostic) return { active: false, diagnostic: readDiagnostic }
-      const active = tasks.some(
-        (task) => task.status === 'started' && task.cleanupStatus !== 'tab_closed' && hasWatcherEndpoint(task, workspaceId) && task.reportStatus !== 'completed' && task.reportStatus !== 'failed',
-      )
+      const active = tasks.some((task) => task.workspaceId === workspaceId && taskHasOpenLifecycleObligation(task))
       return { active }
     } catch (error) {
       return { active: false, diagnostic: `task-state read failed: ${(error as Error).message}` }
@@ -779,7 +781,27 @@ export default function firstmate(pi: ExtensionAPI) {
   }
 
   function watcherTaskCandidate(task: TaskRecord, workspaceId: string): boolean {
-    return task.status === 'started' && task.cleanupStatus !== 'tab_closed' && task.workspaceId === workspaceId && task.reportStatus !== 'completed' && task.reportStatus !== 'failed'
+    return task.workspaceId === workspaceId && taskHasOpenLifecycleObligation(task)
+  }
+
+  function watcherTaskPhase(task: TaskRecord): string {
+    if (task.cleanupStatus === 'tab_closed') return 'lease-or-cleanup-recovery'
+    if (task.reportStatus === 'completed') {
+      if (task.worktreeProvider === 'treehouse' && task.deliveryStatus !== 'landed') return 'awaiting-delivery-authority'
+      return 'awaiting-teardown'
+    }
+    if (task.reportStatus === 'failed' || task.reportStatus === 'blocked') return 'awaiting-recovery'
+    return 'awaiting-report'
+  }
+
+  function watcherAction(task: TaskRecord, state: NativeWorkerState): string {
+    const phase = watcherTaskPhase(task)
+    if (phase === 'awaiting-delivery-authority')
+      return `Task ${task.taskId} has a completed worktree report. Ask the captain for explicit local-merge authority, then run task_deliver and task_teardown.`
+    if (phase === 'awaiting-teardown') return `Task ${task.taskId} is delivered or already local. Run task_teardown and verify cleanup.`
+    if (phase === 'awaiting-recovery') return `Task ${task.taskId} reported ${task.reportStatus}. Preserve its work and handle the blocker or run explicit task_abort/task_recover.`
+    if (state === 'blocked') return `Task ${task.taskId} worker ${task.workerName} entered blocked. Inspect the worker and handle the approval or blocker.`
+    return `Task ${task.taskId} worker ${task.workerName} entered ${state}. Run task_reconcile and inspect the worker result.`
   }
 
   function notifyMissingEndpoint(task: TaskRecord): void {
@@ -801,7 +823,7 @@ export default function firstmate(pi: ExtensionAPI) {
           `FIRSTMATE WATCHER: Task ${task.taskId} worker endpoint cannot be verified (${identity}). Do not classify it as idle/done or completed; inspect the durable task and recover/reconcile the recorded endpoint.`,
         ) || endpointMissingLatched
     }
-    watcherObservations.set(task.taskId, { state: previous?.state, edgeLatched: false, endpointMissingLatched })
+    watcherObservations.set(task.taskId, { state: previous?.state, phase: watcherTaskPhase(task), edgeLatched: false, endpointMissingLatched })
   }
 
   function notifyWatcher(message: string): boolean {
@@ -843,6 +865,17 @@ export default function firstmate(pi: ExtensionAPI) {
         if (!watcherRunning) return
         if (!watcherTaskCandidate(task, workspaceId)) continue
         seenTaskIds.add(task.taskId)
+        const phase = watcherTaskPhase(task)
+        if (task.cleanupStatus === 'tab_closed') {
+          const previous = watcherObservations.get(task.taskId)
+          let edgeLatched = previous?.phase === phase ? previous.edgeLatched : false
+          if (!edgeLatched) {
+            edgeLatched =
+              notifyWatcher(`FIRSTMATE WATCHER: Task ${task.taskId} still has a durable lease or cleanup obligation after endpoint closure. Run status and explicit task_recover; do not discard retained work without captain authority.`) || edgeLatched
+          }
+          watcherObservations.set(task.taskId, { state: 'done', phase, edgeLatched, endpointMissingLatched: false })
+          continue
+        }
         if (!hasWatcherEndpoint(task, workspaceId)) {
           notifyMissingEndpoint(task)
           continue
@@ -880,31 +913,27 @@ export default function firstmate(pi: ExtensionAPI) {
         }
         const previous = watcherObservations.get(task.taskId)
         if (state === 'working') {
-          watcherObservations.set(task.taskId, { state, edgeLatched: false, endpointMissingLatched: false })
+          watcherObservations.set(task.taskId, { state, phase, edgeLatched: false, endpointMissingLatched: false })
           continue
         }
         // A worker can transition to idle/done before its final report write is
         // visible to the coordinator. Do not steer Firstmate into reconciliation
         // during that handoff; an ENOENT report is a transient state here.
-        if (state === 'idle' || state === 'done') {
+        if ((state === 'idle' || state === 'done') && phase === 'awaiting-report') {
           try {
             await fs.promises.access(task.reportPath, fs.constants.R_OK)
           } catch {
-            watcherObservations.set(task.taskId, { state: 'working', edgeLatched: false, endpointMissingLatched: false })
+            watcherObservations.set(task.taskId, { state: 'working', phase, edgeLatched: false, endpointMissingLatched: false })
             continue
           }
         }
 
-        let edgeLatched = previous?.edgeLatched ?? false
-        const actionable = task.reportStatus !== 'completed' && (state === 'blocked' || state === 'idle' || state === 'done')
-        if (actionable && previous?.state !== state && !edgeLatched) {
-          const detail =
-            state === 'blocked'
-              ? `FIRSTMATE WATCHER: Task ${task.taskId} worker ${task.workerName} entered blocked. Firstmate, inspect worker ${task.workerName} and handle the approval/blocker.`
-              : `FIRSTMATE WATCHER: Task ${task.taskId} worker ${task.workerName} entered ${state} with reportStatus=${task.reportStatus}. Firstmate, run task_reconcile for ${task.taskId} and inspect the worker result.`
-          edgeLatched = notifyWatcher(detail) || edgeLatched
+        let edgeLatched = previous?.phase === phase ? (previous?.edgeLatched ?? false) : false
+        const actionable = state === 'blocked' || state === 'idle' || state === 'done'
+        if (actionable && (previous?.state !== state || previous?.phase !== phase) && !edgeLatched) {
+          edgeLatched = notifyWatcher(`FIRSTMATE WATCHER: ${watcherAction(task, state)}`) || edgeLatched
         }
-        watcherObservations.set(task.taskId, { state, edgeLatched, endpointMissingLatched: false })
+        watcherObservations.set(task.taskId, { state, phase, edgeLatched, endpointMissingLatched: false })
       }
       pollSucceeded = true
     } catch (error) {
@@ -1076,9 +1105,9 @@ export default function firstmate(pi: ExtensionAPI) {
       promptGuidelines: [
         'Use herdr_control.task_create and visible worker tabs for all implementation and code mutations; use the subagent tool only with agent: "browser-tester" for browser QA, never for implementation or reconnaissance. Firstmate must never call mcp. Use artifact only for generated browser artifacts, reports, or diagrams under the project \\`.pi/artifacts/\\` directory, not implementation work or arbitrary file edits. Never use bash, edit, or write. Delegate mutations through worker panes.',
         'Use the subagent tool only with agent: "browser-tester" for browser QA. That delegate may use MCP for browser interaction, but sign-in must always be performed manually by the captain; never automate credentials or authentication. Do not use subagent for implementation or reconnaissance.',
-        'Choose the worker count yourself; do not ask the captain to choose it. Use one visible implementation worker by default; use two only for genuinely independent, bounded scopes; never fan out uncontrollably. Delegate broad codebase reconnaissance and read-heavy investigation instead of doing long local read/grep loops. Inspect narrow one-file questions directly when that is simpler.',
+        'Choose the worker count and isolation yourself; do not ask the captain to choose mechanics. Use one visible shared-checkout worker by default. Pass isolation: "worktree" for a large task that benefits from isolation, every review task, or each worker when running genuinely independent parallel scopes. Use at most two workers and never fan out uncontrollably. Implementation worktrees require the captain’s exact local-commit statement in commitAuthority before task_create.',
         'task_create is asynchronous/no-wait: create the worker, keep the firstmate focused on the captain, and rely on watcher follow-ups rather than polling or waiting for worker completion. Do not call task_reconcile while the worker is still working; wait for the terminal watcher follow-up and its report.',
-        'Use task_create with the current session isolation mode, one visible tab per implementation worker, and the selected worker kind. Reconcile the structured report before claiming completion; shared tasks never use task_deliver, while worktree tasks require task_deliver before task_teardown.',
+        'Use task_create with one visible tab per implementation worker and the selected worker kind. The session isolation mode is only the default; pass a per-task isolation override when warranted. Reconcile only after the exact worker is idle/done. Shared tasks never use task_deliver. For worktree tasks, ask the captain for explicit local-merge authority after the report, pass the exact statement in task_deliver authority, then run task_teardown.',
         'Implementation workers and their subagents must not push, publish, or commit without explicit captain authorization. The browser-tester delegate may use MCP only for browser QA and must report when manual sign-in is required. Failed/blocked shared reports may use only the guarded exact idle/done tab cleanup; never force-close active/hung workers. Never auto-return or discard Treehouse leases; report only verified outcomes and preserve unrelated changes.',
       ],
       parameters: HerdrControlParams,
@@ -1416,7 +1445,10 @@ export default function firstmate(pi: ExtensionAPI) {
             }
           }
 
-          const returnTaskLease = async (task: TaskRecord): Promise<{ returned: boolean; idempotent?: boolean; task: TaskRecord; error?: string; result?: Record<string, unknown> }> => {
+          const returnTaskLease = async (
+            task: TaskRecord,
+            allowDiscard = false,
+          ): Promise<{ returned: boolean; idempotent?: boolean; task: TaskRecord; error?: string; result?: Record<string, unknown> }> => {
             if (task.worktreeProvider !== 'treehouse') return { returned: true, idempotent: true, task }
             if (isPendingLeaseNoop(task.leaseStatus)) return { returned: true, idempotent: true, task }
             if (task.leaseReturnHelperTabId || task.leaseReturnHelperPaneId) {
@@ -1454,7 +1486,16 @@ export default function firstmate(pi: ExtensionAPI) {
             const stdoutPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stdout`)
             const stderrPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.stderr`)
             const statusPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.status`)
-            const command = `treehouse return --force ${shellQuote(task.worktree)} --if-lease-holder ${shellQuote(task.leaseHolder)} > ${shellQuote(stdoutPath)} 2> ${shellQuote(stderrPath)}; printf '%s\\n' "$?" > ${shellQuote(statusPath)}`
+            const worktreeStatusPath = path.join(TASK_STATE_DIR, `.${task.taskId}.lease-return.worktree-status`)
+            const command = buildTreehouseReturnCommand({
+              worktree: task.worktree,
+              leaseHolder: task.leaseHolder,
+              stdoutPath,
+              stderrPath,
+              statusPath,
+              worktreeStatusPath,
+              allowDiscard,
+            })
             const helperResult = await createRawHelper(task.workspaceId || '', task.worktree, `firstmate-lease-return-${task.taskId}`)
             if (!helperResult.helper)
               return { returned: false, task, error: helperResult.error || 'could not create raw Treehouse return helper tab; preserving the lease.', result: helperResult.result }
@@ -1492,7 +1533,7 @@ export default function firstmate(pi: ExtensionAPI) {
             const commandSucceeded = (!error && code === 0) || markerSucceeded
             if (markerSucceeded) error = undefined
             if (!commandSucceeded && !error) error = `treehouse return exited ${code ?? 'unknown'}; lease is preserved.`
-            const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`], signal, 10_000).catch(
+            const tempCleanup = await runHerdr(['pane', 'run', helper.paneId, `rm -f ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)} ${shellQuote(worktreeStatusPath)}`], signal, 10_000).catch(
               (cleanupError) => ({ stdout: '', stderr: (cleanupError as Error).message, code: 1 }),
             )
             const tempCleanupSucceeded = tempCleanup.code === 0
@@ -1592,7 +1633,15 @@ export default function firstmate(pi: ExtensionAPI) {
               if (params.reviewTarget !== undefined && !params.reviewTarget.trim()) return errorResult('`reviewTarget` must be a non-empty ref when provided.', { action: params.action })
 
               let project = path.resolve(ctx.cwd, params.project)
-              const taskIsolation = isolationMode
+              const taskIsolation = params.isolation ?? isolationMode
+              if (taskIsolation === 'worktree' && params.reviewTarget === undefined && !params.commitAuthority?.trim()) {
+                return errorResult('implementation worktree tasks require the captain’s exact local-commit authorization in `commitAuthority` before a worker is started.', {
+                  action: params.action,
+                  project,
+                  isolation: taskIsolation,
+                  authorityRequired: 'local_commit',
+                })
+              }
               try {
                 project = await fs.promises.realpath(project)
               } catch (error) {
@@ -1600,8 +1649,33 @@ export default function firstmate(pi: ExtensionAPI) {
               }
               const projectIdentity = await repositoryIdentity(project, signal)
               if (!projectIdentity.identity) return errorResult(projectIdentity.error || 'could not verify git repository identity.', { action: params.action, project })
+              let baseBranch: string | undefined
+              let baseCommit: string | undefined
+              if (taskIsolation === 'worktree' && params.reviewTarget === undefined) {
+                const [branchResult, commitResult] = await Promise.all([
+                  pi.exec('git', ['-C', project, 'symbolic-ref', '--quiet', '--short', 'HEAD'], { signal, timeout: 10_000 }),
+                  pi.exec('git', ['-C', project, 'rev-parse', 'HEAD'], { signal, timeout: 10_000 }),
+                ])
+                baseBranch = branchResult.stdout.trim()
+                baseCommit = commitResult.stdout.trim()
+                if (
+                  branchResult.code !== 0 ||
+                  commitResult.code !== 0 ||
+                  !baseBranch ||
+                  baseBranch.includes('\u0000') ||
+                  baseBranch.includes('\n') ||
+                  !/^[0-9a-f]{40,64}$/i.test(baseCommit)
+                ) {
+                  return errorResult('implementation worktree tasks require an exact attached primary branch and base commit.', {
+                    action: params.action,
+                    project,
+                    branch: commandResultText('git symbolic-ref', branchResult),
+                    commit: commandResultText('git rev-parse HEAD', commitResult),
+                  })
+                }
+              }
               if (taskIsolation === 'shared' && params.reviewTarget !== undefined) {
-                return errorResult('reviewTarget tasks require worktree isolation; switch with /firstmate-isolation worktree.', { action: params.action, project, reviewTarget: params.reviewTarget })
+                return errorResult('reviewTarget tasks require worktree isolation; call task_create with isolation: "worktree".', { action: params.action, project, reviewTarget: params.reviewTarget })
               }
               if (taskIsolation === 'shared') {
                 try {
@@ -1769,7 +1843,11 @@ export default function firstmate(pi: ExtensionAPI) {
                 tabId: null,
                 paneId: null,
                 branch,
+                ...(baseBranch && baseCommit ? { baseBranch, baseCommit } : {}),
                 ...(params.reviewTarget !== undefined ? { reviewTarget: params.reviewTarget } : {}),
+                ...(taskIsolation === 'worktree' && params.reviewTarget === undefined && params.commitAuthority?.trim()
+                  ? { commitAuthority: params.commitAuthority.trim(), commitAuthorityAt: now }
+                  : {}),
                 workerKind: taskWorkerKind,
                 status: 'provisioning',
                 reportPath,
@@ -2092,7 +2170,7 @@ export default function firstmate(pi: ExtensionAPI) {
                   return failAfterTab('worker pane did not enter the exact leased Treehouse worktree.', { argv: ['herdr', 'pane', 'get', returnedPaneId], cwd: parseJsonMaybe(cwdResult.stdout) })
                 }
 
-                const branchSetupCommand = treehouseWorkerBranchCommand(branch, task.reviewTarget)
+                const branchSetupCommand = treehouseWorkerBranchCommand(branch, task.reviewTarget, task.baseCommit)
                 const branchSetupArgs = ['pane', 'run', returnedPaneId, branchSetupCommand]
                 const branchSetupResult = await runHerdr(branchSetupArgs, signal, timeout)
                 if (branchSetupResult.code !== 0) {
@@ -2132,7 +2210,10 @@ export default function firstmate(pi: ExtensionAPI) {
               }
 
               const reviewPrompt = task.reviewTarget ? `\n\nThis is a review task. Inspect the existing target ref ${task.reviewTarget}; do not silently review the default branch.` : ''
-              const workerPrompt = `${params.prompt}${reviewPrompt}${workerReportContract(taskId, reportPath)}`
+              const commitPrompt = task.commitAuthority
+                ? `\n\nThe captain explicitly authorized local commits for this isolated task with: ${JSON.stringify(task.commitAuthority)}. Create the local task-branch commit needed for delivery, but never push or publish.`
+                : ''
+              const workerPrompt = `${params.prompt}${reviewPrompt}${commitPrompt}${workerReportContract(taskId, reportPath)}`
               const promptArgs = ['agent', 'prompt', workerName, workerPrompt]
               const promptResult = await runHerdr(promptArgs, signal, timeout)
               if (promptResult.code !== 0) {
@@ -2175,6 +2256,46 @@ export default function firstmate(pi: ExtensionAPI) {
                 const guidance = 'This failed/blocked task already has verified terminal worker cleanup. Use task_abort/task_recover only to finish any retained exact artifacts; no task_teardown is required.'
                 const details = { action: params.action, taskId, taskPath: taskFilePath(taskId), reportPath, complete: false, reconciled: true, task, nextAction: guidance }
                 return errorResult(`worker report outcome is ${task.reportOutcome || task.reportStatus}; task is not complete. ${guidance}`, details)
+              }
+              if (
+                task.status !== 'started' ||
+                typeof task.workspaceId !== 'string' ||
+                !WORKSPACE_ID_RE.test(task.workspaceId) ||
+                task.workspaceId !== process.env.HERDR_WORKSPACE_ID ||
+                typeof task.tabId !== 'string' ||
+                !TAB_ID_RE.test(task.tabId) ||
+                typeof task.paneId !== 'string' ||
+                !PANE_ID_RE.test(task.paneId) ||
+                typeof task.workerName !== 'string' ||
+                !AGENT_NAME_RE.test(task.workerName) ||
+                typeof task.workerKind !== 'string' ||
+                !AGENT_KIND_RE.test(task.workerKind)
+              ) {
+                return errorResult('task reconciliation requires the exact durable worker endpoint.', { action: params.action, taskId, task })
+              }
+              const reconcileAgentResult = await runHerdr(['agent', 'get', task.paneId], signal, 10_000)
+              const reconcileAgent = (parseJsonMaybe(reconcileAgentResult.stdout) as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent
+              if (
+                reconcileAgentResult.code !== 0 ||
+                !hasExactWorkerIdentity(
+                  { workspaceId: task.workspaceId, tabId: task.tabId, paneId: task.paneId, workerName: task.workerName, workerKind: task.workerKind },
+                  reconcileAgent,
+                )
+              ) {
+                return errorResult('live worker endpoint does not match the exact durable task identity.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  agent: parseJsonMaybe(reconcileAgentResult.stdout),
+                })
+              }
+              if (!workerIsTerminal(reconcileAgent?.agent_status)) {
+                return errorResult('worker is not idle or done; wait for the terminal watcher follow-up before reconciling its report.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  workerStatus: reconcileAgent?.agent_status,
+                })
               }
 
               let reportText: string
@@ -2325,6 +2446,10 @@ export default function firstmate(pi: ExtensionAPI) {
                 task.worktreeProvider !== 'treehouse' ||
                 typeof task.worktree !== 'string' ||
                 !path.isAbsolute(task.worktree) ||
+                typeof task.baseBranch !== 'string' ||
+                !task.baseBranch ||
+                typeof task.baseCommit !== 'string' ||
+                !/^[0-9a-f]{40,64}$/i.test(task.baseCommit) ||
                 (task.leaseStatus !== 'leased' && task.leaseStatus !== 'returned') ||
                 task.leaseHolder !== taskId ||
                 typeof task.leaseId !== 'string' ||
@@ -2345,8 +2470,27 @@ export default function firstmate(pi: ExtensionAPI) {
               }
               if (task.branch !== `firstmate/${taskId}`) return errorResult('durable task branch is not the generated exact worker branch.', { action: params.action, taskId, task })
               if (task.reviewTarget) return errorResult('review tasks are inspection-only and cannot be locally delivered.', { action: params.action, taskId, task })
+              if (typeof task.commitAuthority !== 'string' || !task.commitAuthority || typeof task.commitAuthorityAt !== 'string') {
+                return errorResult('implementation worktree task has no durable captain commit authority; preserve the lease and recover explicitly.', { action: params.action, taskId, task })
+              }
               if (task.deliveryStatus !== 'landed' && task.leaseStatus !== 'leased')
                 return errorResult('an undelivered task must still hold its active Treehouse lease.', { action: params.action, taskId, task })
+              if (task.deliveryStatus !== 'landed') {
+                if (!params.authority?.trim()) {
+                  return errorResult('task delivery requires the captain’s exact merge authorization in `authority`.', {
+                    action: params.action,
+                    taskId,
+                    task,
+                    authorityRequired: 'local_merge',
+                  })
+                }
+                task = {
+                  ...task,
+                  deliveryAuthority: params.authority.trim(),
+                  deliveryAuthorityAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                }
+              }
 
               let reportText: string
               try {
@@ -2448,49 +2592,36 @@ export default function firstmate(pi: ExtensionAPI) {
                   agent: parseJsonMaybe(agentResult.stdout),
                 })
               }
+              if (!workerIsTerminal(agent.agent_status)) {
+                return errorResult('worker is not idle or done; delivery is blocked until the terminal watcher follow-up.', {
+                  action: params.action,
+                  taskId,
+                  task,
+                  workerStatus: agent.agent_status,
+                })
+              }
 
               const evidencePath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.evidence`)
               const dirtyPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.dirty-paths`)
               const workerPathsPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.worker-paths`)
-              const dirtyPathOverlapCheck = [
-                'try{',
-                "const fs=require('node:fs');",
-                'const paths=(file)=>{const bytes=fs.readFileSync(file);const entries=[];let start=0;for(let index=0;index<bytes.length;index+=1){if(bytes[index]===0){entries.push(bytes.subarray(start,index));start=index+1}}return entries};',
-                "const key=(entry)=>entry.toString('hex');",
-                'const dirtyEntries=paths(process.argv[1]);const dirty=new Set(dirtyEntries.map(key));const dirtyAncestors=new Set();',
-                'for(const entry of dirtyEntries){for(let index=0;index<entry.length;index+=1){if(entry[index]===47)dirtyAncestors.add(key(entry.subarray(0,index)))} }',
-                'const overlaps=paths(process.argv[2]).some((entry)=>{const entryKey=key(entry);if(dirty.has(entryKey)||dirtyAncestors.has(entryKey))return true;for(let index=0;index<entry.length;index+=1){if(entry[index]===47&&dirty.has(key(entry.subarray(0,index))))return true}return false});process.exit(overlaps?1:0)',
-                '}catch{process.exit(2)}',
-              ].join('')
+              const workerStatusPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.worker-status`)
               const stdoutPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stdout`)
               const stderrPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.stderr`)
               const statusPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.status`)
               const deliveryScriptPath = path.join(TASK_STATE_DIR, `.${taskId}.delivery.sh`)
-              const deliveryScript =
-                [
-                  '#!/bin/sh',
-                  `project=${shellQuote(task.project)}`,
-                  `branch=${shellQuote(task.branch)}`,
-                  `evidence=${shellQuote(evidencePath)}`,
-                  `dirty_paths=${shellQuote(dirtyPathsPath)}`,
-                  `worker_paths=${shellQuote(workerPathsPath)}`,
-                  `expected_repo_identity=${shellQuote(task.projectRepoIdentity || '')}`,
-                  'repo_identity=$(git -C "$project" rev-parse --git-common-dir 2>/dev/null || true)',
-                  'case "$repo_identity" in /*) ;; *) repo_identity="$project/$repo_identity";; esac',
-                  'repo_identity=$(cd "$repo_identity" 2>/dev/null && pwd -P || true)',
-                  'if [ -n "$expected_repo_identity" ] && [ "$repo_identity" = "$expected_repo_identity" ]; then repo_identity_check=complete; else repo_identity_check=failed; fi',
-                  'target_ref=$(git -C "$project" symbolic-ref --quiet HEAD 2>/dev/null || true)',
-                  'case "$target_ref" in refs/heads/*) target="${target_ref#refs/heads/}";; *) target=;; esac',
-                  'if git -C "$project" show-ref --verify --quiet "refs/heads/$branch"; then branch_exists=true; else branch_exists=false; fi',
-                  'dirty_paths_check=not-applicable',
-                  'dirty_paths_overlap=false',
-                  'if ! { git -C "$project" diff --name-only -z; git -C "$project" diff --cached --name-only -z; git -C "$project" ls-files --others --exclude-standard -z; } > "$dirty_paths"; then dirty_paths_check=failed; elif [ -n "$target" ] && [ "$branch_exists" = true ]; then if git -C "$project" diff --name-only --no-renames -z "$target" "$branch" > "$worker_paths"; then dirty_paths_check=complete; else dirty_paths_check=failed; fi; fi',
-                  `if [ "$dirty_paths_check" = complete ] && [ -s "$dirty_paths" ] && [ -s "$worker_paths" ]; then if ${shellQuote(process.execPath)} -e ${shellQuote(dirtyPathOverlapCheck)} "$dirty_paths" "$worker_paths"; then dirty_paths_overlap=false; else case "$?" in 1) dirty_paths_overlap=true;; *) dirty_paths_check=failed;; esac; fi; fi`,
-                  'if [ -n "$target" ] && [ "$branch_exists" = true ] && git -C "$project" merge-base --is-ancestor "$target" "$branch"; then fast_forward=true; else fast_forward=false; fi',
-                  'printf \'target=%s\\nrepo_identity_check=%s\\ndirty_paths_check=%s\\ndirty_paths_overlap=%s\\nbranch_exists=%s\\nfast_forward=%s\\n\' "$target" "$repo_identity_check" "$dirty_paths_check" "$dirty_paths_overlap" "$branch_exists" "$fast_forward" > "$evidence"',
-                  'if [ -z "$target" ] || [ "$repo_identity_check" != complete ] || [ "$dirty_paths_check" = failed ] || [ "$dirty_paths_overlap" != false ] || [ "$branch_exists" != true ] || [ "$fast_forward" != true ]; then echo \'refusing local delivery: primary checkout is detached, the repository identity changed, the dirty-path check failed, dirty paths overlap the worker branch, the recorded worker branch is missing, or branches have diverged\' >&2; code=1; else before=$(git -C "$project" rev-parse "$target"); git -C "$project" merge --ff-only "$branch"; code=$?; if [ "$code" -eq 0 ]; then after=$(git -C "$project" rev-parse "$target"); printf \'before=%s\\nafter=%s\\n\' "$before" "$after" >> "$evidence"; fi; fi',
-                  '[ "$code" -eq 0 ]',
-                ].join('\n') + '\n'
+              const deliveryScript = buildLocalDeliveryScript({
+                project: task.project,
+                worktree: task.worktree,
+                branch: task.branch,
+                expectedTargetBranch: task.baseBranch,
+                evidencePath,
+                dirtyPathsPath,
+                workerPathsPath,
+                workerStatusPath,
+                repositoryIdentity: task.projectRepoIdentity || '',
+                reportedChanges: reportValidation.report.changedFiles.length > 0,
+                nodePath: process.execPath,
+              })
               try {
                 await fs.promises.mkdir(TASK_STATE_DIR, { recursive: true, mode: 0o700 })
                 await fs.promises.writeFile(deliveryScriptPath, deliveryScript, { encoding: 'utf8', mode: 0o700 })
@@ -2560,10 +2691,15 @@ export default function firstmate(pi: ExtensionAPI) {
               const deliveryDecision = assessLocalDelivery({
                 targetBranch: values.target || '',
                 repositoryIdentityCheckSucceeded: values.repo_identity_check === 'complete',
+                targetBranchMatches: values.target_branch_matches === 'true',
                 dirtyPathCheckSucceeded: values.dirty_paths_check === 'complete',
                 dirtyPathsOverlap: values.dirty_paths_overlap === 'true',
                 branchExists: values.branch_exists === 'true',
                 fastForward: values.fast_forward === 'true',
+                workerClean: values.worker_clean === 'true',
+                workerBranchVerified: values.worker_branch_verified === 'true',
+                workerHeadMatchesBranch: values.worker_head_matches === 'true',
+                reportedChangesCommitted: values.reported_changes_committed === 'true',
               })
               const refused = deliveryDecision.allowed
                 ? undefined
@@ -2571,6 +2707,16 @@ export default function firstmate(pi: ExtensionAPI) {
                   ? 'primary checkout is detached or not on a local branch'
                   : deliveryDecision.reason === 'repository-identity-mismatch'
                     ? 'primary checkout repository identity changed'
+                    : deliveryDecision.reason === 'target-branch-mismatch'
+                      ? 'primary checkout is no longer on the task’s recorded target branch'
+                    : deliveryDecision.reason === 'worker-dirty'
+                      ? 'worker worktree still has uncommitted or untracked changes'
+                      : deliveryDecision.reason === 'worker-branch-mismatch'
+                        ? 'worker worktree is no longer on the exact task branch'
+                        : deliveryDecision.reason === 'worker-head-mismatch'
+                          ? 'worker worktree HEAD does not match the recorded task branch'
+                          : deliveryDecision.reason === 'reported-changes-uncommitted'
+                            ? 'the completed report lists changed files but the task branch has no committed changes'
                     : deliveryDecision.reason === 'dirty-path-check-failed'
                       ? 'could not safely compare primary dirty paths with the worker branch'
                       : deliveryDecision.reason === 'dirty-overlap'
@@ -2595,7 +2741,7 @@ export default function firstmate(pi: ExtensionAPI) {
                   'pane',
                   'run',
                   helper.paneId,
-                  `rm -f ${shellQuote(deliveryScriptPath)} ${shellQuote(evidencePath)} ${shellQuote(dirtyPathsPath)} ${shellQuote(workerPathsPath)} ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`,
+                  `rm -f ${shellQuote(deliveryScriptPath)} ${shellQuote(evidencePath)} ${shellQuote(dirtyPathsPath)} ${shellQuote(workerPathsPath)} ${shellQuote(workerStatusPath)} ${shellQuote(stdoutPath)} ${shellQuote(stderrPath)} ${shellQuote(statusPath)}`,
                 ],
                 signal,
                 10_000,
@@ -2619,6 +2765,10 @@ export default function firstmate(pi: ExtensionAPI) {
                 deliveryStdout: stdout,
                 deliveryStderr: stderr,
                 deliveryError: deliverySuccess ? undefined : deliveryError || refused || 'local delivery failed or returned incomplete evidence',
+                deliveryWorkerClean: values.worker_clean === 'true',
+                deliveryWorkerBranchVerified: values.worker_branch_verified === 'true' && values.worker_head_matches === 'true',
+                deliveryWorkerHead: values.worker_head,
+                deliveryReportedChangesCommitted: values.reported_changes_committed === 'true',
                 deliveryHelperTabId: helperClose.closed ? undefined : helper.tabId,
                 deliveryHelperPaneId: helperClose.closed ? undefined : helper.paneId,
                 updatedAt: new Date().toISOString(),
@@ -2807,7 +2957,7 @@ export default function firstmate(pi: ExtensionAPI) {
                 updatedAt: new Date().toISOString(),
               }
               if (task.worktreeProvider === 'treehouse' && task.leaseStatus === 'leased') {
-                const leaseReturn = await returnTaskLease(recoveredTask)
+                const leaseReturn = await returnTaskLease(recoveredTask, params.discard === true)
                 if (!leaseReturn.returned)
                   return errorResult(leaseReturn.error || 'Treehouse lease return failed; preserving durable state.', {
                     action: params.action,
@@ -2889,6 +3039,12 @@ export default function firstmate(pi: ExtensionAPI) {
                   deliveryStatus: task.deliveryStatus,
                   leaseStatus: task.leaseStatus,
                 }) ||
+                  typeof task.deliveryAuthority !== 'string' ||
+                  !task.deliveryAuthority ||
+                  typeof task.deliveryAuthorityAt !== 'string' ||
+                  task.deliveryWorkerClean !== true ||
+                  task.deliveryWorkerBranchVerified !== true ||
+                  task.deliveryReportedChangesCommitted !== true ||
                   typeof (task.deliveryTargetBranch || task.deliveryDefaultBranch) !== 'string' ||
                   typeof task.deliveryCommit !== 'string' ||
                   typeof task.deliveryAt !== 'string')
@@ -3606,7 +3762,7 @@ export default function firstmate(pi: ExtensionAPI) {
     if (!active) return
     applyFirstmateTools()
     const kindLine = `\n\nCurrent firstmate agent kind: ${currentAgentKind || 'unknown'}. Current selected worker kind: ${selectedWorkerKind}; task_create uses this by default. Select the allowlisted worker kind with /firstmate-worker pi or /firstmate-worker claude.`
-    const isolationLine = `\n\nCurrent session isolation mode: ${isolationMode}. task_create must use ${isolationMode === 'shared' ? 'the requested shared checkout; do not start concurrent shared tasks for that project' : 'an isolated Treehouse worktree and require task_deliver before teardown'}. The captain can switch it with /firstmate-isolation shared or /firstmate-isolation worktree.`
+    const isolationLine = `\n\nCurrent default isolation preference: ${isolationMode}. Shared checkout remains the normal default. task_create may override it per task with isolation: "worktree" for large, review, or parallel work; parallel workers for one project must use separate worktrees. Implementation worktrees require exact captain commitAuthority before creation and exact captain merge authority at delivery. The captain can change the fallback preference with /firstmate-isolation shared or /firstmate-isolation worktree.`
     return { systemPrompt: `${firstmatePolicy}${kindLine}${isolationLine}\n\n${event.systemPrompt}` }
   })
 
