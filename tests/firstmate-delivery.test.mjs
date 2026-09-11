@@ -242,6 +242,7 @@ test('worker report contract uses the canonical global task-state output path', 
   assert.ok(contract.includes(`write a UTF-8 JSON report to the exact outside-project path ${reportPath}`))
   assert.ok(contract.includes('Use the write tool directly with that exact absolute path'))
   assert.ok(contract.includes(`PI_FIRSTMATE_REPORT_PATH=${reportPath}`))
+  assert.ok(contract.includes('Do not use /tmp or another temporary location for the report'))
 })
 
 test('worker reports are validated independently of worker lifecycle operations', () => {

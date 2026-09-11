@@ -26,7 +26,7 @@ export function workerReportContract(taskId: string, reportPath: string): string
   return `
 
 ## Required structured worker report
-Before claiming this task is complete, blocked, or failed, write a UTF-8 JSON report to the exact outside-project path ${reportPath}. The pane environment also exports PI_FIRSTMATE_TASK_ID=${taskId} and PI_FIRSTMATE_REPORT_PATH=${reportPath}. Do not rely on scrollback or a final message as the report. The report schema is exactly:
+Before claiming this task is complete, blocked, or failed, write a UTF-8 JSON report to the exact outside-project path ${reportPath}. The pane environment also exports PI_FIRSTMATE_TASK_ID=${taskId} and PI_FIRSTMATE_REPORT_PATH=${reportPath}. Do not use /tmp or another temporary location for the report; only this exact path is permitted outside the project. Do not rely on scrollback or a final message as the report. The report schema is exactly:
 {
   "version": ${REPORT_VERSION},
   "taskId": "${taskId}",

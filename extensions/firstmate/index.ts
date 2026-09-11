@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
-import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
@@ -41,7 +40,9 @@ import { normalizeFirstmateToolResult } from './tool-result.ts'
 import { StringEnum } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 
-const MARKER_DIR = path.join(os.tmpdir(), 'pi-herdr-firstmate')
+// Keep coordination state inside Pi's granted state directory. The nono Pi
+// profile intentionally does not grant arbitrary access to the OS temp dir.
+const MARKER_DIR = path.join(path.dirname(TASK_STATE_DIR), 'markers')
 const MARKER_VERSION = 1
 const SHARED_ADMISSION_LOCK_PREFIX = '.shared-admission-'
 const FIRSTMATE_EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url))

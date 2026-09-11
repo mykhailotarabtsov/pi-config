@@ -104,3 +104,9 @@ test('Firstmate loads the canonical policy only from its active runtime path', a
   assert.doesNotMatch(source, /FIRSTMATE_POLICY_(?:FALLBACK|EMERGENCY_FALLBACK)/)
   assert.doesNotMatch(source, /isError: true/)
 })
+
+test('Firstmate marker storage stays inside Pi state instead of OS temp', async () => {
+  const source = await readFile(new URL('../extensions/firstmate/index.ts', import.meta.url), 'utf8')
+  assert.match(source, /const MARKER_DIR = path\.join\(path\.dirname\(TASK_STATE_DIR\), 'markers'\)/)
+  assert.doesNotMatch(source, /os\.tmpdir\(\)/)
+})
