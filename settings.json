@@ -13,8 +13,7 @@
   "packages": [
     {
       "source": "~/.config/nono/packages/nolabs-ai/pi"
-    },
-    "npm:pi-mcp-adapter@2.26.1"
+    }
   ],
   "hideThinkingBlock": true,
   "doubleEscapeAction": "tree",
@@ -22,7 +21,5 @@
     "showTerminalProgress": false
   },
   "tuiMode": "fullscreen",
-  "extensionChangelogVersions": {
-    "{\"source\":\"npm:pi-mcp-adapter@2.26.1\",\"scope\":\"user\"}": "2.26.1"
-  }
+  "extensionChangelogVersions": {}
 }
