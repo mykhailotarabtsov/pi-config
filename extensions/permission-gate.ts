@@ -12,9 +12,6 @@ const MUTATING_TOOLS = new Set(["write", "edit"]);
 // trying to prove that every chained segment is read-only.
 const SHELL_CONTROL = /[\n\r;&|`$()<>\\]/;
 const GIT_PUSH_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+push(?:\s|$)/i;
-const GIT_COMMIT_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+(?:add|commit|rm)(?:\s|$)/i;
-const GIT_HISTORY_COMMAND = /\bgit(?:\s+(?:--[^\s;&|]+|-[^\s;&|]+)(?:\s+[^\s;&|]+)?)*\s+(?:checkout|switch|restore|reset|clean|merge|rebase|pull|branch|tag|stash|worktree|cherry-pick|revert|am|bisect|replace|notes|update-ref|symbolic-ref|commit-tree)(?:\s|$)/i;
-const FIRSTMATE_COMMIT_AUTHORITY_ENV = "PI_FIRSTMATE_COMMIT_AUTHORIZED";
 // This is intentionally an obvious-command guard, not an OS sandbox. It catches
 // common publishing paths while leaving comprehensive enforcement to the host.
 const PUBLISH_COMMAND = /(?:\bnpm|pnpm|yarn|bun)\s+publish\b|\b(?:cargo|twine)\s+publish\b|\btwine\s+upload\b|\b(?:docker|podman)\s+push\b|\bgh\s+(?:pr\s+create|release\s+(?:create|upload))\b/i;
@@ -125,28 +122,6 @@ const DANGEROUS_BASH = [
   /\b(npm|pnpm|yarn|bun)\s+(i|install|add|remove|uninstall|dlx|create|exec)\b/,
   /\b(pip|pip3|uv|poetry)\s+(install|add|remove)\b/,
   /\bgit\s+(reset|clean|checkout|switch|restore|rebase|merge|push|commit|add|rm)\b/,
-  /\b(find|xargs)\b.*\b-exec\b/,
-  /\btee\b/,
-];
-
-// Firstmate workers are unattended. They must either proceed autonomously
-// inside their task boundary or stop with a report; an interactive permission
-// dialog would park the worker indefinitely. Keep this list narrower than the
-// interactive gate so routine project work remains autonomous.
-const FIRSTMATE_BLOCKED_BASH = [
-  /\bsudo\b/,
-  /\brm\b/,
-  /\b(rmdir|truncate)\b/,
-  /\bchown\b/,
-  /\bkill(all)?\b/,
-  /\bpkill\b/,
-  /\bdd\b/,
-  /\b(sh|bash|zsh)\s+-c\b/,
-  /\b(source|\.)\s+\S+/,
-  /\b(curl|wget)\b.*\|\s*(sh|bash|zsh)\b/,
-  /\b(curl|wget)\b.*(?:--upload-file|-T\b|--data(?:-raw|-binary)?\b|-X\s*(?:POST|PUT|PATCH|DELETE)\b)/,
-  /\b(npm|pnpm|yarn|bun)\s+(i|install|add|remove|uninstall|dlx|create|exec)\b/,
-  /\b(pip|pip3|uv|poetry)\s+(install|add|remove)\b/,
   /\b(find|xargs)\b.*\b-exec\b/,
   /\btee\b/,
 ];
@@ -400,41 +375,6 @@ function isWithinTrustedSubagentResource(filePath: string): boolean {
   });
 }
 
-function isValidatedFirstmateReportPath(filePath: string): boolean {
-  const taskId = process.env.PI_FIRSTMATE_TASK_ID ?? "";
-  const reportPath = process.env.PI_FIRSTMATE_REPORT_PATH ?? "";
-  if (!taskId || !reportPath || !path.isAbsolute(reportPath)) return false;
-  if (!/^task-[a-z0-9-]{8,80}$/.test(taskId)) return false;
-
-  // Firstmate writes to this exact lexical path. Canonicalize only the root to
-  // detect symlink escapes; accepting two resolved paths alone would allow a
-  // report-path symlink to redirect writes to an arbitrary file.
-  const taskRoot = path.resolve(os.homedir(), ".pi", "firstmate", "tasks");
-  const expected = path.join(taskRoot, `${taskId}.report.json`);
-  if (path.resolve(reportPath) !== expected || path.resolve(filePath) !== expected) return false;
-  let canonicalRoot: string;
-  let canonicalReport: string;
-  try {
-    canonicalRoot = realpathSync(taskRoot);
-    if (lstatSync(expected).isSymbolicLink()) return false;
-    canonicalReport = realpathSync(expected);
-  } catch {
-    // The report may be a new file, but its complete existing parent chain must
-    // still be canonical and inside the canonical Firstmate task root.
-    const parent = path.dirname(expected);
-    try {
-      canonicalRoot = realpathSync(taskRoot);
-      canonicalReport = path.join(realpathSync(parent), path.basename(expected));
-    } catch {
-      return false;
-    }
-  }
-  const relative = path.relative(canonicalRoot, canonicalReport);
-  return relative === path.basename(expected)
-    && !relative.startsWith(`..${path.sep}`)
-    && !path.isAbsolute(relative);
-}
-
 function commandPathArguments(command: string): string[] {
   const normalizedCommand = command.replaceAll(/["']/g, "");
   const paths: string[] = [];
@@ -523,8 +463,6 @@ export default function (pi: ExtensionAPI) {
     && process.env.PI_SUBAGENT_AGENT === "browser-tester"
     && process.env.PI_SUBAGENT_AGENT_SOURCE === "user"
     && isTrustedBrowserDefinition;
-  const isFirstmateExecution = process.env.PI_FIRSTMATE_WORKER === "1";
-  const isFirstmateWorker = isFirstmateExecution && !isSubagentChild;
   const noPublishIdentity = process.env.PI_PERMISSION_NO_PUBLISH === "1";
   const withPermissionDialog = async <T>(label: string, dialog: () => Promise<T>): Promise<T> => {
     pi.events.emit("herdr:blocked", { active: true, label });
@@ -541,11 +479,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   const checkBashPermission = async (command: string, cwd: string, ctx: ExtensionContext) => {
-    if ((isFirstmateExecution || noPublishIdentity) && containsGitPush(command)) {
-      return { allowed: false as const, reason: "git push is blocked for Firstmate workers and their subagents" };
+    if (noPublishIdentity && containsGitPush(command)) {
+      return { allowed: false as const, reason: "git push is blocked for headless subagents" };
     }
-    if ((isFirstmateExecution || noPublishIdentity) && containsPublishCommand(command)) {
-      return { allowed: false as const, reason: "Publishing commands are blocked for Firstmate workers and their subagents" };
+    if (noPublishIdentity && containsPublishCommand(command)) {
+      return { allowed: false as const, reason: "Publishing commands are blocked for headless subagents" };
     }
 
     const boundaryRoot = process.env.PI_PERMISSION_ROOT ?? ctx.cwd;
@@ -554,28 +492,6 @@ export default function (pi: ExtensionAPI) {
     const outsideProject = containsOutOfProjectPath(command, cwd, boundaryRoot);
     const symlinkEscape = containsSymlinkEscape(command, cwd, boundaryRoot);
     const subagentOutsideRoot = isSubagentChild && !isWithinProject(cwd, boundaryRoot);
-
-    if (isFirstmateWorker) {
-      if (!command) return { allowed: true as const };
-      if (sensitive) return { allowed: false as const, reason: "Sensitive-path Bash command blocked for unattended Firstmate worker" };
-      if (outsideProject || !isWithinProject(cwd, boundaryRoot)) {
-        return { allowed: false as const, reason: "Project-boundary Bash command blocked for unattended Firstmate worker" };
-      }
-      if (symlinkEscape) return { allowed: false as const, reason: "Symlink escape blocked for unattended Firstmate worker" };
-      if (SHELL_CONTROL.test(command)) {
-        return { allowed: false as const, reason: "Shell control syntax blocked for unattended Firstmate worker; run simple commands separately" };
-      }
-      const normalized = command.replaceAll(/["']/g, "").toLowerCase();
-      if (GIT_COMMIT_COMMAND.test(normalized)) {
-        return process.env[FIRSTMATE_COMMIT_AUTHORITY_ENV] === "1"
-          ? { allowed: true as const }
-          : { allowed: false as const, reason: "Git staging and commits require durable captain commit authority for this Firstmate task" };
-      }
-      if (GIT_HISTORY_COMMAND.test(normalized) || FIRSTMATE_BLOCKED_BASH.some((pattern) => pattern.test(normalized))) {
-        return { allowed: false as const, reason: "Dangerous Bash command blocked for unattended Firstmate worker" };
-      }
-      return { allowed: true as const };
-    }
 
     if (!command || (!dangerous && !sensitive && !outsideProject && !subagentOutsideRoot) || trustedExactCommands.has(command)) {
       return { allowed: true as const };
@@ -717,13 +633,10 @@ export default function (pi: ExtensionAPI) {
       const trustedSubagentResourceRead = READ_ONLY_TOOLS.has(event.toolName)
         && isSubagentChild
         && isWithinTrustedSubagentResource(filePath);
-      const validatedReportWrite = isFirstmateWorker
-        && MUTATING_TOOLS.has(event.toolName)
-        && isValidatedFirstmateReportPath(filePath);
       const needsApproval = sensitive
         || protectedMutation
         || symlinkEscape
-        || (!inProject && !globalPiRead && !trustedSubagentResourceRead && !validatedReportWrite);
+        || (!inProject && !globalPiRead && !trustedSubagentResourceRead);
 
       // Ordinary project reads, searches, listings, and edits are allowed without interruption.
       // Non-sensitive global ~/.pi reads are also allowed for interactive users;
@@ -738,15 +651,6 @@ export default function (pi: ExtensionAPI) {
       if (allowSafeOperationsForSession && canEnableSafeOperations) return undefined;
       if (!sensitive && MUTATING_TOOLS.has(event.toolName) && trustedAllMutatingTools.has(event.toolName)) return undefined;
       if (trustedToolPaths.has(key)) return undefined;
-
-      if (isFirstmateWorker) {
-        return {
-          block: true,
-          reason: sensitive || protectedMutation || symlinkEscape
-            ? `Protected path blocked for unattended Firstmate worker: ${displayPath(filePath)}`
-            : `Project boundary blocked for unattended Firstmate worker: ${displayPath(filePath)}`,
-        };
-      }
 
       if (isSubagentChild) {
         return {
@@ -793,13 +697,10 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (classifiedMcp) {
-      if (process.env.PI_FIRSTMATE_ACTIVE === "1") {
-        return { block: true, reason: "Firstmate delegates MCP browser work to the browser-tester agent" };
-      }
       const key = mcpToolKey(event.toolName, event.input);
       const trustedBrowserMcp = isTrustedBrowserTester && isBrowserMcpRequest(event.toolName, event.input, sourceInfo);
-      if (isFirstmateExecution || (noPublishIdentity && !trustedBrowserMcp)) {
-        return { block: true, reason: "MCP calls are blocked for Firstmate workers and their subagents" };
+      if (noPublishIdentity && !trustedBrowserMcp) {
+        return { block: true, reason: "MCP calls are blocked for headless subagents" };
       }
       // mcpScript executes its own internal calls in the vendor adapter, so the
       // only safe hook available here is approval of the entire script. Direct

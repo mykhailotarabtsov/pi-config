@@ -12,10 +12,10 @@ This checkout is the portable resource set for Pi. General coding rules live in
   and pickup.
 - `skills/*/SKILL.md` — optional workflows for review, commits, setup, GitHub,
   Herdr, and codebase learning.
-- `extensions/` — auto-discovered UI, permission, artifact, subagent, and
-  Firstmate integrations. `themes/` contains selectable themes.
+- `extensions/` — auto-discovered UI, permission, artifact, and subagent
+  integrations. `themes/` contains selectable themes.
 - `setup.sh` and `scripts/setup.mjs` — safe installation and synchronization.
-  `tests/` covers setup, permissions, subagents, Firstmate, UI, and artifacts.
+  `tests/` covers setup, permissions, subagents, UI, and artifacts.
 
 ## Normal delegation
 
@@ -33,16 +33,6 @@ is explicitly sufficient, `reviewer` for static inspection, `unit-tester` for
 actual test execution, and `browser-tester` for manual browser QA. Agents must
 report what they changed or inspected, validation evidence, and blockers; a
 blocked or failed result is not completion.
-
-## Firstmate
-
-Only when activated in Herdr, the runtime loads the canonical policy from
-`extensions/firstmate/POLICY.md` beside this file. Follow that injected role
-instead of ordinary Herdr split-pane guidance or generic workflow chains.
-Firstmate coordinates visible workers, never implements locally, and delegates
-browser QA only to the user-scoped browser tester. Pi is the default worker;
-Claude requires an explicit allowlisted override. Keep the full contract in
-that one policy file rather than duplicating it here.
 
 ## Skills
 

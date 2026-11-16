@@ -10,8 +10,7 @@ auto-discovered extensions, themes, and safe setup helpers.
   unit-tester, and browser-tester.
 - `prompts/` — implementation, review, planning, handoff, and pickup templates.
 - `skills/` — optional review, commit, GitHub, Herdr, MCP, and codebase workflows.
-- `extensions/` — startup/UI, permission, artifacts, subagent, and Herdr-gated
-  Firstmate integrations.
+- `extensions/` — startup/UI, permission, artifacts, and subagent integrations.
 - `mcp.json` — the configured global MCP servers; the browser QA server is
   `chrome-devtools`.
 - `themes/`, `models.json.template`, `package.json`, and `package-lock.json` —
@@ -94,7 +93,3 @@ collisions are reported. Headless project agents require a trusted project and
 `confirmProjectAgents: false`. Global trusted skills/Pi docs have narrow read-only
 resource exceptions; auth/session files do not. Browser provenance is a
 trusted-process guardrail, not cryptographic isolation.
-
-Firstmate is active only under its gated Herdr policy. It coordinates visible
-workers; it does not implement locally. Read `extensions/firstmate/POLICY.md`
-for authoritative lifecycle and reporting behavior.

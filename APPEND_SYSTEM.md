@@ -11,7 +11,7 @@
   blockers. Do not claim work or evidence that was not verified.
 - Create commits only when explicitly asked; load the `commit` skill first and
   stage only task-owned changes. Do not push or publish without explicit user
-  authorization; Firstmate workers never push or publish.
+  authorization.
 - For commit-title requests, use `<type>(<optional scope>): <imperative summary>`
   without a trailing period. A title-only request never authorizes a commit.
 - After actual changes, include `Proposed Conventional Commit title:` in the final

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile, readFile, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import os from 'node:os'
@@ -19,8 +19,7 @@ const { createChildGroupTerminator, decodeUtf8Chunks } = subagentModule
 
 const ENV_KEYS = [
   'HOME', 'PI_CODING_AGENT_DIR', 'PI_PERMISSION_ROOT', 'PI_SUBAGENT_CHILD', 'PI_SUBAGENT_AGENT',
-  'PI_SUBAGENT_AGENT_SOURCE', 'PI_SUBAGENT_AGENT_DEFINITION', 'PI_FIRSTMATE_WORKER', 'PI_FIRSTMATE_TASK_ID',
-  'PI_FIRSTMATE_REPORT_PATH', 'PI_FIRSTMATE_COMMIT_AUTHORIZED', 'PI_PERMISSION_NO_PUBLISH',
+  'PI_SUBAGENT_AGENT_SOURCE', 'PI_SUBAGENT_AGENT_DEFINITION', 'PI_PERMISSION_NO_PUBLISH',
   'PI_PERMISSION_RESOURCE_ROOTS',
 ]
 
@@ -125,42 +124,6 @@ test('browser MCP bypass requires user-agent provenance, definition path, and an
     const interactive = harness({ tools: [{ name: 'browser_navigate', sourceInfo: { path: '/host/node_modules/pi-mcp-adapter/index.js' } }], choice: 'Allow once' })
     assert.equal(await interactive.call({ toolName: 'browser_navigate', input: {} }, { cwd: project, hasUI: true, choice: 'Allow once' }), undefined)
     assert.equal(interactive.selections.length, 1)
-  })
-})
-
-test('Firstmate keeps ordinary boundary checks and only permits a validated report file', async () => {
-  await fixture(async ({ project, home }) => {
-    process.env.PI_FIRSTMATE_WORKER = '1'
-    const gate = harness()
-    const outside = await gate.call({ toolName: 'write', input: { path: path.join(home, 'unrelated.txt') } }, { cwd: project, hasUI: true })
-    assert.equal(outside?.block, true)
-    assert.equal(gate.selections.length, 0)
-
-    const protectedMutation = await gate.call({ toolName: 'write', input: { path: path.join(project, 'node_modules', 'package', 'index.js') } }, { cwd: project, hasUI: true })
-    assert.equal(protectedMutation?.block, true)
-    assert.equal(gate.selections.length, 0)
-
-    const taskId = 'task-abc12345-def67890'
-    const report = path.join(home, '.pi', 'firstmate', 'tasks', `${taskId}.report.json`)
-    await mkdir(path.dirname(report), { recursive: true })
-    process.env.PI_FIRSTMATE_TASK_ID = taskId
-    process.env.PI_FIRSTMATE_REPORT_PATH = report
-    const allowed = await gate.call({ toolName: 'write', input: { path: report } }, { cwd: project })
-    assert.equal(allowed, undefined)
-
-    process.env.PI_FIRSTMATE_REPORT_PATH = path.join(home, 'other.json')
-    const invalid = await gate.call({ toolName: 'write', input: { path: process.env.PI_FIRSTMATE_REPORT_PATH } }, { cwd: project })
-    assert.equal(invalid?.block, true)
-
-    const arbitrary = path.join(home, 'arbitrary.txt')
-    await writeFile(arbitrary, 'not a report')
-    await rm(report, { force: true })
-    await symlink(arbitrary, report)
-    process.env.PI_FIRSTMATE_REPORT_PATH = report
-    const symlinked = await gate.call({ toolName: 'write', input: { path: report } }, { cwd: project })
-    assert.equal(symlinked?.block, true)
-    await rm(arbitrary)
-    assert.equal((await gate.call({ toolName: 'write', input: { path: report } }, { cwd: project }))?.block, true)
   })
 })
 

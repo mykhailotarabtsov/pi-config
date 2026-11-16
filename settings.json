@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.85.1",
+  "lastChangelogVersion": "1.5.2",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-luna",
   "agents": {
@@ -21,5 +21,8 @@
   "terminal": {
     "showTerminalProgress": false
   },
-  "tuiMode": "fullscreen"
+  "tuiMode": "fullscreen",
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-mcp-adapter@2.26.1\",\"scope\":\"user\"}": "2.26.1"
+  }
 }
