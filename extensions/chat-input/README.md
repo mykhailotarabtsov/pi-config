@@ -28,8 +28,8 @@ User config lives in `~/.pi/agent/configs/chat-input.json`. Create it to overrid
   "planModePrefixColor": "customMessageLabel",
   "planModeBorderColor": "customMessageLabel",
   "chatModePrefix": "»",
-  "chatModePrefixColor": "chatModeBorder",
-  "chatModeBorderColor": "chatModeBorder",
+  "chatModePrefixColor": "borderAccent",
+  "chatModeBorderColor": "borderAccent",
   "companion": {
     "enabled": true,
     "color": "accent"
@@ -49,9 +49,9 @@ User config lives in `~/.pi/agent/configs/chat-input.json`. Create it to overrid
 | `planModeBorderColor` | `string` | `"customMessageLabel"` | Border colour in plan/execute mode (theme token or hex) |
 | `planModePrefix` | `string` | `"⏸"` | Prefix character in plan/execute mode |
 | `planModePrefixColor` | `string` | `"customMessageLabel"` | Prefix colour in plan/execute mode (theme token or hex) |
-| `chatModeBorderColor` | `string` | `"chatModeBorder"` | Border colour in chat mode (theme token or hex) |
+| `chatModeBorderColor` | `string` | `"borderAccent"` | Border colour in chat mode (theme token or hex) |
 | `chatModePrefix` | `string` | `"»"` | Prefix character in chat mode |
-| `chatModePrefixColor` | `string` | `"chatModeBorder"` | Prefix colour in chat mode (theme token or hex) |
+| `chatModePrefixColor` | `string` | `"borderAccent"` | Prefix colour in chat mode (theme token or hex) |
 | `companion.enabled` | `boolean` | `false` | Show a rotating ASCII cat companion above the input. When disabled, top padding is `0`. |
 | `companion.color` | `string` | `"accent"` | Theme colour token **or** hex colour for the companion art. |
 

@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+  "$schema": "https://pi.dev/schemas/theme.schema.json",
   "name": "slop",
   "vars": {
     "primary": "#d67858",
@@ -19,8 +19,6 @@
 
     "muted": "muted",
     "dim": "faint",
-    "separator": "#4e4c49",
-    "chatModeBorder": "#81a2be",
 
     "text": "text",
     "thinkingText": "faint",

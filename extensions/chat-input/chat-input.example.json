@@ -8,8 +8,8 @@
   "planModePrefixColor": "customMessageLabel",
   "planModeBorderColor": "customMessageLabel",
   "chatModePrefix": "»",
-  "chatModePrefixColor": "chatModeBorder",
-  "chatModeBorderColor": "chatModeBorder",
+  "chatModePrefixColor": "borderAccent",
+  "chatModeBorderColor": "borderAccent",
   "companion": {
     "enabled": true,
     "color": "accent"
