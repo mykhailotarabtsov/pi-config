@@ -22,6 +22,11 @@ git/
 # Machine-specific binaries (won't work on other platforms)
 bin/
 
+# Orca-managed local extensions
+extensions/orca-agent-status.ts
+extensions/orca-prefill.ts
+extensions/orca-titlebar-spinner.ts
+
 # Local session handoffs and generated artifacts
 .pi/handoffs/
 .pi/artifacts/
