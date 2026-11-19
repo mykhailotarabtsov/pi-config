@@ -1,13 +1,13 @@
 {
   "lastChangelogVersion": "1.5.2",
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.6-luna",
+  "defaultProvider": "llama.cpp",
+  "defaultModel": "ggml-org/gemma-4-12B-it-GGUF:Q4_0",
   "agents": {
     "defaults": {
       "timeoutSeconds": 120
     }
   },
-  "defaultThinkingLevel": "xhigh",
+  "defaultThinkingLevel": "high",
   "theme": "slop",
   "quietStartup": true,
   "packages": [

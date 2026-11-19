@@ -115,7 +115,7 @@ const DANGEROUS_BASH = [
   /\bdd\b/,
   /\b(sh|bash|zsh)\s+-c\b/,
   /\b(sh|bash|zsh)\s+\S+/,
-  /\b(source|\.)\s+\S+/,
+  /(?:^|\s)(?:source|\.)\s+\S+/,
   /\b(node|deno|python|python3|perl|ruby)\s+(-e|-c)\b/,
   /\b(curl|wget)\b.*\|\s*(sh|bash|zsh)\b/,
   /\b(curl|wget)\b.*(?:--upload-file|-T\b|--data(?:-raw|-binary)?\b|-X\s*(?:POST|PUT|PATCH|DELETE)\b)/,

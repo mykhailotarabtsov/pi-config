@@ -342,3 +342,23 @@ test('publishes permission state and rerenders on session-safe transitions', asy
     }
   })
 })
+
+test('normal worker_done report punctuation does not request shell approval', async () => {
+  await withFixture(async ({ project }) => {
+    const harness = createHarness()
+    const command = 'orca orchestration send --type worker_done --body "First sentence. Second sentence." --task-id task_test --dispatch-id ctx_test --outcome succeeded'
+    assert.equal(await harness.callTool('bash', { command }, { cwd: project, hasUI: true }), undefined)
+    assert.equal(harness.selections.length, 0)
+  })
+})
+
+test('shell dot and source commands still require approval', async () => {
+  await withFixture(async ({ project }) => {
+    const harness = createHarness()
+    for (const command of ['. ./setup.sh', 'source ./setup.sh']) {
+      const result = await harness.callTool('bash', { command }, { cwd: project, hasUI: true, choice: 'Block' })
+      assert.equal(result?.block, true)
+    }
+    assert.equal(harness.selections.length, 2)
+  })
+})
